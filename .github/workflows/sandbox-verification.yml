@@ -1,0 +1,12 @@
+name: Sandbox handoff smoke
+'on':
+  workflow_dispatch: {}
+permissions: {}
+jobs:
+  handoff-smoke:
+    name: handoff-smoke
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+    - run: printf "sandbox-handoff-smoke\n"
+run-name: sandbox-verification-20260908T234533Z-8d7f4b2416394578962e9d9fc10153bd
