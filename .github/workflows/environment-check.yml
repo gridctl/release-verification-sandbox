@@ -32,3 +32,19 @@ jobs:
             brew --version
           fi
           printf '%s\n' 'Runner tools and job-scoped OIDC environment are available.'
+  tap-access:
+    if: github.repository == 'gridctl/release-verification-sandbox'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Verify sandbox tap Contents write access
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GORELEASER_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${GH_TOKEN:-}"
+          # An unreferenced test blob verifies write permission without changing a branch.
+          gh api --method POST repos/gridctl/homebrew-verification-sandbox/git/blobs \
+            -f encoding=utf-8 -f content='Sandbox credential preflight' --jq .sha
