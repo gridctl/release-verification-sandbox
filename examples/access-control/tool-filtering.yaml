@@ -1,0 +1,35 @@
+# Tool Filtering Example
+#
+# Demonstrates server-level tool filtering:
+#
+# The `tools` field on an mcp-server whitelists which tools are exposed
+# to all clients through the gateway. Tools not in the list are never
+# loaded — they don't appear in tool listings and can't be called.
+#
+# Filtering prevents tool confusion (LLMs picking the wrong tool from
+# the wrong server) and reduces context window consumption.
+#
+# Usage:
+#   gridctl apply examples/access-control/tool-filtering.yaml
+#
+version: "1"
+name: tool-filtering-demo
+
+network:
+  name: tool-filtering-net
+
+mcp-servers:
+  # No filtering — all tools exposed
+  - name: unrestricted-server
+    image: alpine:latest
+    port: 8080
+    command: ["sh", "-c", "while true; do sleep 3600; done"]
+
+  # Server-level filtering — only "read" and "list" are exposed
+  # Even if the underlying server supports "delete" or "modify",
+  # those tools never reach the gateway or the LLM client.
+  - name: restricted-server
+    image: alpine:latest
+    port: 8081
+    tools: ["read", "list"]
+    command: ["sh", "-c", "while true; do sleep 3600; done"]

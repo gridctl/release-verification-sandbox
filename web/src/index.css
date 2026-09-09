@@ -1,0 +1,1205 @@
+@import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+@theme {
+  /* ============================================
+     OBSIDIAN OBSERVATORY - Design System
+     A refined dark aesthetic inspired by mission
+     control centers and scientific observation
+     ============================================ */
+
+  /* Core Obsidian Palette - Deep blacks with warm undertones */
+  --color-background: #08080a;
+  --color-surface: #111113;
+  --color-surface-elevated: #18181b;
+  --color-surface-highlight: #1f1f23;
+  --color-border: #27272a;
+  --color-border-subtle: rgba(255, 255, 255, 0.06);
+
+  /* Primary - Warm Amber (Energy, Activity) */
+  --color-primary: #f59e0b;
+  --color-primary-light: #fbbf24;
+  --color-primary-dark: #d97706;
+  --color-primary-glow: rgba(245, 158, 11, 0.15);
+
+  /* Secondary - Deep Teal (Technical, Data) */
+  --color-secondary: #0d9488;
+  --color-secondary-light: #14b8a6;
+  --color-secondary-dark: #0f766e;
+  --color-secondary-glow: rgba(13, 148, 136, 0.15);
+
+  /* Tertiary - Purple/Violet (Agents, AI) */
+  --color-tertiary: #8b5cf6;
+  --color-tertiary-light: #a78bfa;
+  --color-tertiary-dark: #7c3aed;
+  --color-tertiary-glow: rgba(139, 92, 246, 0.15);
+
+  /* Status - Distinct, purposeful */
+  --color-status-running: #10b981;
+  --color-status-running-glow: rgba(16, 185, 129, 0.2);
+  --color-status-stopped: #52525b;
+  --color-status-error: #f43f5e;
+  --color-status-error-glow: rgba(244, 63, 94, 0.2);
+  --color-status-pending: #eab308;
+  --color-status-pending-glow: rgba(234, 179, 8, 0.2);
+  --color-status-idle: #64748b;
+
+  /* Text - Warm whites */
+  --color-text-primary: #fafaf9;
+  --color-text-secondary: #a8a29e;
+  --color-text-muted: #78716c;
+
+  /* Typography - Distinctive choices */
+  --font-sans: 'Outfit', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', 'Fira Code', monospace;
+
+  /* Shadows - Atmospheric depth */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4), 0 2px 4px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.3);
+  --shadow-glow-primary: 0 0 20px var(--color-primary-glow), 0 0 40px var(--color-primary-glow);
+  --shadow-glow-secondary: 0 0 20px var(--color-secondary-glow), 0 0 40px var(--color-secondary-glow);
+  --shadow-glow-tertiary: 0 0 20px var(--color-tertiary-glow), 0 0 40px var(--color-tertiary-glow);
+
+  /* Glass effect */
+  --glass-bg: rgba(17, 17, 19, 0.8);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-elevated-bg: rgba(24, 24, 27, 0.9);
+
+  /* Theme-aware compositing helpers (overridden per data-theme).
+     Extracted from inline literals so light mode can invert them. */
+  --bevel-highlight: rgba(255, 255, 255, 0.06);
+  --minimap-mask: rgba(8, 8, 10, 0.85);
+  --selection-bg: rgba(245, 158, 11, 0.06);
+  --selection-border: rgba(245, 158, 11, 0.3);
+  --shadow-node: 0 4px 24px rgba(0, 0, 0, 0.4);
+  --shadow-node-hover: 0 8px 40px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  /* Soft directional shadow cast leftward by an elevated detail/inspector pane
+     onto the recessed list behind it. Tight, diffuse, no spread. */
+  --shadow-pane-left: -12px 0 28px -16px rgba(0, 0, 0, 0.7);
+  --grain-opacity: 0.015;
+}
+
+/* ============================================
+   THEME PALETTES
+   Dark ("Obsidian Observatory") is the default and lives in the @theme block
+   above so its values seed :root and every Tailwind color/shadow utility
+   resolves to var(--color-*) / var(--shadow-*). The light ("Observatory Day")
+   block re-keys those same custom properties; both Tailwind utilities and the
+   structural CSS below pick up the swap with no per-component changes.
+   data-theme is set synchronously by the boot script in index.html (anti-FOUC)
+   and by themes/applyTheme.ts at runtime.
+   ============================================ */
+
+:root,
+:root[data-theme='dark'] {
+  color-scheme: dark;
+}
+
+/* Observatory Day — a hand-keyed warm-neutral light theme. Glow is dropped in
+   favour of soft drop-shadows + borders; the amber accent is re-keyed darker so
+   it clears WCAG on light surfaces (amber-500 on white is ~1.9:1). */
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  /* Neutral-cool light gray canvas: white nodes separate cleanly and the warm
+     amber/status accents pop against it (warm-on-cool). */
+  --color-background: #eceef1;
+  --color-surface: #f4f6f8;
+  --color-surface-elevated: #ffffff;
+  --color-surface-highlight: #e1e4e9;
+  --color-border: #d3d7de;
+  --color-border-subtle: rgba(15, 23, 42, 0.08);
+
+  /* Primary — re-keyed amber (amber-800/900) for contrast on light. Yellow has
+     no dark form: to clear 4.5:1 as small text on these warm-tinted surfaces the
+     accent has to shift to brown-orange, which is what Radix, Primer, and
+     Atlassian all do for their light-mode warm text step. The whole ramp moves
+     together so `from-primary to-primary-dark` gradients keep a visible step and
+     `hover:bg-primary-light` stays a perceptible hover. */
+  --color-primary: #92400e;
+  --color-primary-light: #a5490b;
+  --color-primary-dark: #78350f;
+  --color-primary-glow: rgba(146, 64, 14, 0.18);
+
+  /* Secondary — deep teal */
+  --color-secondary: #0f766e;
+  --color-secondary-light: #115e59;
+  --color-secondary-dark: #134e4a;
+  --color-secondary-glow: rgba(15, 118, 110, 0.16);
+
+  /* Tertiary — violet */
+  --color-tertiary: #7c3aed;
+  --color-tertiary-light: #6d28d9;
+  --color-tertiary-dark: #5b21b6;
+  --color-tertiary-glow: rgba(124, 58, 237, 0.15);
+
+  /* Status — saturated enough to read clearly against the bright canvas.
+     Running darkens to emerald-800: the previous emerald-600 read 3.33:1 as
+     small text on its own 10% tint, so the active state badge could not clear
+     AA. Same failure the warm accent had, one hue over. */
+  --color-status-running: #065f46;
+  --color-status-running-glow: rgba(6, 95, 70, 0.25);
+  --color-status-stopped: #9ca3af;
+  --color-status-error: #e11d48;
+  --color-status-error-glow: rgba(225, 29, 72, 0.2);
+  /* Pending keeps its own hue rather than reusing primary: sharing one hex made
+     "brand accent" and "needs attention" indistinguishable in light, a collision
+     dark mode does not have. */
+  --color-status-pending: #854d0e;
+  --color-status-pending-glow: rgba(133, 77, 14, 0.2);
+  --color-status-idle: #6b7280;
+
+  /* Text — neutral near-black ramp; muted is darkened a shade from the warm
+     palette so secondary descriptions stay readable on the bright canvas. */
+  --color-text-primary: #1a1c20;
+  --color-text-secondary: #4b515b;
+  --color-text-muted: #687078;
+
+  /* Shadows — saturated transparent cool-slate, not black; elevation comes from
+     these + borders rather than the dark-mode lighter-surface trick. */
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.08);
+  --shadow-md: 0 4px 12px rgba(15, 23, 42, 0.08), 0 2px 4px rgba(15, 23, 42, 0.05);
+  --shadow-lg: 0 10px 32px rgba(15, 23, 42, 0.11), 0 4px 12px rgba(15, 23, 42, 0.07);
+  --shadow-node: 0 4px 20px rgba(15, 23, 42, 0.09);
+  --shadow-node-hover: 0 8px 32px rgba(15, 23, 42, 0.13), 0 0 0 1px rgba(15, 23, 42, 0.06);
+  /* Cool-slate edge shadow (matches the light palette's other elevation cues) */
+  --shadow-pane-left: -12px 0 26px -16px rgba(15, 23, 42, 0.16);
+
+  /* Glow dropped on light — map glow tokens to soft accent drop-shadows. */
+  --shadow-glow-primary: 0 2px 10px var(--color-primary-glow);
+  --shadow-glow-secondary: 0 2px 10px var(--color-secondary-glow);
+  --shadow-glow-tertiary: 0 2px 10px var(--color-tertiary-glow);
+
+  /* Glass — light translucent panes with dark text */
+  --glass-bg: rgba(255, 255, 255, 0.72);
+  --glass-border: rgba(15, 23, 42, 0.08);
+  --glass-elevated-bg: rgba(255, 255, 255, 0.86);
+
+  /* Compositing helpers inverted for light */
+  --bevel-highlight: rgba(255, 255, 255, 0.7);
+  --minimap-mask: rgba(236, 238, 241, 0.6);
+  --selection-bg: rgba(146, 64, 14, 0.08);
+  --selection-border: rgba(146, 64, 14, 0.4);
+  --grain-opacity: 0;
+}
+
+/* Brief color-only crossfade applied during a theme switch (themes/applyTheme.ts
+   adds .theme-transitioning to <html> for ~200ms). Gated behind no-preference so
+   it never fires for reduced-motion users; layout properties are never animated. */
+@media (prefers-reduced-motion: no-preference) {
+  .theme-transitioning,
+  .theme-transitioning *,
+  .theme-transitioning *::before,
+  .theme-transitioning *::after {
+    transition:
+      background-color 180ms ease,
+      border-color 180ms ease,
+      color 180ms ease,
+      fill 180ms ease,
+      stroke 180ms ease,
+      box-shadow 180ms ease !important;
+  }
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  background-color: var(--color-background);
+}
+
+/* Frosted-glass surfaces in light theme. Stack canvas nodes and the tool-detail
+   popover paint an opaque Tailwind surface (from-surface/95, bg-surface-
+   elevated/95) that reads as a flat white card on the bright canvas. In light
+   only, drop them to a translucent white so the existing backdrop-blur frosts
+   the canvas/grid behind them — cohesive with the dark glass language. Dark
+   keeps its opaque surfaces (no rule), since glass fades into the inky bg. */
+:root[data-theme='light'] .frost-surface {
+  background: rgba(255, 255, 255, 0.6) !important;
+}
+
+body {
+  background-color: var(--color-background);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: "rlig" 1, "calt" 1;
+}
+
+/* ============================================
+   ATMOSPHERIC BACKGROUND - Subtle grain texture
+   ============================================ */
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+  opacity: var(--grain-opacity, 0.015);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ============================================
+   REACT FLOW CUSTOMIZATIONS
+   ============================================ */
+
+.react-flow__pane {
+  cursor: grab;
+}
+
+.react-flow__pane:active {
+  cursor: grabbing;
+}
+
+/* Edge styling - Refined */
+.react-flow__edge-path {
+  stroke: var(--color-border);
+  stroke-width: 1.5px;
+  transition: stroke 0.3s ease, stroke-width 0.3s ease;
+}
+
+.react-flow__edge:hover .react-flow__edge-path {
+  stroke: var(--color-text-muted);
+  stroke-width: 2px;
+}
+
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: var(--color-primary);
+  stroke-width: 2px;
+}
+
+/* Animated edges - Energy flow */
+.react-flow__edge.animated .react-flow__edge-path {
+  stroke: var(--color-primary);
+  stroke-dasharray: 6 4;
+  animation: energy-flow 1.2s linear infinite;
+}
+
+@keyframes energy-flow {
+  from { stroke-dashoffset: 0; }
+  to { stroke-dashoffset: -10; }
+}
+
+/* Connection line (while dragging) */
+.react-flow__connection-line {
+  stroke: var(--color-primary);
+  stroke-width: 2px;
+  stroke-dasharray: 6 4;
+  animation: connection-pulse 0.6s ease-in-out infinite alternate;
+}
+
+@keyframes connection-pulse {
+  from { opacity: 0.5; }
+  to { opacity: 1; }
+}
+
+/* Controls - Glass panel */
+.react-flow__controls {
+  background: var(--glass-bg);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+
+.react-flow__controls-button {
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--color-border-subtle);
+  color: var(--color-text-muted);
+  width: 32px;
+  height: 32px;
+  transition: all 0.2s ease;
+}
+
+.react-flow__controls-button:hover {
+  background: var(--color-surface-highlight);
+  color: var(--color-primary);
+}
+
+.react-flow__controls-button:last-child {
+  border-bottom: 0;
+}
+
+.react-flow__controls-button svg {
+  fill: currentColor;
+  stroke: currentColor;
+  width: 16px;
+  height: 16px;
+}
+
+/* Custom control buttons */
+.control-button {
+  background: var(--glass-bg);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  color: var(--color-text-muted);
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.control-button:hover {
+  background: var(--color-surface-highlight);
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+  box-shadow: var(--shadow-glow-primary);
+}
+
+/* MiniMap - Observatory view */
+.react-flow__minimap {
+  background: var(--glass-bg);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg);
+}
+
+.react-flow__minimap-mask {
+  fill: var(--minimap-mask);
+}
+
+.react-flow__minimap-node {
+  fill: var(--color-surface-highlight);
+  stroke: var(--color-border);
+  stroke-width: 1;
+}
+
+/* Hide attribution */
+.react-flow__attribution {
+  display: none;
+}
+
+/* Handle styling - Energy points */
+.react-flow__handle {
+  width: 10px;
+  height: 10px;
+  border-width: 2px;
+  border-color: var(--color-background);
+  transition: all 0.2s ease;
+}
+
+.react-flow__handle-left {
+  left: -5px;
+}
+
+.react-flow__handle-right {
+  right: -5px;
+}
+
+.react-flow__handle:hover {
+  transform: scale(1.3);
+  box-shadow: 0 0 12px var(--color-primary-glow);
+}
+
+/* Selection box */
+.react-flow__selection {
+  background-color: var(--selection-bg);
+  border: 1px solid var(--selection-border);
+}
+
+/* ============================================
+   CUSTOM SCROLLBAR - Refined
+   ============================================ */
+
+.scrollbar-dark::-webkit-scrollbar {
+  width: 6px;
+}
+
+.scrollbar-dark::-webkit-scrollbar-track {
+  background-color: transparent;
+}
+
+.scrollbar-dark::-webkit-scrollbar-thumb {
+  background-color: var(--color-border);
+  border-radius: 3px;
+}
+
+.scrollbar-dark::-webkit-scrollbar-thumb:hover {
+  background-color: var(--color-text-muted);
+}
+
+/* Truncate with ellipsis */
+.truncate-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* ============================================
+   NODE STYLES - Glass Panels
+   ============================================ */
+
+/* Base node - Glass morphism */
+.node-glass {
+  background: var(--glass-bg);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  box-shadow: inset 0 1px 0 var(--bevel-highlight);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.node-glass:hover {
+  border-color: var(--color-border);
+  box-shadow: inset 0 1px 0 var(--bevel-highlight), var(--shadow-lg);
+}
+
+/* Primary variant (MCP servers) - Amber accent */
+.node-glass-primary {
+  background: linear-gradient(
+    135deg,
+    var(--glass-bg) 0%,
+    color-mix(in srgb, var(--color-primary) 4%, transparent) 100%
+  );
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  box-shadow: inset 0 1px 0 var(--bevel-highlight);
+}
+
+.node-glass-primary.selected {
+  border-color: var(--color-primary);
+  box-shadow:
+    inset 0 1px 0 var(--bevel-highlight),
+    0 0 0 1px var(--color-primary),
+    var(--shadow-glow-primary),
+    var(--shadow-lg);
+}
+
+/* Secondary variant (Resources) - Teal accent */
+.node-glass-secondary {
+  background: linear-gradient(
+    135deg,
+    var(--glass-bg) 0%,
+    color-mix(in srgb, var(--color-secondary) 4%, transparent) 100%
+  );
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  box-shadow: inset 0 1px 0 var(--bevel-highlight);
+}
+
+.node-glass-secondary.selected {
+  border-color: var(--color-secondary);
+  box-shadow:
+    inset 0 1px 0 var(--bevel-highlight),
+    0 0 0 1px var(--color-secondary),
+    var(--shadow-glow-secondary),
+    var(--shadow-lg);
+}
+
+/* Gateway node - Central hub */
+.node-gateway {
+  background: linear-gradient(
+    180deg,
+    var(--glass-elevated-bg) 0%,
+    color-mix(in srgb, var(--color-primary) 6%, transparent) 100%
+  );
+  backdrop-filter: blur(20px);
+  border: 1px solid color-mix(in srgb, var(--color-primary) 22%, transparent);
+  border-radius: 16px;
+  box-shadow: inset 0 1px 0 var(--bevel-highlight), var(--shadow-lg);
+}
+
+.node-gateway.selected {
+  border-color: var(--color-primary);
+  box-shadow:
+    inset 0 1px 0 var(--bevel-highlight),
+    0 0 0 2px var(--color-primary),
+    var(--shadow-glow-primary),
+    var(--shadow-lg);
+}
+
+/* ============================================
+   STATUS INDICATORS - Living dots
+   ============================================ */
+
+.status-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  position: relative;
+}
+
+.status-indicator::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  animation: status-pulse 2s ease-in-out infinite;
+}
+
+.status-indicator-running {
+  background: var(--color-status-running);
+  box-shadow: 0 0 8px var(--color-status-running-glow);
+}
+
+.status-indicator-running::after {
+  background: var(--color-status-running);
+  animation-name: status-pulse-running;
+}
+
+@keyframes status-pulse-running {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.8); opacity: 0; }
+}
+
+.status-indicator-stopped {
+  background: var(--color-status-stopped);
+}
+
+.status-indicator-stopped::after {
+  display: none;
+}
+
+.status-indicator-error {
+  background: var(--color-status-error);
+  box-shadow: 0 0 8px var(--color-status-error-glow);
+  animation: error-blink 1s ease-in-out infinite;
+}
+
+@keyframes error-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+.status-indicator-pending {
+  background: var(--color-status-pending);
+  box-shadow: 0 0 8px var(--color-status-pending-glow);
+  animation: pending-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pending-pulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+/* ============================================
+   ANIMATIONS - Staggered reveals
+   ============================================ */
+
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-in-scale {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes slide-in-right {
+  from {
+    opacity: 0;
+    transform: translateX(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes glow-pulse {
+  0%, 100% {
+    box-shadow: 0 0 12px var(--color-primary-glow);
+  }
+  50% {
+    box-shadow: 0 0 24px var(--color-primary-glow), 0 0 48px var(--color-primary-glow);
+  }
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up 0.4s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+.animate-fade-in-scale {
+  animation: fade-in-scale 0.3s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+.animate-slide-in-right {
+  animation: slide-in-right 0.3s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* Stagger delays */
+.stagger-1 { animation-delay: 0.05s; }
+.stagger-2 { animation-delay: 0.1s; }
+.stagger-3 { animation-delay: 0.15s; }
+.stagger-4 { animation-delay: 0.2s; }
+.stagger-5 { animation-delay: 0.25s; }
+
+/* ============================================
+   BUTTON STYLES - Refined interactions
+   ============================================ */
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-primary-dark) 100%);
+  color: var(--color-background);
+  font-weight: 600;
+  padding: 0.5rem 1rem;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  box-shadow: 0 2px 8px var(--color-primary-glow);
+}
+
+.btn-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px var(--color-primary-glow), var(--shadow-glow-primary);
+}
+
+.btn-primary:active {
+  transform: translateY(0);
+}
+
+.btn-secondary {
+  background: var(--color-surface-elevated);
+  color: var(--color-text-primary);
+  font-weight: 500;
+  padding: 0.5rem 1rem;
+  border-radius: 8px;
+  border: 1px solid var(--color-border);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-secondary:hover {
+  background: var(--color-surface-highlight);
+  border-color: var(--color-text-muted);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-weight: 500;
+  padding: 0.5rem 1rem;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-ghost:hover {
+  background: var(--color-surface-highlight);
+  color: var(--color-text-primary);
+}
+
+.btn-danger {
+  background: linear-gradient(135deg, var(--color-status-error) 0%, #e11d48 100%);
+  color: white;
+  font-weight: 600;
+  padding: 0.5rem 1rem;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  box-shadow: 0 2px 8px var(--color-status-error-glow);
+}
+
+.btn-danger:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px var(--color-status-error-glow);
+}
+
+/* ============================================
+   GLASS PANELS - Atmospheric surfaces
+   ============================================ */
+
+.glass-panel {
+  background: var(--glass-bg);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+}
+
+.glass-panel-elevated {
+  background: var(--glass-elevated-bg);
+  backdrop-filter: blur(20px);
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg);
+}
+
+/* Top-edge inset highlight — fakes light catching a beveled glass surface.
+   Compose with other shadows via comma separation. */
+.shadow-bevel {
+  box-shadow: inset 0 1px 0 var(--bevel-highlight);
+}
+
+.shadow-lg-bevel {
+  box-shadow: inset 0 1px 0 var(--bevel-highlight), var(--shadow-lg);
+}
+
+/* ============================================
+   PERFORMANCE OPTIMIZATIONS
+   ============================================ */
+
+.node-glass,
+.node-glass-primary,
+.node-glass-secondary,
+.node-gateway,
+.react-flow__edge-path {
+  transform: translateZ(0);
+  will-change: transform, opacity, box-shadow;
+}
+
+/* Prevent clipping on hover animations */
+.react-flow__node,
+.react-flow__node *,
+.react-flow__nodes,
+.react-flow__renderer,
+.react-flow__viewport {
+  overflow: visible !important;
+}
+
+/* Re-assert clipping for truncated tool fan-out labels. The rule above forces
+   overflow:visible on every node descendant, which otherwise defeats the
+   `truncate` utility (it needs overflow:hidden) and lets long tool names spill
+   past the pill. Higher specificity + !important wins it back, scoped to the
+   label so badges/handles/dots still overflow freely. */
+.react-flow__node .tool-label {
+  overflow: hidden !important;
+}
+
+/* Re-assert scrolling for in-node popovers (tool overflow list, tool detail).
+   Same conflict as .tool-label: the blanket rule above forces overflow:visible
+   on every node descendant, which defeats overflow-y-auto and lets popover
+   content paint past the panel border onto the canvas. */
+.react-flow__node .node-scroll {
+  overflow-y: auto !important;
+}
+
+.react-flow__edge.animated .react-flow__edge-path {
+  transform: translateZ(0);
+  backface-visibility: hidden;
+}
+
+.control-button,
+.react-flow__controls-button {
+  will-change: background-color, color, box-shadow;
+}
+
+/* ============================================
+   PATH HIGHLIGHTING - Selection-based dimming
+   ============================================ */
+
+/* Base transition for nodes and edges */
+.react-flow__node,
+.react-flow__edge {
+  transition: opacity 0.3s ease, filter 0.3s ease, visibility 0.3s ease;
+}
+
+/* Hidden state - for uses edges when no selection */
+.react-flow__edge.hidden {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* Visible state - override hidden when uses edge should be shown */
+.react-flow__edge.visible {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+/* Uses edges base style (dashed lines) */
+.react-flow__edge.uses-edge .react-flow__edge-path {
+  stroke-dasharray: 4 4;
+}
+
+/* Dimmed state - nodes */
+.react-flow__node.dimmed {
+  opacity: 0.25;
+  filter: grayscale(40%);
+}
+
+/* Dimmed state - edges */
+.react-flow__edge.dimmed .react-flow__edge-path {
+  opacity: 0.15;
+  stroke: var(--color-border) !important;
+}
+
+/* Highlighted state - nodes get elevated z-index */
+.react-flow__node.highlighted {
+  z-index: 10;
+}
+
+/* Highlighted state - edges get enhanced visibility */
+.react-flow__edge.highlighted .react-flow__edge-path {
+  stroke-width: 2.5px !important;
+  filter: drop-shadow(0 0 4px currentColor);
+}
+
+/* Access Lens: render edges as calm, solid lines while editing scope — the
+   energy-flow animation is stopped and the dash pattern dropped, so nothing
+   marches. Defined after the `.animated` rule so it wins on equal specificity. */
+.react-flow__edge.lens-frozen .react-flow__edge-path {
+  animation: none !important;
+  stroke-dasharray: none !important;
+}
+
+/* Reduced motion preference */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ============================================
+   LOG VIEWER - Font size scaling
+   ============================================ */
+
+/* Log text uses a CSS custom property for font sizing.
+   Set --log-font-size on the log container to control all log text. */
+.log-text {
+  font-size: var(--log-font-size, 11px);
+  line-height: 1.5;
+}
+
+.log-text-detail {
+  font-size: calc(var(--log-font-size, 11px) - 1px);
+  line-height: 1.4;
+}
+
+/* ============================================
+   DETACHED WINDOW STYLES
+   ============================================ */
+
+/* Shadow glow variants for status colors */
+.shadow-glow-success {
+  box-shadow: 0 0 12px var(--color-status-running-glow);
+}
+
+.shadow-glow-error {
+  box-shadow: 0 0 12px var(--color-status-error-glow);
+}
+
+/* Detached window indicator pulse */
+@keyframes detached-pulse {
+  0%, 100% {
+    opacity: 0.7;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.detached-indicator {
+  animation: detached-pulse 2s ease-in-out infinite;
+}
+
+/* Text zoom scaling classes */
+.text-zoom {
+  font-size: var(--text-zoom-size, 12px);
+  line-height: 1.5;
+}
+
+/* ============================================
+   PLAYGROUND - Markdown prose rendering
+   ============================================ */
+
+.prose-playground {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--color-text-primary);
+}
+
+.prose-playground p { margin: 0 0 0.5em; }
+.prose-playground p:last-child { margin-bottom: 0; }
+.prose-playground strong { color: var(--color-text-primary); font-weight: 600; }
+.prose-playground em { color: var(--color-text-secondary); font-style: italic; }
+.prose-playground code {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  background: color-mix(in srgb, var(--color-secondary) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-secondary) 16%, transparent);
+  color: var(--color-secondary-light);
+  padding: 0.1em 0.35em;
+  border-radius: 3px;
+}
+.prose-playground pre {
+  background: var(--color-background);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 0.5em 0.75em;
+  overflow-x: auto;
+  margin: 0.5em 0;
+}
+.prose-playground pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 10px;
+  color: var(--color-text-secondary);
+}
+.prose-playground ul, .prose-playground ol {
+  margin: 0.25em 0 0.5em;
+  padding-left: 1.25em;
+}
+.prose-playground li { margin: 0.15em 0; }
+.prose-playground h1, .prose-playground h2, .prose-playground h3 {
+  color: var(--color-text-primary);
+  font-weight: 600;
+  margin: 0.75em 0 0.25em;
+  line-height: 1.3;
+}
+.prose-playground h1 { font-size: 14px; }
+.prose-playground h2 { font-size: 13px; }
+.prose-playground h3 { font-size: 12px; }
+.prose-playground a {
+  color: var(--color-secondary-light);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--color-secondary) 35%, transparent);
+}
+.prose-playground blockquote {
+  border-left: 2px solid var(--color-secondary);
+  margin: 0.5em 0;
+  padding-left: 0.75em;
+  color: var(--color-text-secondary);
+  font-style: italic;
+}
+
+/* ============================================
+   SKILL LIBRARY - Markdown instructions rendering
+   Scope for MarkdownPreview (Library inspector
+   Instructions tab + SkillEditor preview pane).
+   ============================================ */
+.skill-md {
+  color: var(--color-text-secondary);
+  /* Scales with the reading-pane text-size control (useTextZoom sets
+     --text-zoom-size on the wrapping container). Children below use em so the
+     whole hierarchy scales from this single base; 13px stays the default. */
+  font-size: var(--text-zoom-size, 13px);
+  line-height: 1.6;
+  word-break: break-word;
+}
+.skill-md > :first-child { margin-top: 0; }
+.skill-md > :last-child { margin-bottom: 0; }
+
+.skill-md h1,
+.skill-md h2,
+.skill-md h3,
+.skill-md h4 {
+  color: var(--color-text-primary);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+}
+.skill-md h1 {
+  font-size: 1.385em;
+  margin: 0 0 0.75em;
+  padding-bottom: 0.4em;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+.skill-md h2 { font-size: 1.154em; margin: 1.4em 0 0.5em; }
+.skill-md h3 { font-size: 1em; margin: 1.1em 0 0.35em; }
+.skill-md h4 { font-size: 0.923em; margin: 1em 0 0.3em; color: var(--color-text-secondary); }
+
+.skill-md p { margin: 0 0 0.7em; }
+.skill-md strong { color: var(--color-text-primary); font-weight: 600; }
+.skill-md em { color: var(--color-text-secondary); }
+.skill-md a { color: var(--color-primary); text-decoration: none; }
+.skill-md a:hover { text-decoration: underline; }
+
+.skill-md ul,
+.skill-md ol { margin: 0.5em 0 0.7em; padding-left: 1.3em; }
+.skill-md li { margin: 0.2em 0; }
+.skill-md li::marker { color: var(--color-text-muted); }
+
+.skill-md hr {
+  border: 0;
+  border-top: 1px solid var(--color-border-subtle);
+  margin: 1.25em 0;
+}
+
+/* Inline code only (fenced blocks are styled via .md-code below). */
+.skill-md :not(pre) > code {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.85em;
+  color: var(--color-primary-light);
+  background: var(--color-surface-highlight);
+  padding: 0.1em 0.4em;
+  border-radius: 4px;
+}
+
+.skill-md blockquote {
+  border-left: 2px solid var(--color-border);
+  margin: 0.7em 0;
+  padding: 0.1em 0 0.1em 0.9em;
+  color: var(--color-text-muted);
+}
+
+.skill-md table {
+  display: block;
+  width: 100%;
+  border-collapse: collapse;
+  overflow-x: auto;
+  margin: 0.7em 0;
+  font-size: 0.923em;
+}
+.skill-md th,
+.skill-md td {
+  border: 1px solid var(--color-border);
+  padding: 0.4em 0.6em;
+  text-align: left;
+}
+.skill-md th {
+  color: var(--color-text-primary);
+  font-weight: 600;
+  background: var(--color-surface-elevated);
+}
+.skill-md td { color: var(--color-text-secondary); }
+
+/* --- Fenced code blocks (custom marked renderer) --- */
+.skill-md .md-code {
+  margin: 0.8em 0;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--color-background);
+}
+.skill-md .md-code__bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.3em 0.6em;
+  background: var(--color-surface-elevated);
+  border-bottom: 1px solid var(--color-border);
+}
+.skill-md .md-code__lang {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.769em;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-text-muted);
+}
+.skill-md .md-code__copy {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.769em;
+  color: var(--color-text-muted);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  padding: 0.15em 0.5em;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.skill-md .md-code__copy:hover {
+  color: var(--color-text-primary);
+  border-color: var(--color-text-muted);
+}
+.skill-md .md-code__copy[data-copied] {
+  color: var(--color-status-running);
+  border-color: var(--color-status-running);
+}
+.skill-md .md-code pre {
+  margin: 0;
+  padding: 0.75em 0.85em;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  overflow-x: auto;
+}
+.skill-md .md-code code {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.923em;
+  line-height: 1.55;
+  background: none;
+  padding: 0;
+  color: var(--color-text-secondary);
+}
+
+/* Prism token colors, mapped to theme tokens so they re-key per data-theme. */
+.skill-md .token.comment,
+.skill-md .token.prolog,
+.skill-md .token.doctype,
+.skill-md .token.cdata { color: var(--color-text-muted); font-style: italic; }
+.skill-md .token.punctuation { color: var(--color-text-secondary); }
+.skill-md .token.property,
+.skill-md .token.tag,
+.skill-md .token.boolean,
+.skill-md .token.number,
+.skill-md .token.constant,
+.skill-md .token.symbol { color: var(--color-tertiary-light); }
+.skill-md .token.selector,
+.skill-md .token.attr-name,
+.skill-md .token.string,
+.skill-md .token.char,
+.skill-md .token.builtin,
+.skill-md .token.inserted { color: var(--color-secondary-light); }
+.skill-md .token.operator,
+.skill-md .token.entity,
+.skill-md .token.url { color: var(--color-tertiary); }
+.skill-md .token.atrule,
+.skill-md .token.attr-value,
+.skill-md .token.keyword { color: var(--color-primary-light); }
+.skill-md .token.function,
+.skill-md .token.class-name { color: var(--color-secondary); }
+.skill-md .token.regex,
+.skill-md .token.important,
+.skill-md .token.variable { color: var(--color-primary); }
+
+/* --- GitHub-style alert callouts (marked-alert) --- */
+.skill-md .markdown-alert {
+  margin: 0.8em 0;
+  padding: 0.6em 0.85em;
+  border-left: 3px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-surface-elevated);
+}
+.skill-md .markdown-alert > :first-child { margin-top: 0; }
+.skill-md .markdown-alert > :last-child { margin-bottom: 0; }
+.skill-md .markdown-alert-title {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 0.3em;
+}
+.skill-md .markdown-alert-title svg {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+}
+.skill-md .markdown-alert-note { border-left-color: var(--color-secondary); }
+.skill-md .markdown-alert-note .markdown-alert-title { color: var(--color-secondary-light); }
+.skill-md .markdown-alert-tip { border-left-color: var(--color-status-running); }
+.skill-md .markdown-alert-tip .markdown-alert-title { color: var(--color-status-running); }
+.skill-md .markdown-alert-important { border-left-color: var(--color-tertiary); }
+.skill-md .markdown-alert-important .markdown-alert-title { color: var(--color-tertiary-light); }
+.skill-md .markdown-alert-warning { border-left-color: var(--color-primary); }
+.skill-md .markdown-alert-warning .markdown-alert-title { color: var(--color-primary-light); }
+.skill-md .markdown-alert-caution { border-left-color: var(--color-status-error); }
+.skill-md .markdown-alert-caution .markdown-alert-title { color: var(--color-status-error); }

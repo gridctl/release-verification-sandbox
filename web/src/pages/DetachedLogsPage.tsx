@@ -1,0 +1,262 @@
+import { useEffect, useRef, useState } from 'react';
+import {
+  Terminal,
+  ChevronDown,
+  Maximize2,
+  Minimize2,
+  Radio,
+  Layers,
+} from 'lucide-react';
+import { cn } from '../lib/cn';
+import { IconButton } from '../components/ui/IconButton';
+import { GATEWAY_LOG_SOURCE, LogsView, useLogsView } from '../components/log';
+import { fetchStatus } from '../lib/api';
+import { useDetachedWindowSync } from '../hooks/useBroadcastChannel';
+import { POLLING } from '../lib/constants';
+import type { GatewayStatus } from '../types';
+import { ErrorBoundary } from '../components/ui/ErrorBoundary';
+
+interface NodeOption {
+  name: string;
+  type: 'mcp-server' | 'resource';
+}
+
+// Frameless logs popout. The log surface itself is the shared LogsView (same
+// URL-synced ?source=/?q=/?level=/?trace= semantics as the workspace, in this
+// window's own URL) including the full control bar, so every stream action
+// stays in lockstep with the workspace; this page adds only the window
+// chrome: source dropdown, fullscreen, and the footer. Trace pivots open the
+// Traces workspace in a full app tab since the popout has no other workspaces.
+function DetachedLogsPageContent() {
+  const view = useLogsView();
+  const { source } = view;
+
+  const [nodes, setNodes] = useState<NodeOption[]>([]);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  // Register with main window
+  useDetachedWindowSync('logs');
+
+  // Fetch available nodes for the source picker
+  useEffect(() => {
+    const fetchNodes = async () => {
+      try {
+        const status: GatewayStatus = await fetchStatus();
+        const nodeList: NodeOption[] = [
+          ...(status['mcp-servers'] ?? []).map((s) => ({ name: s.name, type: 'mcp-server' as const })),
+          ...(status.resources ?? []).map((r) => ({ name: r.name, type: 'resource' as const })),
+        ];
+        setNodes(nodeList);
+      } catch {
+        // Ignore errors fetching nodes
+      }
+    };
+
+    fetchNodes();
+    const nodeInterval = window.setInterval(fetchNodes, POLLING.STATUS);
+
+    return () => clearInterval(nodeInterval);
+  }, []);
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setDropdownOpen(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  const isGateway = source === GATEWAY_LOG_SOURCE;
+  const sourceLabel = source == null ? 'All sources' : isGateway ? 'Gateway' : source;
+
+  const handleSelectSource = (next: string | null) => {
+    view.setSource(next);
+    setDropdownOpen(false);
+  };
+
+  const toggleFullscreen = async () => {
+    if (!document.fullscreenElement) {
+      await document.documentElement.requestFullscreen();
+      setIsFullscreen(true);
+    } else {
+      await document.exitFullscreen();
+      setIsFullscreen(false);
+    }
+  };
+
+  // Listen for fullscreen changes
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(!!document.fullscreenElement);
+    };
+
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
+  }, []);
+
+  return (
+    <div className="h-screen w-screen bg-background flex flex-col overflow-hidden">
+      {/* Background grain */}
+      <div
+        className="fixed inset-0 pointer-events-none z-0 opacity-[0.015]"
+        style={{
+          backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E")`,
+        }}
+      />
+
+      {/* Header — identity chrome only; stream actions live in the shared bar */}
+      <header className="h-12 flex-shrink-0 bg-surface/90 backdrop-blur-xl border-b border-border/50 flex items-center justify-between px-4 z-10 relative">
+        {/* Top accent line */}
+        <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-primary/30 to-transparent" />
+
+        <div className="flex items-center gap-3">
+          <div className={cn(
+            'p-1.5 rounded-lg border',
+            source == null
+              ? 'bg-surface-elevated/60 border-border/50'
+              : isGateway
+                ? 'bg-primary/10 border-primary/20'
+                : 'bg-tertiary/10 border-tertiary/20'
+          )}>
+            {source == null ? (
+              <Layers size={14} className="text-text-secondary" />
+            ) : isGateway ? (
+              <Radio size={14} className="text-primary" />
+            ) : (
+              <Terminal size={14} className="text-tertiary" />
+            )}
+          </div>
+
+          {/* Source selector dropdown */}
+          <div className="relative" ref={dropdownRef}>
+            <button
+              onClick={() => setDropdownOpen(!dropdownOpen)}
+              className={cn(
+                'flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-all',
+                'bg-surface-elevated/60 border border-border/50',
+                'hover:bg-surface-highlight hover:border-text-muted/30',
+                dropdownOpen && 'bg-surface-highlight border-text-muted/30'
+              )}
+            >
+              <span className="text-text-primary">{sourceLabel}</span>
+              <ChevronDown
+                size={14}
+                className={cn(
+                  'text-text-muted transition-transform duration-200',
+                  dropdownOpen && 'rotate-180'
+                )}
+              />
+            </button>
+
+            {dropdownOpen && (
+              <div className="absolute top-full left-0 mt-1 w-64 py-1 bg-surface-elevated/95 backdrop-blur-xl border border-border/50 rounded-lg shadow-lg z-50 animate-fade-in-scale">
+                <SourceOption
+                  label="All sources"
+                  dotClass="bg-text-muted"
+                  tag="all"
+                  selected={source == null}
+                  onSelect={() => handleSelectSource(null)}
+                />
+                <SourceOption
+                  label="Gateway"
+                  dotClass="bg-primary"
+                  tag="gateway"
+                  selected={isGateway}
+                  onSelect={() => handleSelectSource(GATEWAY_LOG_SOURCE)}
+                />
+                {(nodes ?? []).map((node) => (
+                  <SourceOption
+                    key={node.name}
+                    label={node.name}
+                    dotClass={node.type === 'mcp-server' ? 'bg-violet-400' : 'bg-secondary'}
+                    tag={node.type === 'mcp-server' ? 'server' : node.type}
+                    selected={source === node.name}
+                    onSelect={() => handleSelectSource(node.name)}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+
+          {isGateway && (
+            <span className="text-[10px] px-1.5 py-0.5 bg-primary/10 text-primary rounded font-medium border border-primary/20">
+              Structured
+            </span>
+          )}
+        </div>
+      </header>
+
+      {/* Log surface — shared with the workspace, incl. the full control bar */}
+      <LogsView
+        view={view}
+        onTraceClick={(traceId) =>
+          window.open(`/traces?trace=${encodeURIComponent(traceId)}`, '_blank', 'noopener')
+        }
+        emptyText="No logs available"
+        toolbarExtra={
+          <IconButton
+            icon={isFullscreen ? Minimize2 : Maximize2}
+            onClick={toggleFullscreen}
+            tooltip={isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
+            size="sm"
+            variant="ghost"
+          />
+        }
+      />
+
+      {/* Footer status bar. Entry counts live in the shared filter bar now —
+          repeating them here showed the same numbers twice. */}
+      <footer className="h-6 flex-shrink-0 bg-surface/90 backdrop-blur-xl border-t border-border/50 flex items-center justify-end px-4 text-[10px] text-text-muted">
+        <span className="flex items-center gap-1">
+          <span className="w-1.5 h-1.5 rounded-full bg-text-muted animate-pulse motion-reduce:animate-none" />
+          Detached Window
+        </span>
+      </footer>
+    </div>
+  );
+}
+
+function SourceOption({
+  label,
+  dotClass,
+  tag,
+  selected,
+  onSelect,
+}: {
+  label: string;
+  dotClass: string;
+  tag: string;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      onClick={onSelect}
+      className={cn(
+        'w-full flex items-center gap-2 px-3 py-2 text-left text-sm transition-colors',
+        'hover:bg-surface-highlight',
+        selected && 'bg-primary/10 text-primary'
+      )}
+    >
+      <span className={cn('w-1.5 h-1.5 rounded-full', dotClass)} />
+      <span className="truncate">{label}</span>
+      <span className="ml-auto text-[10px] text-text-muted uppercase">{tag}</span>
+    </button>
+  );
+}
+
+// Export with error boundary wrapper
+export function DetachedLogsPage() {
+  return (
+    <ErrorBoundary variant="window">
+      <DetachedLogsPageContent />
+    </ErrorBoundary>
+  );
+}

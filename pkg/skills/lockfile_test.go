@@ -1,0 +1,279 @@
+package skills
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestLockFileReadWrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "skills.lock.yaml")
+
+	lf := &LockFile{
+		Sources: map[string]LockedSource{
+			"my-skills": {
+				Repo:      "https://github.com/org/skills",
+				Ref:       "main",
+				CommitSHA: "abc123",
+				FetchedAt: time.Date(2025, 1, 15, 10, 0, 0, 0, time.UTC),
+				Skills: map[string]LockedSkill{
+					"deploy": {Path: "skills/deploy", ContentHash: "hash1"},
+					"lint":   {Path: "skills/lint", ContentHash: "hash2"},
+				},
+			},
+		},
+	}
+
+	require.NoError(t, WriteLockFile(path, lf))
+	assert.FileExists(t, path)
+
+	got, err := ReadLockFile(path)
+	require.NoError(t, err)
+	assert.Len(t, got.Sources, 1)
+
+	src := got.Sources["my-skills"]
+	assert.Equal(t, "https://github.com/org/skills", src.Repo)
+	assert.Equal(t, "abc123", src.CommitSHA)
+	assert.Len(t, src.Skills, 2)
+	assert.Equal(t, "hash1", src.Skills["deploy"].ContentHash)
+}
+
+func TestLockFile_CredentialRefRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "skills.lock.yaml")
+
+	lf := &LockFile{
+		Sources: map[string]LockedSource{
+			"private": {
+				Repo:          "https://gitlab.internal/team/skills",
+				Ref:           "main",
+				CommitSHA:     "abc",
+				FetchedAt:     time.Now().UTC(),
+				CredentialRef: "${vault:GIT_TOKEN}",
+				Skills:        map[string]LockedSkill{"x": {Path: "x"}},
+			},
+		},
+	}
+	require.NoError(t, WriteLockFile(path, lf))
+
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), "${vault:GIT_TOKEN}")
+
+	got, err := ReadLockFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "${vault:GIT_TOKEN}", got.Sources["private"].CredentialRef)
+}
+
+func TestLockFileReadNotFound(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nonexistent.yaml")
+
+	lf, err := ReadLockFile(path)
+	require.NoError(t, err)
+	assert.NotNil(t, lf)
+	assert.Empty(t, lf.Sources)
+}
+
+func TestLockFileSetRemoveSource(t *testing.T) {
+	lf := &LockFile{Sources: make(map[string]LockedSource)}
+
+	lf.SetSource("test", LockedSource{
+		Repo:      "https://github.com/org/test",
+		CommitSHA: "abc",
+	})
+	assert.Len(t, lf.Sources, 1)
+
+	lf.RemoveSource("test")
+	assert.Empty(t, lf.Sources)
+}
+
+func TestLockFileRemoveSkill(t *testing.T) {
+	lf := &LockFile{
+		Sources: map[string]LockedSource{
+			"src": {
+				Skills: map[string]LockedSkill{
+					"skill-a": {ContentHash: "a"},
+					"skill-b": {ContentHash: "b"},
+				},
+			},
+		},
+	}
+
+	// Remove one skill
+	lf.RemoveSkill("skill-a")
+	assert.Len(t, lf.Sources["src"].Skills, 1)
+
+	// Remove last skill should remove source
+	lf.RemoveSkill("skill-b")
+	assert.Empty(t, lf.Sources)
+}
+
+func TestLockFileFindSkillSource(t *testing.T) {
+	lf := &LockFile{
+		Sources: map[string]LockedSource{
+			"src-a": {
+				Skills: map[string]LockedSkill{
+					"skill-1": {},
+				},
+			},
+			"src-b": {
+				Skills: map[string]LockedSkill{
+					"skill-2": {},
+				},
+			},
+		},
+	}
+
+	name, src, found := lf.FindSkillSource("skill-2")
+	assert.True(t, found)
+	assert.Equal(t, "src-b", name)
+	assert.NotNil(t, src)
+
+	_, _, found = lf.FindSkillSource("nonexistent")
+	assert.False(t, found)
+}
+
+func TestLockFileInvalidYAML(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bad.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("not: [valid: yaml"), 0644))
+
+	_, err := ReadLockFile(path)
+	assert.Error(t, err)
+}
+
+func TestLockFilePath(t *testing.T) {
+	p := LockFilePath()
+	assert.Contains(t, p, ".gridctl")
+	assert.Contains(t, p, "skills.lock.yaml")
+}
+
+func TestLockFileWithFingerprint(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "skills.lock.yaml")
+
+	fp := &Fingerprint{
+		ContentHash: "abc123",
+		ToolsHash:   "def456",
+		Tools:       []string{"tool-a", "tool-b"},
+	}
+
+	lf := &LockFile{
+		Sources: map[string]LockedSource{
+			"test-src": {
+				Repo:      "https://github.com/org/skills",
+				Ref:       "main",
+				CommitSHA: "sha1",
+				FetchedAt: time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC),
+				Skills: map[string]LockedSkill{
+					"my-skill": {
+						Path:        "skills/my-skill",
+						ContentHash: "hash1",
+						Fingerprint: fp,
+					},
+				},
+			},
+		},
+	}
+
+	require.NoError(t, WriteLockFile(path, lf))
+
+	got, err := ReadLockFile(path)
+	require.NoError(t, err)
+
+	skill := got.Sources["test-src"].Skills["my-skill"]
+	require.NotNil(t, skill.Fingerprint)
+	assert.Equal(t, "abc123", skill.Fingerprint.ContentHash)
+	assert.Equal(t, "def456", skill.Fingerprint.ToolsHash)
+	assert.Equal(t, []string{"tool-a", "tool-b"}, skill.Fingerprint.Tools)
+}
+
+func TestLockFileSetSourceInitializesMap(t *testing.T) {
+	lf := &LockFile{}
+	lf.SetSource("new", LockedSource{Repo: "https://example.com/repo"})
+	assert.Len(t, lf.Sources, 1)
+	assert.Equal(t, "https://example.com/repo", lf.Sources["new"].Repo)
+}
+
+// TestReadLockFileMigratesRuleFiles pins the back-compat path: a lockfile
+// written before per-rule provenance carries rules as a bare name list, and
+// must load with entries whose hash is empty — meaning "unknown", never a
+// hash that could match content and license an overwrite.
+func TestReadLockFileMigratesRuleFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "skills.lock.yaml")
+	legacy := `version: 2
+sources:
+  acme-pack:
+    repo: https://github.com/acme/pack
+    ref: main
+    commit_sha: abc123
+    content_hash: h2:deadbeef
+    pack:
+      name: team-pack
+      rules:
+        - style
+        - review
+`
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	lf, err := ReadLockFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack := lf.Sources["acme-pack"].Pack
+	if pack == nil {
+		t.Fatal("pack record lost on read")
+	}
+	if len(pack.RuleFiles) != 2 {
+		t.Fatalf("RuleFiles = %+v, want 2 migrated entries", pack.RuleFiles)
+	}
+	for name, rule := range pack.RuleFiles {
+		if rule.ContentHash != "" {
+			t.Errorf("%s migrated with hash %q, want empty (unknown provenance)", name, rule.ContentHash)
+		}
+	}
+	if len(pack.Rules) != 2 {
+		t.Errorf("Rules list must survive migration, got %v", pack.Rules)
+	}
+}
+
+func TestReadLockFileKeepsExistingRuleFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "skills.lock.yaml")
+	current := `version: 2
+sources:
+  acme-pack:
+    repo: https://github.com/acme/pack
+    ref: main
+    commit_sha: abc123
+    pack:
+      name: team-pack
+      rules:
+        - style
+      rule_files:
+        style:
+          path: rules/style.md
+          content_hash: h2:cafe
+`
+	if err := os.WriteFile(path, []byte(current), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	lf, err := ReadLockFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := lf.Sources["acme-pack"].Pack.RuleFiles["style"]
+	if got.ContentHash != "h2:cafe" || got.Path != "rules/style.md" {
+		t.Errorf("recorded provenance overwritten by migration: %+v", got)
+	}
+}

@@ -1,0 +1,340 @@
+package api
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"os"
+	"sync"
+	"sync/atomic"
+
+	"github.com/gridctl/gridctl/internal/stackedit"
+	"gopkg.in/yaml.v3"
+)
+
+// Sentinel errors for the tool-whitelist editor. Callers translate these into
+// HTTP status codes; the YAML helper itself is transport-agnostic.
+var (
+	errServerNotFound = errors.New("mcp server not found in stack")
+	errStackModified  = errors.New("stack file was modified on disk since read")
+	errStackFileEmpty = errors.New("no stack file configured")
+)
+
+
+// stackEditBetweenReadsHook fires after the initial read and before the
+// pre-write re-read on every read-verify-write cycle in this package
+// (setServerTools, handleStackAppend). Production code leaves it nil; tests
+// set it to simulate an external edit landing in the narrow window between
+// the two reads. The atomic.Value wrapper keeps the race detector quiet when
+// parallel tests run.
+var stackEditBetweenReadsHook atomic.Value // stores func()
+
+func swapBetweenReadsHook(fn func()) func() {
+	prev := stackEditBetweenReadsHook.Load()
+	if fn == nil {
+		stackEditBetweenReadsHook.Store((func())(nil))
+	} else {
+		stackEditBetweenReadsHook.Store(fn)
+	}
+	if prev == nil {
+		return nil
+	}
+	return prev.(func())
+}
+
+func fireBetweenReadsHook() {
+	v := stackEditBetweenReadsHook.Load()
+	if v == nil {
+		return
+	}
+	fn, _ := v.(func())
+	if fn != nil {
+		fn()
+	}
+}
+
+// stackFileLock and atomicWrite delegate to stackedit so the API server and
+// the import CLI share one write discipline (and, within a process, one lock
+// map per path).
+func stackFileLock(path string) *sync.Mutex {
+	return stackedit.PathLock(path)
+}
+
+func atomicWrite(path string, data []byte) error {
+	return stackedit.AtomicWrite(path, data)
+}
+
+// setServerTools updates the `tools:` field on the named MCP server in the
+// stack YAML at path. It serializes concurrent callers on the same path,
+// detects external edits via a pre-read hash vs. pre-write re-read, and writes
+// atomically (temp file + fsync + rename) so a mid-write crash leaves the
+// original file intact.
+//
+// The update is done via yaml.Node round-tripping so top-level comments,
+// ordering, and unrelated scalar formatting survive. tools must contain only
+// non-empty strings; the caller is responsible for validating tool names
+// against the server's discovered tools.
+//
+// Returns errServerNotFound when the server name is absent, errStackModified
+// when the on-disk file changed between the initial read and the atomic write,
+// or a wrapped filesystem error on I/O failure.
+func setServerTools(path, serverName string, tools []string) error {
+	if path == "" {
+		return errStackFileEmpty
+	}
+
+	mu := stackFileLock(path)
+	mu.Lock()
+	defer mu.Unlock()
+
+	original, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read stack file: %w", err)
+	}
+	originalHash := sha256.Sum256(original)
+
+	updated, err := patchServerTools(original, serverName, tools)
+	if err != nil {
+		return err
+	}
+
+	fireBetweenReadsHook()
+
+	// Re-read right before write to catch any external edit that sneaked in
+	// between our initial read and the write. With the per-path mutex this is
+	// a tight window, but external editors (vim, git) do not respect our lock.
+	current, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("re-read stack file: %w", err)
+	}
+	if sha256.Sum256(current) != originalHash {
+		return errStackModified
+	}
+
+	return atomicWrite(path, updated)
+}
+
+// serverToolsUpdate is one server's whitelist change within a batch write.
+type serverToolsUpdate struct {
+	Server string
+	Tools  []string
+}
+
+// setServerToolsBatch applies whitelist changes for multiple servers to the
+// stack YAML at path in a SINGLE atomic write, mirroring setServerTools'
+// per-path locking and read-verify-write conflict detection. The change is
+// all-or-nothing: every update lands or none do (the caller validates tool
+// names up front and triggers exactly one reload afterward).
+//
+// Returns errServerNotFound (wrapped with the missing name) when any update
+// targets a server absent from the stack, errStackModified when the file
+// changed between the initial read and the write, or a filesystem error.
+func setServerToolsBatch(path string, updates []serverToolsUpdate) error {
+	if path == "" {
+		return errStackFileEmpty
+	}
+
+	mu := stackFileLock(path)
+	mu.Lock()
+	defer mu.Unlock()
+
+	original, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read stack file: %w", err)
+	}
+	originalHash := sha256.Sum256(original)
+
+	updated, err := patchMultipleServerTools(original, updates)
+	if err != nil {
+		return err
+	}
+
+	fireBetweenReadsHook()
+
+	current, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("re-read stack file: %w", err)
+	}
+	if sha256.Sum256(current) != originalHash {
+		return errStackModified
+	}
+
+	return atomicWrite(path, updated)
+}
+
+// patchMultipleServerTools applies every update's tools list to its server in
+// one yaml.Node round-trip, preserving comments/ordering. It indexes the
+// mcp-servers sequence by name once, then applies each update via the same
+// replaceOrInsertTools the single-server path uses (an empty list drops the
+// tools: key = expose all). Returns errServerNotFound (wrapped with the name)
+// if any update targets a server that isn't in the stack — and writes nothing,
+// since the marshal happens only after all updates apply.
+func patchMultipleServerTools(source []byte, updates []serverToolsUpdate) ([]byte, error) {
+	if len(updates) == 0 {
+		return nil, fmt.Errorf("no server updates provided")
+	}
+
+	var root yaml.Node
+	if err := yaml.Unmarshal(source, &root); err != nil {
+		return nil, fmt.Errorf("parse stack yaml: %w", err)
+	}
+	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 {
+		return nil, fmt.Errorf("parse stack yaml: not a document")
+	}
+
+	doc := root.Content[0]
+	if doc.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("parse stack yaml: top-level not a mapping")
+	}
+
+	serversSeq := findMappingValue(doc, "mcp-servers")
+	if serversSeq == nil || serversSeq.Kind != yaml.SequenceNode {
+		return nil, errServerNotFound
+	}
+
+	byName := make(map[string]*yaml.Node, len(serversSeq.Content))
+	for _, entry := range serversSeq.Content {
+		if entry.Kind != yaml.MappingNode {
+			continue
+		}
+		if nameNode := findMappingValue(entry, "name"); nameNode != nil {
+			byName[nameNode.Value] = entry
+		}
+	}
+
+	for _, u := range updates {
+		target, ok := byName[u.Server]
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", errServerNotFound, u.Server)
+		}
+		if err := replaceOrInsertTools(target, u.Tools); err != nil {
+			return nil, err
+		}
+	}
+
+	return encodeStackYAML(&root)
+}
+
+// patchServerTools rewrites the given YAML source with tools set to the
+// provided list for the named server. The yaml.Node round-trip keeps line
+// comments and ordering; only the target tools: sequence is replaced.
+func patchServerTools(source []byte, serverName string, tools []string) ([]byte, error) {
+	var root yaml.Node
+	if err := yaml.Unmarshal(source, &root); err != nil {
+		return nil, fmt.Errorf("parse stack yaml: %w", err)
+	}
+	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 {
+		return nil, fmt.Errorf("parse stack yaml: not a document")
+	}
+
+	doc := root.Content[0]
+	if doc.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("parse stack yaml: top-level not a mapping")
+	}
+
+	serversSeq := findMappingValue(doc, "mcp-servers")
+	if serversSeq == nil || serversSeq.Kind != yaml.SequenceNode {
+		return nil, errServerNotFound
+	}
+
+	var targetServer *yaml.Node
+	for _, entry := range serversSeq.Content {
+		if entry.Kind != yaml.MappingNode {
+			continue
+		}
+		nameNode := findMappingValue(entry, "name")
+		if nameNode != nil && nameNode.Value == serverName {
+			targetServer = entry
+			break
+		}
+	}
+	if targetServer == nil {
+		return nil, errServerNotFound
+	}
+
+	if err := replaceOrInsertTools(targetServer, tools); err != nil {
+		return nil, err
+	}
+
+	return encodeStackYAML(&root)
+}
+
+// findMappingValue returns the value node associated with key in a mapping,
+// or nil when the key is absent. Mapping node Content alternates key/value
+// nodes, so we iterate by two.
+func findMappingValue(mapping *yaml.Node, key string) *yaml.Node {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			return mapping.Content[i+1]
+		}
+	}
+	return nil
+}
+
+// replaceOrInsertTools sets the server mapping's tools: field. An empty
+// whitelist removes the field (matching the YAML semantics that "no tools:
+// key" means "expose all tools"). A non-empty whitelist replaces the existing
+// sequence or appends a new key to the end of the mapping.
+func replaceOrInsertTools(server *yaml.Node, tools []string) error {
+	if server.Kind != yaml.MappingNode {
+		return fmt.Errorf("server entry is not a mapping")
+	}
+
+	for i := 0; i+1 < len(server.Content); i += 2 {
+		if server.Content[i].Value == "tools" {
+			if len(tools) == 0 {
+				// Drop the key/value pair entirely so the YAML no longer
+				// carries a now-meaningless tools: field.
+				server.Content = append(server.Content[:i], server.Content[i+2:]...)
+				return nil
+			}
+			server.Content[i+1] = toolsSequenceNode(tools)
+			return nil
+		}
+	}
+
+	if len(tools) == 0 {
+		// Nothing to do — already omitted.
+		return nil
+	}
+
+	keyNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "tools"}
+	server.Content = append(server.Content, keyNode, toolsSequenceNode(tools))
+	return nil
+}
+
+// toolsSequenceNode builds a flow-preserving scalar sequence for the provided
+// whitelist. We emit a block sequence — the canonical style in existing stack
+// files — so diffs stay small when the tools list grows over time.
+func toolsSequenceNode(tools []string) *yaml.Node {
+	seq := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+	seq.Content = make([]*yaml.Node, 0, len(tools))
+	for _, t := range tools {
+		seq.Content = append(seq.Content, &yaml.Node{
+			Kind:  yaml.ScalarNode,
+			Tag:   "!!str",
+			Value: t,
+		})
+	}
+	return seq
+}
+
+// encodeStackYAML marshals a patched document with the package-standard
+// two-space indent. Shared by every yaml.Node patcher so the round-trip
+// encoding never drifts between endpoints.
+func encodeStackYAML(root *yaml.Node) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(root); err != nil {
+		return nil, fmt.Errorf("marshal stack yaml: %w", err)
+	}
+	if err := enc.Close(); err != nil {
+		return nil, fmt.Errorf("marshal stack yaml: %w", err)
+	}
+	return buf.Bytes(), nil
+}

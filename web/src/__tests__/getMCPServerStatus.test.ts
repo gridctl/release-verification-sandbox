@@ -1,0 +1,96 @@
+import { describe, it, expect } from 'vitest';
+
+import { createMCPServerNodes, getMCPServerStatus } from '../lib/graph/nodes';
+import type { AutoscaleStatus, MCPServerStatus, ReplicaStatus } from '../types';
+
+function makeServer(overrides: Partial<MCPServerStatus> = {}): MCPServerStatus {
+  return {
+    name: 'svc',
+    transport: 'http',
+    initialized: true,
+    toolCount: 0,
+    tools: [],
+    ...overrides,
+  };
+}
+
+function makeAutoscale(overrides: Partial<AutoscaleStatus> = {}): AutoscaleStatus {
+  return {
+    min: 0,
+    max: 2,
+    current: 0,
+    target: 0,
+    targetInFlight: 3,
+    medianInFlight: 0,
+    lastDecision: 'noop',
+    idleToZero: true,
+    ...overrides,
+  };
+}
+
+const oneReplica: ReplicaStatus[] = [
+  { replicaId: 0, state: 'healthy', healthy: true, inFlight: 0, startedAt: '' },
+];
+
+describe('getMCPServerStatus', () => {
+  it.each([
+    [
+      'never-booted non-autoscaled server',
+      makeServer({ initialized: false }),
+      'initializing',
+    ],
+    [
+      'autoscaled server at zero replicas renders as idle',
+      makeServer({ initialized: false, autoscale: makeAutoscale(), replicas: [] }),
+      'idle',
+    ],
+    [
+      'autoscaled server at zero replicas with undefined replicas renders as idle',
+      makeServer({ initialized: false, autoscale: makeAutoscale() }),
+      'idle',
+    ],
+    [
+      'healthy running server',
+      makeServer({ initialized: true, healthy: true, replicas: oneReplica }),
+      'running',
+    ],
+    [
+      'initialized but unhealthy server',
+      makeServer({ initialized: true, healthy: false, replicas: oneReplica }),
+      'error',
+    ],
+    [
+      'registration-failed server (uninitialized, unhealthy, no replicas)',
+      makeServer({ initialized: false, healthy: false, healthError: 'unsupported protocol version from server: "1999-01-01"' }),
+      'error',
+    ],
+    [
+      'autoscaled server with at least one live replica is not idle',
+      makeServer({
+        initialized: true,
+        healthy: true,
+        autoscale: makeAutoscale({ current: 1, target: 1 }),
+        replicas: oneReplica,
+      }),
+      'running',
+    ],
+  ])('%s → %s', (_label, input, expected) => {
+    expect(getMCPServerStatus(input)).toBe(expected);
+  });
+});
+
+describe('createMCPServerNodes', () => {
+  it('preserves Python container provenance for the attached sidebar', () => {
+    const server = makeServer({
+      kind: 'Python container',
+      image: 'gridctl-demo-fetch:0.6.0-a1b2c3d4',
+      source: { type: 'pypi', package: 'mcp-server-fetch', version: '0.6.0' },
+    });
+
+    expect(createMCPServerNodes([server])[0].data).toMatchObject({
+      kind: server.kind,
+      image: server.image,
+      source: server.source,
+    });
+  });
+});

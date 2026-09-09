@@ -1,0 +1,173 @@
+version: '3'
+
+# gridctl task runner. Run `task --list` for the catalog, `task --summary <name>`
+# for the long-form notes on a task. Old `make <target>` names forward here via
+# the transitional Makefile shim.
+
+set: [errexit, pipefail]
+
+vars:
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo "dev"
+  COMMIT:
+    sh: git rev-parse --short HEAD 2>/dev/null || echo "none"
+  DATE:
+    sh: date -u +"%Y-%m-%dT%H:%M:%SZ"
+  LDFLAGS: -X main.version={{.VERSION}} -X main.commit={{.COMMIT}} -X main.date={{.DATE}}
+
+tasks:
+  default:
+    desc: Build frontend and backend (same as build)
+    cmds:
+      - task: build
+
+  build:
+    desc: Build frontend and backend
+    cmds:
+      - task: build:web
+      - task: build:go
+
+  build:web:
+    desc: Build the React frontend and stage it for embedding
+    summary: |
+      Builds web/ with Vite and copies web/dist into cmd/gridctl/web/dist,
+      where the embed_web build tag picks it up. A checkout without frontend
+      source (no web/tsconfig.json) skips the build instead of failing.
+    cmds:
+      - |
+        if [ ! -f web/tsconfig.json ]; then
+          echo "Skipping web build (source files not present)"
+          exit 0
+        fi
+        echo "Building web frontend..."
+        (cd web && npm run build)
+        echo "Copying dist to cmd/gridctl/web/dist..."
+        rm -rf cmd/gridctl/web
+        mkdir -p cmd/gridctl/web
+        cp -r web/dist cmd/gridctl/web/
+
+  build:go:
+    desc: Build the Go binary only
+    summary: |
+      Embeds the web UI (-tags embed_web) when cmd/gridctl/web/dist exists;
+      otherwise builds without it and the UI 404s. Run `task build:web` first
+      to include the UI. Version metadata comes from git describe.
+    cmds:
+      - |
+        echo "Building Go binary ({{.VERSION}})..."
+        if [ -d cmd/gridctl/web/dist ]; then
+          echo "Including embedded web assets..."
+          go build -tags embed_web -ldflags "{{.LDFLAGS}}" -o gridctl ./cmd/gridctl
+        else
+          echo "Building without web assets (run 'task build:web' first to include UI)..."
+          go build -ldflags "{{.LDFLAGS}}" -o gridctl ./cmd/gridctl
+        fi
+
+  dev:
+    desc: Run the Vite dev server against a separately running backend
+    cmds:
+      - cd web && npm run dev
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -rf gridctl
+      - rm -rf cmd/gridctl/web
+      - rm -rf web/dist
+      - rm -rf web/node_modules
+
+  deps:
+    desc: Install frontend and backend dependencies
+    cmds:
+      - cd web && npm install
+      - go mod tidy
+
+  run:
+    desc: Build and run the binary
+    cmds:
+      - task: build
+      - ./gridctl
+
+  test:
+    desc: Run unit tests with the race detector (matches CI)
+    cmds:
+      - go test -race ./...
+
+  test:coverage:
+    desc: Run unit tests with a coverage report
+    cmds:
+      - go test -race -coverprofile=coverage.out ./...
+      - go tool cover -html=coverage.out -o coverage.html
+      - echo "Coverage report generated coverage.html"
+
+  test:frontend:
+    desc: Run frontend tests (Vitest)
+    cmds:
+      - cd web && npm test
+
+  test:integration:
+    desc: Run integration tests (requires Docker or Podman, matches CI flags)
+    cmds:
+      - go test -tags=integration -race -timeout 15m ./tests/integration/...
+
+  test:litellm:
+    desc: Run the LiteLLM contract test against the pinned proxy image (multi-GB pull)
+    summary: |
+      Pre-pulls the digest-pinned LiteLLM image, then boots it against a
+      rendered gridctl models fragment included from a human-shaped
+      config and asserts the router model is served. The pull dominates
+      a cold run, so it happens outside the test timeout; the plain
+      test:integration suite skips this test when the image is not
+      already cached.
+    cmds:
+      - docker pull ghcr.io/berriai/litellm:v1.97.0@sha256:468c25f35f3e5ec4e414974f00deab93337b1b4d9953cabcfd3722e59415f834
+      - go test -tags=integration -race -timeout 10m -run TestLiteLLMBootsRenderedFragment ./tests/integration/...
+
+  test:conformance:
+    desc: Run the MCP conformance suite against a live gateway (requires Node 22+)
+    summary: |
+      Builds gridctl, starts a stackless daemon, and drives the official
+      @modelcontextprotocol/conformance suite against it, once per spec
+      generation. Deliberate deviations live in
+      tests/integration/conformance-baseline.yml; the suite fails on both
+      unexpected failures and stale baseline entries.
+    cmds:
+      - go test -tags=integration -race -timeout 10m -run TestConformance ./tests/integration/...
+
+  lint:
+    desc: Lint backend and frontend
+    cmds:
+      - task: lint:go
+      - task: lint:web
+
+  lint:go:
+    desc: Lint Go code (golangci-lint, gosec enabled)
+    cmds:
+      - golangci-lint run
+
+  lint:web:
+    desc: Lint the frontend (zero-error baseline, enforced by CI)
+    cmds:
+      - cd web && npm run lint
+
+  generate:
+    desc: Regenerate mocks under pkg/mcp/ and pkg/runtime/ (requires mockgen)
+    cmds:
+      - go generate ./pkg/mcp/... ./pkg/runtime/...
+
+  mock:servers:
+    desc: Build and start the example mock MCP servers (PORT=9001)
+    summary: |
+      Builds the two mock servers under examples/_mock-servers/ and starts
+      mock-mcp-server twice, HTTP on PORT and SSE on PORT+1. Start/stop logic
+      lives in scripts/mock-servers.sh because backgrounding needs a real
+      shell. Stop with `task mock:clean`.
+    vars:
+      PORT: '{{.PORT | default "9001"}}'
+    cmds:
+      - bash scripts/mock-servers.sh start {{.PORT}}
+
+  mock:clean:
+    desc: Stop and remove the example mock MCP servers
+    cmds:
+      - bash scripts/mock-servers.sh stop

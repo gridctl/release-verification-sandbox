@@ -1,0 +1,52 @@
+# Basic Gateway Example
+#
+# Demonstrates using Gridctl as a gateway to an existing MCP server.
+# This pattern connects to an MCP server already running on your machine
+# and exposes it through Gridctl's unified interface.
+#
+# Use cases:
+#   - Connect multiple clients to a single MCP server
+#   - Aggregate tools from multiple MCP servers
+#   - Add Gridctl's monitoring and management layer
+#
+# Prerequisites:
+#   An MCP server running and accessible via HTTP or SSE.
+#   Update the url below to match your server's endpoint.
+#
+# Usage:
+#   gridctl apply examples/gateways/gateway-basic.yaml
+#
+#   Then connect clients to Gridctl's gateway URL:
+#   http://localhost:8180/mcp
+
+version: "1"
+name: gateway-basic
+
+# Optional gateway configuration.
+# All fields are optional — omit the gateway section entirely for defaults.
+gateway:
+  # tokenizer controls how token counts are measured for the Metrics tab,
+  # sparklines, and format savings percentages.
+  #
+  # "embedded" (default): uses the cl100k_base BPE vocabulary (pure Go, no
+  # network access, no API key required). Accurate for English and code content;
+  # approximately 10-15% variance for Claude models, whose vocabulary is unpublished.
+  # A significant improvement over the previous 4-bytes/token heuristic.
+  #
+  # "api": routes counting through Anthropic's count_tokens endpoint for exact
+  # results. Requires ANTHROPIC_API_KEY (or tokenizer_api_key below) and network
+  # access to api.anthropic.com. Anthropic-specific — returns incorrect results
+  # when routing to non-Anthropic models (Gemini, local endpoints, etc.).
+  #
+  tokenizer: embedded
+
+  # tokenizer_api_key overrides the ANTHROPIC_API_KEY environment variable when
+  # tokenizer is set to "api". Leave unset to use the environment variable.
+  # tokenizer_api_key: "${MY_ANTHROPIC_KEY}"
+
+mcp-servers:
+  # Connect to an existing MCP server
+  # Replace with your MCP server's URL and transport
+  - name: external-mcp
+    url: http://localhost:8000/mcp
+    transport: http

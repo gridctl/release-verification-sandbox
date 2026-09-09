@@ -1,0 +1,750 @@
+package controller
+
+import (
+	"io/fs"
+	"net"
+	"os"
+	"os/exec"
+	"testing"
+	"time"
+
+	"github.com/gridctl/gridctl/pkg/config"
+	"github.com/gridctl/gridctl/pkg/runtime"
+	"github.com/gridctl/gridctl/pkg/state"
+	"github.com/gridctl/gridctl/pkg/vault"
+)
+
+// setTempHome overrides HOME so state files go to a temp directory.
+func setTempHome(t *testing.T) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+}
+
+// startDummyProcess starts a sleep process that can be safely killed in tests.
+func startDummyProcess(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting dummy process: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	return cmd.Process.Pid
+}
+
+func TestNew(t *testing.T) {
+	cfg := Config{
+		StackPath: "/path/to/stack.yaml",
+		Port:      8180,
+		BasePort:  9000,
+	}
+	ctrl := New(cfg)
+	if ctrl == nil {
+		t.Fatal("New returned nil")
+	}
+}
+
+func TestStackController_Serve_StacklessConfig(t *testing.T) {
+	setTempHome(t)
+
+	// Verify that a controller configured for stackless mode has no StackPath,
+	// which is the precondition for Serve() to skip stack loading.
+	ctrl := New(Config{
+		Port:  8190,
+		Quiet: true,
+	})
+	ctrl.SetWebFS(func() (fs.FS, error) { return nil, nil })
+
+	if ctrl.config.StackPath != "" {
+		t.Errorf("expected empty StackPath for stackless config, got %q", ctrl.config.StackPath)
+	}
+	if ctrl.webFS == nil {
+		t.Error("expected webFS to be set")
+	}
+}
+
+func TestStackController_Serve_LoadsVaultBestEffort(t *testing.T) {
+	setTempHome(t)
+
+	// Verify vaultStore is nil before Serve() and that vault dir is resolvable.
+	ctrl := New(Config{Port: 8191, Quiet: true})
+	if ctrl.vaultStore != nil {
+		t.Error("expected nil vaultStore before Serve()")
+	}
+
+	vaultDir, verr := state.VaultDir()
+	if verr != nil {
+		t.Fatalf("VaultDir: %v", verr)
+	}
+	if vaultDir == "" {
+		t.Error("expected non-empty vault dir from state.VaultDir()")
+	}
+}
+
+func TestStackController_SetVersion(t *testing.T) {
+	ctrl := New(Config{})
+	ctrl.SetVersion("v1.0.0")
+	if ctrl.version != "v1.0.0" {
+		t.Errorf("expected version 'v1.0.0', got '%s'", ctrl.version)
+	}
+}
+
+func TestStackController_SetWebFS(t *testing.T) {
+	ctrl := New(Config{})
+	ctrl.SetWebFS(func() (fs.FS, error) {
+		return nil, nil
+	})
+	if ctrl.webFS == nil {
+		t.Error("expected webFS to be set")
+	}
+}
+
+func TestBuildWorkloadSummaries_Empty(t *testing.T) {
+	stack := &config.Stack{}
+	result := &runtime.UpResult{}
+
+	summaries := BuildWorkloadSummaries(stack, result)
+	if len(summaries) != 0 {
+		t.Errorf("expected 0 summaries, got %d", len(summaries))
+	}
+}
+
+func TestBuildWorkloadSummaries_MCPServers(t *testing.T) {
+	stack := &config.Stack{
+		MCPServers: []config.MCPServer{
+			{Name: "http-server", Transport: "http"},
+			{Name: "stdio-server", Transport: "stdio"},
+			{Name: "ext-server", URL: "https://example.com"},
+			{Name: "local-server", Command: []string{"./server"}},
+			{Name: "ssh-server", Command: []string{"/opt/server"}, SSH: &config.SSHConfig{Host: "10.0.0.1", User: "user"}},
+			{Name: "api-server", OpenAPI: &config.OpenAPIConfig{Spec: "/spec.json"}},
+		},
+	}
+	result := &runtime.UpResult{
+		MCPServers: []runtime.MCPServerResult{
+			{Name: "http-server"},
+			{Name: "stdio-server"},
+			{Name: "ext-server"},
+			{Name: "local-server"},
+			{Name: "ssh-server"},
+			{Name: "api-server"},
+		},
+	}
+
+	summaries := BuildWorkloadSummaries(stack, result)
+
+	if len(summaries) != 6 {
+		t.Fatalf("expected 6 summaries, got %d", len(summaries))
+	}
+
+	expectedTransports := map[string]string{
+		"http-server":  "http",
+		"stdio-server": "stdio",
+		"ext-server":   "external",
+		"local-server": "local",
+		"ssh-server":   "ssh",
+		"api-server":   "openapi",
+	}
+
+	for _, s := range summaries {
+		if s.Type != "mcp-server" {
+			t.Errorf("expected type 'mcp-server', got '%s' for %s", s.Type, s.Name)
+		}
+		if s.State != "running" {
+			t.Errorf("expected state 'running', got '%s' for %s", s.State, s.Name)
+		}
+		expected, ok := expectedTransports[s.Name]
+		if !ok {
+			t.Errorf("unexpected server: %s", s.Name)
+			continue
+		}
+		if s.Transport != expected {
+			t.Errorf("expected transport '%s' for %s, got '%s'", expected, s.Name, s.Transport)
+		}
+	}
+}
+
+func TestBuildWorkloadSummaries_DefaultTransport(t *testing.T) {
+	stack := &config.Stack{
+		MCPServers: []config.MCPServer{
+			{Name: "default-server", Transport: ""}, // Empty transport defaults to "http"
+		},
+	}
+	result := &runtime.UpResult{
+		MCPServers: []runtime.MCPServerResult{
+			{Name: "default-server"},
+		},
+	}
+
+	summaries := BuildWorkloadSummaries(stack, result)
+	if len(summaries) != 1 {
+		t.Fatalf("expected 1 summary, got %d", len(summaries))
+	}
+	if summaries[0].Transport != "http" {
+		t.Errorf("expected transport 'http' for default, got '%s'", summaries[0].Transport)
+	}
+}
+
+func TestBuildWorkloadSummaries_Resources(t *testing.T) {
+	stack := &config.Stack{
+		Resources: []config.Resource{
+			{Name: "postgres"},
+			{Name: "redis"},
+		},
+	}
+	result := &runtime.UpResult{}
+
+	summaries := BuildWorkloadSummaries(stack, result)
+	if len(summaries) != 2 {
+		t.Fatalf("expected 2 summaries, got %d", len(summaries))
+	}
+
+	for _, s := range summaries {
+		if s.Type != "resource" {
+			t.Errorf("expected type 'resource', got '%s'", s.Type)
+		}
+		if s.Transport != "container" {
+			t.Errorf("expected transport 'container', got '%s'", s.Transport)
+		}
+	}
+}
+
+func TestBuildWorkloadSummaries_Mixed(t *testing.T) {
+	stack := &config.Stack{
+		MCPServers: []config.MCPServer{
+			{Name: "server1", Transport: "http"},
+		},
+		Resources: []config.Resource{
+			{Name: "db"},
+		},
+	}
+	result := &runtime.UpResult{
+		MCPServers: []runtime.MCPServerResult{
+			{Name: "server1"},
+		},
+	}
+
+	summaries := BuildWorkloadSummaries(stack, result)
+	if len(summaries) != 2 {
+		t.Fatalf("expected 2 summaries, got %d", len(summaries))
+	}
+
+	types := make(map[string]int)
+	for _, s := range summaries {
+		types[s.Type]++
+	}
+	if types["mcp-server"] != 1 {
+		t.Errorf("expected 1 mcp-server, got %d", types["mcp-server"])
+	}
+	if types["resource"] != 1 {
+		t.Errorf("expected 1 resource, got %d", types["resource"])
+	}
+}
+
+func TestConfig_Defaults(t *testing.T) {
+	cfg := Config{}
+	if cfg.Port != 0 {
+		t.Errorf("expected default port 0 (zero value), got %d", cfg.Port)
+	}
+	if cfg.Verbose {
+		t.Error("expected Verbose to default to false")
+	}
+	if cfg.DaemonChild {
+		t.Error("expected DaemonChild to default to false")
+	}
+}
+
+func TestCreatePrinter_Quiet(t *testing.T) {
+	sc := New(Config{Quiet: true})
+	stack := &config.Stack{Name: "test"}
+	printer := sc.createPrinter(stack)
+	if printer != nil {
+		t.Error("expected nil printer when Quiet=true")
+	}
+}
+
+func TestCreatePrinter_NotQuiet(t *testing.T) {
+	sc := New(Config{StackPath: "/path/to/stack.yaml"})
+	sc.SetVersion("v0.1.0")
+	stack := &config.Stack{Name: "test"}
+	printer := sc.createPrinter(stack)
+	if printer == nil {
+		t.Error("expected non-nil printer when Quiet=false")
+	}
+}
+
+func TestCreatePrinter_Verbose(t *testing.T) {
+	sc := New(Config{StackPath: "/path/to/stack.yaml", Verbose: true})
+	stack := &config.Stack{Name: "test"}
+	// Should not panic with verbose mode
+	printer := sc.createPrinter(stack)
+	if printer == nil {
+		t.Error("expected non-nil printer when Verbose=true")
+	}
+}
+
+func TestSetupOrchestratorLogging_ForegroundVerbose(t *testing.T) {
+	sc := New(Config{Foreground: true, Verbose: true})
+	rt := runtime.NewOrchestrator(nil, nil)
+
+	logBuffer, handler := sc.setupOrchestratorLogging(rt)
+	if logBuffer == nil {
+		t.Error("expected non-nil logBuffer in foreground+non-quiet mode")
+	}
+	if handler == nil {
+		t.Error("expected non-nil handler in foreground+non-quiet mode")
+	}
+}
+
+func TestSetupOrchestratorLogging_ForegroundNonQuiet(t *testing.T) {
+	sc := New(Config{Foreground: true, Quiet: false})
+	rt := runtime.NewOrchestrator(nil, nil)
+
+	logBuffer, handler := sc.setupOrchestratorLogging(rt)
+	if logBuffer == nil {
+		t.Error("expected non-nil logBuffer in foreground+non-quiet mode")
+	}
+	if handler == nil {
+		t.Error("expected non-nil handler")
+	}
+}
+
+func TestSetupOrchestratorLogging_NonQuiet(t *testing.T) {
+	sc := New(Config{Foreground: false, Quiet: false})
+	rt := runtime.NewOrchestrator(nil, nil)
+
+	logBuffer, handler := sc.setupOrchestratorLogging(rt)
+	// Non-foreground, non-quiet returns nil buffer but still sets logger on rt
+	if logBuffer != nil {
+		t.Error("expected nil logBuffer in non-foreground mode")
+	}
+	if handler != nil {
+		t.Error("expected nil handler in non-foreground mode")
+	}
+}
+
+func TestSetupOrchestratorLogging_Quiet(t *testing.T) {
+	sc := New(Config{Quiet: true})
+	rt := runtime.NewOrchestrator(nil, nil)
+
+	logBuffer, handler := sc.setupOrchestratorLogging(rt)
+	if logBuffer != nil {
+		t.Error("expected nil logBuffer in quiet mode")
+	}
+	if handler != nil {
+		t.Error("expected nil handler in quiet mode")
+	}
+}
+
+func TestSetupOrchestratorLogging_WithVault(t *testing.T) {
+	sc := New(Config{Foreground: true})
+	sc.vaultStore = vault.NewStore(t.TempDir())
+	rt := runtime.NewOrchestrator(nil, nil)
+
+	logBuffer, handler := sc.setupOrchestratorLogging(rt)
+	if logBuffer == nil {
+		t.Error("expected non-nil logBuffer")
+	}
+	if handler == nil {
+		t.Error("expected non-nil handler")
+	}
+}
+
+func TestNewGatewayBuilder(t *testing.T) {
+	cfg := Config{
+		Port:     8180,
+		CodeMode: true,
+		NoExpand: true,
+	}
+	sc := &StackController{
+		config:  cfg,
+		version: "v1.0.0",
+	}
+	sc.SetWebFS(func() (fs.FS, error) { return nil, nil })
+	sc.vaultStore = vault.NewStore(t.TempDir())
+
+	stack := &config.Stack{Name: "test"}
+	rt := runtime.NewOrchestrator(nil, nil)
+	result := &runtime.UpResult{}
+
+	builder, err := sc.newGatewayBuilder(stack, rt, result)
+	if err != nil {
+		t.Fatalf("newGatewayBuilder: %v", err)
+	}
+	if builder == nil {
+		t.Fatal("expected non-nil builder")
+	}
+	if builder.version != "v1.0.0" {
+		t.Errorf("expected version 'v1.0.0', got '%s'", builder.version)
+	}
+	if builder.webFS == nil {
+		t.Error("expected webFS to be set")
+	}
+	if builder.vaultStore == nil {
+		t.Error("expected vaultStore to be set")
+	}
+	if builder.config.Port != 8180 {
+		t.Errorf("expected port 8180, got %d", builder.config.Port)
+	}
+}
+
+func TestNewVaultSetAdapter(t *testing.T) {
+	store := vault.NewStore(t.TempDir())
+	adapter := newVaultSetAdapter(store)
+	if adapter == nil {
+		t.Fatal("expected non-nil adapter")
+	}
+	if adapter.store != store {
+		t.Error("expected adapter to wrap the given store")
+	}
+}
+
+func TestVaultSetAdapter_Get_NotFound(t *testing.T) {
+	store := vault.NewStore(t.TempDir())
+	adapter := newVaultSetAdapter(store)
+
+	_, found := adapter.Get("nonexistent")
+	if found {
+		t.Error("expected found=false for nonexistent key")
+	}
+}
+
+func TestVaultSetAdapter_GetSetSecrets_Empty(t *testing.T) {
+	store := vault.NewStore(t.TempDir())
+	adapter := newVaultSetAdapter(store)
+
+	secrets := adapter.GetSetSecrets("nonexistent-set")
+	if len(secrets) != 0 {
+		t.Errorf("expected 0 secrets, got %d", len(secrets))
+	}
+}
+
+func TestVaultSetAdapter_GetSetSecrets_WithSecrets(t *testing.T) {
+	dir := t.TempDir()
+	// Write a secrets.json file that the vault store will load
+	secretsJSON := `[
+		{"key":"DB_PASSWORD","value":"secret123","set":"database"},
+		{"key":"DB_HOST","value":"localhost","set":"database"},
+		{"key":"API_KEY","value":"key456","set":"api"}
+	]`
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("creating dir: %v", err)
+	}
+	if err := os.WriteFile(dir+"/secrets.json", []byte(secretsJSON), 0644); err != nil {
+		t.Fatalf("writing secrets.json: %v", err)
+	}
+
+	store := vault.NewStore(dir)
+	if err := store.Load(); err != nil {
+		t.Fatalf("loading vault: %v", err)
+	}
+
+	adapter := newVaultSetAdapter(store)
+
+	// Get secrets for the "database" set
+	secrets := adapter.GetSetSecrets("database")
+	if len(secrets) != 2 {
+		t.Fatalf("expected 2 secrets, got %d", len(secrets))
+	}
+
+	// Verify the secrets are config.VaultSecret type with correct values
+	secretMap := make(map[string]string)
+	for _, s := range secrets {
+		secretMap[s.Key] = s.Value
+	}
+	if secretMap["DB_PASSWORD"] != "secret123" {
+		t.Errorf("expected DB_PASSWORD=secret123, got %s", secretMap["DB_PASSWORD"])
+	}
+	if secretMap["DB_HOST"] != "localhost" {
+		t.Errorf("expected DB_HOST=localhost, got %s", secretMap["DB_HOST"])
+	}
+}
+
+func TestVaultSetAdapter_Get_WithValue(t *testing.T) {
+	dir := t.TempDir()
+	secretsJSON := `[{"key":"MY_SECRET","value":"hello"}]`
+	if err := os.WriteFile(dir+"/secrets.json", []byte(secretsJSON), 0644); err != nil {
+		t.Fatalf("writing secrets.json: %v", err)
+	}
+
+	store := vault.NewStore(dir)
+	if err := store.Load(); err != nil {
+		t.Fatalf("loading vault: %v", err)
+	}
+
+	adapter := newVaultSetAdapter(store)
+	val, found := adapter.Get("MY_SECRET")
+	if !found {
+		t.Error("expected found=true")
+	}
+	if val != "hello" {
+		t.Errorf("expected 'hello', got '%s'", val)
+	}
+}
+
+func TestBuildWorkloadSummaries_OnlyResources(t *testing.T) {
+	stack := &config.Stack{
+		Resources: []config.Resource{
+			{Name: "pg"},
+			{Name: "redis"},
+			{Name: "minio"},
+		},
+	}
+	result := &runtime.UpResult{}
+
+	summaries := BuildWorkloadSummaries(stack, result)
+	if len(summaries) != 3 {
+		t.Fatalf("expected 3 summaries, got %d", len(summaries))
+	}
+	for _, s := range summaries {
+		if s.Type != "resource" {
+			t.Errorf("expected type 'resource', got '%s' for %s", s.Type, s.Name)
+		}
+	}
+}
+
+func TestBuildWorkloadSummaries_ServerNotInConfig(t *testing.T) {
+	// MCPServer result has a name that doesn't match any config entry
+	stack := &config.Stack{
+		MCPServers: []config.MCPServer{},
+	}
+	result := &runtime.UpResult{
+		MCPServers: []runtime.MCPServerResult{
+			{Name: "orphan-server"},
+		},
+	}
+
+	summaries := BuildWorkloadSummaries(stack, result)
+	if len(summaries) != 1 {
+		t.Fatalf("expected 1 summary, got %d", len(summaries))
+	}
+	// Transport defaults to "http" via the fallback for empty transport
+	// But since the config entry is missing, serverTransports won't have this key,
+	// so the transport stays empty string
+	if summaries[0].Transport != "" {
+		t.Errorf("expected empty transport for orphan server, got '%s'", summaries[0].Transport)
+	}
+}
+
+func TestCheckState_NoExistingState(t *testing.T) {
+	setTempHome(t)
+
+	sc := New(Config{StackPath: "/tmp/stack.yaml"})
+	stack := &config.Stack{Name: "test-no-state"}
+
+	if err := sc.checkState(stack); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+}
+
+func TestCheckState_StaleState(t *testing.T) {
+	setTempHome(t)
+
+	// Save state with a dead PID
+	st := &state.DaemonState{
+		StackName: "test-stale",
+		StackFile: "/tmp/stack.yaml",
+		PID:       999999, // unlikely to be running
+		Port:      8180,
+		StartedAt: time.Now(),
+	}
+	if err := state.Save(st); err != nil {
+		t.Fatalf("saving state: %v", err)
+	}
+
+	sc := New(Config{StackPath: "/tmp/stack.yaml"})
+	stack := &config.Stack{Name: "test-stale"}
+
+	// Stale state should be cleaned up automatically
+	if err := sc.checkState(stack); err != nil {
+		t.Fatalf("expected no error for stale state, got: %v", err)
+	}
+}
+
+func TestCheckState_RunningWithoutReplace(t *testing.T) {
+	setTempHome(t)
+
+	pid := startDummyProcess(t)
+	st := &state.DaemonState{
+		StackName: "test-running",
+		StackFile: "/tmp/stack.yaml",
+		PID:       pid,
+		Port:      8180,
+		StartedAt: time.Now(),
+	}
+	if err := state.Save(st); err != nil {
+		t.Fatalf("saving state: %v", err)
+	}
+
+	sc := New(Config{StackPath: "/tmp/stack.yaml"})
+	stack := &config.Stack{Name: "test-running"}
+
+	err := sc.checkState(stack)
+	if err == nil {
+		t.Fatal("expected error for running stack without Replace")
+	}
+	if got := err.Error(); !contains(got, "already running") {
+		t.Errorf("expected 'already running' error, got: %s", got)
+	}
+}
+
+func TestCheckState_ReplaceStopsRunningStack(t *testing.T) {
+	setTempHome(t)
+
+	pid := startDummyProcess(t)
+	st := &state.DaemonState{
+		StackName: "test-replace",
+		StackFile: "/tmp/stack.yaml",
+		PID:       pid,
+		Port:      9999,
+		StartedAt: time.Now(),
+	}
+	if err := state.Save(st); err != nil {
+		t.Fatalf("saving state: %v", err)
+	}
+
+	sc := New(Config{StackPath: "/tmp/stack.yaml", Replace: true})
+	stack := &config.Stack{Name: "test-replace"}
+
+	err := sc.checkState(stack)
+	if err != nil {
+		t.Fatalf("expected no error with Replace=true, got: %v", err)
+	}
+
+	// Port should be preserved from the running state
+	if sc.config.Port != 9999 {
+		t.Errorf("expected port 9999, got %d", sc.config.Port)
+	}
+
+	// State file should be deleted
+	_, loadErr := state.Load("test-replace")
+	if loadErr == nil {
+		t.Error("expected state file to be deleted after replace")
+	}
+}
+
+func TestCheckState_ReplaceKeepsExplicitPort(t *testing.T) {
+	setTempHome(t)
+
+	pid := startDummyProcess(t)
+	st := &state.DaemonState{
+		StackName: "test-port",
+		StackFile: "/tmp/stack.yaml",
+		PID:       pid,
+		Port:      8180,
+		StartedAt: time.Now(),
+	}
+	if err := state.Save(st); err != nil {
+		t.Fatalf("saving state: %v", err)
+	}
+
+	// User explicitly set port 7777
+	sc := New(Config{StackPath: "/tmp/stack.yaml", Port: 7777, Replace: true})
+	stack := &config.Stack{Name: "test-port"}
+
+	err := sc.checkState(stack)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	// Explicit port should be preserved, not overwritten
+	if sc.config.Port != 7777 {
+		t.Errorf("expected port 7777 (explicit), got %d", sc.config.Port)
+	}
+}
+
+// occupiedPort starts a listener on a random loopback port and returns the
+// port number. It must bind the same address the HTTP server will
+// (DefaultBindAddress) to actually block it: a wildcard listener does not
+// reliably conflict with a later loopback bind, since SO_REUSEADDR lets the
+// more specific bind succeed, and the server would then start and block
+// forever instead of returning the error these tests assert on. The caller is
+// responsible for closing the listener.
+func occupiedPort(t *testing.T) (int, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", net.JoinHostPort(DefaultBindAddress, "0"))
+	if err != nil {
+		t.Fatalf("could not listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	return port, func() { ln.Close() }
+}
+
+func TestStackController_Serve_Foreground_PortInUse(t *testing.T) {
+	setTempHome(t)
+
+	port, closeListener := occupiedPort(t)
+	defer closeListener()
+
+	ctrl := New(Config{Port: port, Foreground: true, Quiet: true})
+	ctrl.SetWebFS(func() (fs.FS, error) { return nil, nil })
+
+	// Port is occupied so BuildAndRun fails after ~100ms grace period.
+	err := ctrl.Serve(t.Context())
+	if err == nil {
+		t.Fatal("expected error from occupied port")
+	}
+}
+
+func TestStackController_Serve_DaemonChild_PortInUse(t *testing.T) {
+	setTempHome(t)
+
+	port, closeListener := occupiedPort(t)
+	defer closeListener()
+
+	ctrl := New(Config{Port: port, DaemonChild: true, Quiet: true})
+	ctrl.SetWebFS(func() (fs.FS, error) { return nil, nil })
+
+	// DaemonChild path: saves state, then buildAndRunStackless fails on occupied port.
+	err := ctrl.Serve(t.Context())
+	if err == nil {
+		t.Fatal("expected error from occupied port")
+	}
+}
+
+func TestStackController_BuildAndRunStackless_PortInUse(t *testing.T) {
+	setTempHome(t)
+
+	port, closeListener := occupiedPort(t)
+	defer closeListener()
+
+	ctrl := New(Config{Port: port, Quiet: true})
+	ctrl.SetWebFS(func() (fs.FS, error) { return nil, nil })
+
+	err := ctrl.buildAndRunStackless(t.Context(), false)
+	if err == nil {
+		t.Fatal("expected error from occupied port")
+	}
+}
+
+func TestStackController_RunStacklessDaemonChild_PortInUse(t *testing.T) {
+	setTempHome(t)
+
+	port, closeListener := occupiedPort(t)
+	defer closeListener()
+
+	ctrl := New(Config{Port: port, Quiet: true})
+	ctrl.SetWebFS(func() (fs.FS, error) { return nil, nil })
+
+	// runStacklessDaemonChild saves state then calls buildAndRunStackless.
+	// The port is in use so buildAndRunStackless returns quickly with an error.
+	err := ctrl.runStacklessDaemonChild(t.Context())
+	if err == nil {
+		t.Fatal("expected error from occupied port")
+	}
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && searchString(s, substr)
+}
+
+func searchString(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}

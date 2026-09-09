@@ -1,0 +1,1251 @@
+package mcp
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gridctl/gridctl/pkg/jsonrpc"
+	"go.uber.org/mock/gomock"
+)
+
+// loopbackRequest builds a request that looks like it arrived over loopback.
+// httptest.NewRequest defaults Host to example.com, which Host validation
+// (DNS rebinding protection) rejects, so every transport test goes through
+// this instead of calling httptest.NewRequest directly.
+func loopbackRequest(method, target string, body io.Reader) *http.Request {
+	r := httptest.NewRequest(method, target, body)
+	r.Host = "localhost:8180"
+	return r
+}
+
+// initializeStreamable sends an initialize request and returns the session ID.
+func initializeStreamable(t *testing.T, srv *StreamableHTTPServer) string {
+	t.Helper()
+	w := initializeWithVersion(t, srv, "2024-11-05")
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("initialize: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	sessionID := w.Header().Get("Mcp-Session-Id")
+	if sessionID == "" {
+		t.Fatal("initialize: expected Mcp-Session-Id in response header")
+	}
+	return sessionID
+}
+
+// streamablePost sends a JSON-RPC request with a session ID and returns the response.
+func streamablePost(t *testing.T, srv *StreamableHTTPServer, sessionID string, method string, params any) jsonrpc.Response {
+	t.Helper()
+	m := map[string]any{"jsonrpc": "2.0", "id": 1, "method": method}
+	if params != nil {
+		m["params"] = params
+	}
+	body, _ := json.Marshal(m)
+	req := loopbackRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req.Header.Set("Mcp-Session-Id", sessionID)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("%s: expected 200, got %d: %s", method, w.Code, w.Body.String())
+	}
+	var resp jsonrpc.Response
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	return resp
+}
+
+func TestStreamableHTTPServer_Initialize(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	sessionID := initializeStreamable(t, srv)
+
+	if len(sessionID) == 0 {
+		t.Error("expected non-empty session ID")
+	}
+	if srv.SessionCount() != 1 {
+		t.Errorf("expected 1 session, got %d", srv.SessionCount())
+	}
+}
+
+func TestStreamableHTTPServer_Initialize_SessionIDInHeader(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+
+	body, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params":  map[string]any{"protocolVersion": "2024-11-05", "clientInfo": map[string]any{"name": "c", "version": "1"}},
+	})
+	req := loopbackRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp jsonrpc.Response
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %s", resp.Error.Message)
+	}
+	if w.Header().Get("Mcp-Session-Id") == "" {
+		t.Error("expected Mcp-Session-Id response header")
+	}
+}
+
+func TestStreamableHTTPServer_Initialize_ParsesProtocolVersion(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	sessionID := initializeStreamable(t, srv)
+
+	// Verify the session is tracked
+	ids := srv.SessionIDs()
+	found := false
+	for _, id := range ids {
+		if id == sessionID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("session %s not in SessionIDs()", sessionID)
+	}
+}
+
+// initializeWithVersion posts an initialize request with the given
+// protocolVersion (omitted when empty) and returns the raw recorder.
+func initializeWithVersion(t *testing.T, srv *StreamableHTTPServer, version string) *httptest.ResponseRecorder {
+	t.Helper()
+	params := map[string]any{
+		"clientInfo": map[string]any{"name": "test-client", "version": "1.0"},
+	}
+	if version != "" {
+		params["protocolVersion"] = version
+	}
+	body, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params":  params,
+	})
+	req := loopbackRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	return w
+}
+
+func TestStreamableHTTPServer_Initialize_VersionNegotiation(t *testing.T) {
+	tests := []struct {
+		name      string
+		requested string
+		want      string
+	}{
+		{"echoes supported version", "2025-06-18", "2025-06-18"},
+		{"counter-offers latest on unknown version", "1999-01-01", MCPProtocolVersion},
+		{"counter-offers latest on absent version", "", MCPProtocolVersion},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := NewStreamableHTTPServer(NewGateway(), nil)
+			w := initializeWithVersion(t, srv, tt.requested)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+			var resp jsonrpc.Response
+			if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+				t.Fatal(err)
+			}
+			if resp.Error != nil {
+				t.Fatalf("initialize must never fail for version reasons: %s", resp.Error.Message)
+			}
+			var result InitializeResult
+			if err := json.Unmarshal(resp.Result, &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.ProtocolVersion != tt.want {
+				t.Errorf("expected negotiated version %q, got %q", tt.want, result.ProtocolVersion)
+			}
+		})
+	}
+}
+
+func TestStreamableHTTPServer_Initialize_MalformedParams(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":"not-an-object"}`
+	req := loopbackRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 with JSON-RPC error, got %d", w.Code)
+	}
+	var resp jsonrpc.Response
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Error == nil {
+		t.Fatal("expected JSON-RPC error for malformed initialize params")
+	}
+	if resp.Error.Code != jsonrpc.InvalidParams {
+		t.Errorf("expected InvalidParams code %d, got %d", jsonrpc.InvalidParams, resp.Error.Code)
+	}
+	if srv.SessionCount() != 0 {
+		t.Errorf("expected no session for rejected initialize, got %d", srv.SessionCount())
+	}
+}
+
+func TestStreamableHTTPServer_ProtocolVersionHeader(t *testing.T) {
+	tests := []struct {
+		name       string
+		header     string
+		wantStatus int
+	}{
+		{"absent header allowed", "", http.StatusOK},
+		{"supported header allowed", "2025-06-18", http.StatusOK},
+		{"latest header allowed", MCPProtocolVersion, http.StatusOK},
+		{"unsupported header rejected", "1999-01-01", http.StatusBadRequest},
+		{"garbage header rejected", "bogus", http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := NewStreamableHTTPServer(NewGateway(), nil)
+			sessionID := initializeStreamable(t, srv)
+
+			body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "ping"})
+			req := loopbackRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+			req.Header.Set("Mcp-Session-Id", sessionID)
+			if tt.header != "" {
+				req.Header.Set("MCP-Protocol-Version", tt.header)
+			}
+			w := httptest.NewRecorder()
+			srv.ServeHTTP(w, req)
+
+			if w.Code != tt.wantStatus {
+				t.Errorf("expected %d, got %d: %s", tt.wantStatus, w.Code, w.Body.String())
+			}
+			if tt.wantStatus == http.StatusBadRequest && !strings.Contains(w.Body.String(), MCPProtocolVersion) {
+				t.Errorf("expected 400 body to name supported versions, got: %s", w.Body.String())
+			}
+		})
+	}
+}
+
+func TestStreamableHTTPServer_ProtocolVersionHeader_InitializeExempt(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+
+	// A client cannot know the negotiated version before negotiating, so the
+	// initialize request itself never fails header validation.
+	body, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2024-11-05",
+			"clientInfo":      map[string]any{"name": "c", "version": "1"},
+		},
+	})
+	req := loopbackRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req.Header.Set("MCP-Protocol-Version", "bogus")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected initialize to be exempt from header validation, got %d", w.Code)
+	}
+}
+
+func TestStreamableHTTPServer_ProtocolVersionHeader_GetAndDelete(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	sessionID := initializeStreamable(t, srv)
+
+	for _, method := range []string{http.MethodGet, http.MethodDelete} {
+		req := loopbackRequest(method, "/mcp", nil)
+		req.Header.Set("Mcp-Session-Id", sessionID)
+		req.Header.Set("MCP-Protocol-Version", "bogus")
+		w := httptest.NewRecorder()
+		srv.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("%s: expected 400 for unsupported header, got %d", method, w.Code)
+		}
+	}
+}
+
+func TestStreamableHTTPServer_Post_NoSessionID(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+
+	body, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/list",
+	})
+	req := loopbackRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for missing session ID, got %d", w.Code)
+	}
+}
+
+func TestStreamableHTTPServer_Post_UnknownSessionID(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+
+	body, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "ping",
+	})
+	req := loopbackRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req.Header.Set("Mcp-Session-Id", "nonexistent-session")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown session, got %d", w.Code)
+	}
+}
+
+func TestStreamableHTTPServer_Post_InvalidJSON(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+
+	req := loopbackRequest(http.MethodPost, "/mcp", strings.NewReader("{invalid}"))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 with JSON-RPC error, got %d", w.Code)
+	}
+	var resp jsonrpc.Response
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Error == nil {
+		t.Error("expected JSON-RPC error for invalid JSON")
+	}
+	if resp.Error.Code != jsonrpc.ParseError {
+		t.Errorf("expected ParseError code %d, got %d", jsonrpc.ParseError, resp.Error.Code)
+	}
+}
+
+func TestStreamableHTTPServer_Ping(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	sessionID := initializeStreamable(t, srv)
+
+	resp := streamablePost(t, srv, sessionID, "ping", nil)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %s", resp.Error.Message)
+	}
+}
+
+func TestStreamableHTTPServer_ToolsList(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	g := NewGateway()
+	client := setupMockAgentClient(ctrl, "server1", []Tool{
+		{Name: "read", Description: "Read tool"},
+		{Name: "write", Description: "Write tool"},
+	})
+	g.Router().AddClient(client)
+	g.Router().RefreshTools()
+
+	srv := NewStreamableHTTPServer(g, nil)
+	sessionID := initializeStreamable(t, srv)
+
+	resp := streamablePost(t, srv, sessionID, "tools/list", nil)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %s", resp.Error.Message)
+	}
+	var result ToolsListResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Tools) != 2 {
+		t.Errorf("expected 2 tools, got %d", len(result.Tools))
+	}
+}
+
+func TestStreamableHTTPServer_ToolsCall(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	g := NewGateway()
+	client := setupMockAgentClient(ctrl, "server1", []Tool{
+		{Name: "echo", Description: "Echo tool"},
+	})
+	client.EXPECT().CallTool(gomock.Any(), "echo", gomock.Any()).Return(
+		&ToolCallResult{Content: []Content{NewTextContent("hello")}}, nil,
+	)
+	g.Router().AddClient(client)
+	g.Router().RefreshTools()
+
+	srv := NewStreamableHTTPServer(g, nil)
+	sessionID := initializeStreamable(t, srv)
+
+	params, _ := json.Marshal(ToolCallParams{Name: "server1__echo", Arguments: map[string]any{}})
+	body := map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": json.RawMessage(params)}
+	bodyBytes, _ := json.Marshal(body)
+	req := loopbackRequest(http.MethodPost, "/mcp", bytes.NewReader(bodyBytes))
+	req.Header.Set("Mcp-Session-Id", sessionID)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	var resp jsonrpc.Response
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %s", resp.Error.Message)
+	}
+	var result ToolCallResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Error("expected successful tool call")
+	}
+}
+
+func TestStreamableHTTPServer_Delete(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	sessionID := initializeStreamable(t, srv)
+
+	req := loopbackRequest(http.MethodDelete, "/mcp", nil)
+	req.Header.Set("Mcp-Session-Id", sessionID)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 on DELETE, got %d", w.Code)
+	}
+	if srv.SessionCount() != 0 {
+		t.Errorf("expected 0 sessions after DELETE, got %d", srv.SessionCount())
+	}
+}
+
+func TestStreamableHTTPServer_Delete_NoSessionID(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+
+	req := loopbackRequest(http.MethodDelete, "/mcp", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing session ID, got %d", w.Code)
+	}
+}
+
+func TestStreamableHTTPServer_Delete_UnknownSession(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+
+	req := loopbackRequest(http.MethodDelete, "/mcp", nil)
+	req.Header.Set("Mcp-Session-Id", "nonexistent")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown session, got %d", w.Code)
+	}
+}
+
+func TestStreamableHTTPServer_PostAfterDelete(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	sessionID := initializeStreamable(t, srv)
+
+	// Delete the session
+	del := loopbackRequest(http.MethodDelete, "/mcp", nil)
+	del.Header.Set("Mcp-Session-Id", sessionID)
+	delW := httptest.NewRecorder()
+	srv.ServeHTTP(delW, del)
+
+	// Subsequent POST should return 404
+	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "ping"})
+	req := loopbackRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req.Header.Set("Mcp-Session-Id", sessionID)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404 after DELETE, got %d", w.Code)
+	}
+}
+
+func TestStreamableHTTPServer_Get_SSEHeaders(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	sessionID := initializeStreamable(t, srv)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := loopbackRequest(http.MethodGet, "/mcp", nil).WithContext(ctx)
+	req.Header.Set("Mcp-Session-Id", sessionID)
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.ServeHTTP(w, req)
+	}()
+
+	// Give the SSE stream a moment to start
+	time.Sleep(5 * time.Millisecond)
+	cancel()
+	<-done
+
+	if ct := w.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("expected Content-Type text/event-stream, got %s", ct)
+	}
+	if cc := w.Header().Get("Cache-Control"); cc != "no-cache" {
+		t.Errorf("expected Cache-Control no-cache, got %s", cc)
+	}
+}
+
+func TestStreamableHTTPServer_Get_NoSessionID(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+
+	req := loopbackRequest(http.MethodGet, "/mcp", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for missing session ID, got %d", w.Code)
+	}
+}
+
+func TestStreamableHTTPServer_Get_UnknownSession(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+
+	req := loopbackRequest(http.MethodGet, "/mcp", nil)
+	req.Header.Set("Mcp-Session-Id", "nonexistent")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown session, got %d", w.Code)
+	}
+}
+
+func TestStreamableHTTPServer_Get_LastEventID_Replay(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	sessionID := initializeStreamable(t, srv)
+
+	// Manually look up the session and push some events
+	srv.mu.RLock()
+	session := srv.sessions[sessionID]
+	srv.mu.RUnlock()
+
+	session.pushEvent("message", []byte(`{"test":1}`))
+	session.pushEvent("message", []byte(`{"test":2}`))
+	session.pushEvent("message", []byte(`{"test":3}`))
+
+	// Connect with Last-Event-ID: 1 to replay events 2 and 3
+	ctx, cancel := context.WithCancel(context.Background())
+	req := loopbackRequest(http.MethodGet, "/mcp", nil).WithContext(ctx)
+	req.Header.Set("Mcp-Session-Id", sessionID)
+	req.Header.Set("Last-Event-ID", "1")
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.ServeHTTP(w, req)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	<-done
+
+	body := w.Body.String()
+	// Should contain events with ID 2 and 3 (replayed), but not ID 1
+	if !strings.Contains(body, "id: 2") {
+		t.Errorf("expected event id 2 in replay, got: %s", body)
+	}
+	if !strings.Contains(body, "id: 3") {
+		t.Errorf("expected event id 3 in replay, got: %s", body)
+	}
+	if strings.Contains(body, "id: 1\n") {
+		t.Errorf("event id 1 should not be replayed (afterID=1), got: %s", body)
+	}
+}
+
+func TestStreamableHTTPServer_OriginValidation_Rejected(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), []string{"https://allowed.example.com"})
+
+	body, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "initialize",
+		"params": map[string]any{"protocolVersion": "2024-11-05", "clientInfo": map[string]any{"name": "c", "version": "1"}},
+	})
+	req := loopbackRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req.Host = "localhost:8180"
+	req.Header.Set("Origin", "https://evil.example.com")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for disallowed origin, got %d", w.Code)
+	}
+}
+
+func TestStreamableHTTPServer_OriginValidation_AllowedLocalhost(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+
+	body, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "initialize",
+		"params": map[string]any{"protocolVersion": "2024-11-05", "clientInfo": map[string]any{"name": "c", "version": "1"}},
+	})
+
+	for _, origin := range []string{"http://localhost:8180", "http://127.0.0.1:8180"} {
+		t.Run(origin, func(t *testing.T) {
+			req := loopbackRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+			req.Host = "localhost:8180"
+			req.Header.Set("Origin", origin)
+			w := httptest.NewRecorder()
+			srv.ServeHTTP(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Errorf("expected 200 for localhost origin %s, got %d", origin, w.Code)
+			}
+		})
+	}
+}
+
+func TestStreamableHTTPServer_OriginValidation_NoOriginAllowed(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+
+	body, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "initialize",
+		"params": map[string]any{"protocolVersion": "2024-11-05", "clientInfo": map[string]any{"name": "c", "version": "1"}},
+	})
+	// No Origin header — should always be allowed (non-browser client)
+	req := loopbackRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req.Host = "localhost:8180"
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 for request without Origin, got %d", w.Code)
+	}
+}
+
+func TestStreamableHTTPServer_OriginValidation_WildcardAllowsAll(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), []string{"*"})
+
+	body, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "initialize",
+		"params": map[string]any{"protocolVersion": "2024-11-05", "clientInfo": map[string]any{"name": "c", "version": "1"}},
+	})
+	req := loopbackRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req.Host = "localhost:8180"
+	req.Header.Set("Origin", "https://any.example.com")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 for wildcard allowed origins, got %d", w.Code)
+	}
+}
+
+// --- Host validation (DNS rebinding protection) ---
+
+// hostReqBody is the initialize payload the Host tests post.
+func hostReqBody(t *testing.T) []byte {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "initialize",
+		"params": map[string]any{"protocolVersion": "2024-11-05", "clientInfo": map[string]any{"name": "c", "version": "1"}},
+	})
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+	return body
+}
+
+// hostReq builds a POST /mcp request with an explicit Host, optionally
+// recording the local address the request "arrived" on. httptest.NewRequest
+// records none, which validateHost treats as loopback.
+func hostReq(t *testing.T, host string, local net.Addr) *http.Request {
+	t.Helper()
+	req := loopbackRequest(http.MethodPost, "/mcp", bytes.NewReader(hostReqBody(t)))
+	req.Host = host
+	if local != nil {
+		req = req.WithContext(context.WithValue(req.Context(), http.LocalAddrContextKey, local))
+	}
+	return req
+}
+
+func TestStreamableHTTPServer_HostValidation_RejectsForeignHost(t *testing.T) {
+	// The regression case: a rebound page sends the attacker's domain in Host
+	// and no Origin at all, which is what a same-origin GET/POST looks like
+	// after the DNS record flips to 127.0.0.1.
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, hostReq(t, "evil.example.com", nil))
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for foreign Host, got %d", w.Code)
+	}
+}
+
+func TestStreamableHTTPServer_HostValidation_AllowsLoopback(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	local := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8180}
+
+	// Every form is checked against a real recorded local address, so the
+	// port comparison is genuinely exercised rather than skipped.
+	hosts := []string{
+		"localhost:8180", "127.0.0.1:8180", "[::1]:8180", "localhost",
+		"127.0.0.53:8180", // all of 127.0.0.0/8 is loopback
+		"LOCALHOST:8180",  // host names are case-insensitive
+		"localhost.",      // trailing dot is the fully-qualified same name
+		"[::ffff:127.0.0.1]:8180",
+	}
+	for _, host := range hosts {
+		t.Run(host, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			srv.ServeHTTP(w, hostReq(t, host, local))
+
+			if w.Code != http.StatusOK {
+				t.Errorf("expected 200 for loopback Host %s, got %d", host, w.Code)
+			}
+		})
+	}
+}
+
+func TestStreamableHTTPServer_HostValidation_RejectsLookalikes(t *testing.T) {
+	// Suffix and prefix confusion are the cases an allowlist exists to stop:
+	// every one of these embeds a loopback name inside an attacker domain.
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+
+	hosts := []string{
+		"127.0.0.1.evil.com",
+		"localhost.evil.com",
+		"evil.com:8180@localhost",
+		"localhost@evil.com",
+		"0.0.0.0:8180", // DNS can answer 0.0.0.0, so it is a rebinding vector
+		"localhost:",   // bare trailing colon must not skip the port check
+		"[localhost]",
+		"[[::1]]",
+		"127.0.0.1]",
+	}
+	for _, host := range hosts {
+		t.Run(host, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			srv.ServeHTTP(w, hostReq(t, host, nil))
+
+			if w.Code != http.StatusForbidden {
+				t.Errorf("expected 403 for lookalike Host %s, got %d", host, w.Code)
+			}
+		})
+	}
+}
+
+func TestStreamableHTTPServer_HostValidation_NonTCPListenerFailsClosed(t *testing.T) {
+	// A listener whose address is not host:port (Unix socket, net.Pipe) must
+	// not silently disable the check by looking non-loopback.
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	local := &net.UnixAddr{Name: "/tmp/gridctl.sock", Net: "unix"}
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, hostReq(t, "evil.example.com", local))
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for foreign Host on a non-TCP listener, got %d", w.Code)
+	}
+}
+
+func TestStreamableHTTPServer_HostValidation_AllowlistEdgeCases(t *testing.T) {
+	tests := []struct {
+		name    string
+		allowed []string
+		host    string
+		want    int
+	}{
+		{"empty entry does not match empty authority", []string{""}, "[]", http.StatusForbidden},
+		{"wildcard is not a wildcard", []string{"*"}, "evil.example.com", http.StatusForbidden},
+		{"entry with port still matches case-insensitively", []string{"gridctl.internal:8180"}, "GRIDCTL.INTERNAL:8180", http.StatusOK},
+		{"entry without port matches host with port", []string{"gridctl.internal"}, "gridctl.internal:8180", http.StatusOK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := NewStreamableHTTPServer(NewGateway(), nil)
+			srv.SetAllowedHosts(tt.allowed)
+			w := httptest.NewRecorder()
+			srv.ServeHTTP(w, hostReq(t, tt.host, nil))
+
+			if w.Code != tt.want {
+				t.Errorf("expected %d, got %d", tt.want, w.Code)
+			}
+		})
+	}
+}
+
+func TestStreamableHTTPServer_HostValidation_AllowsConfiguredHost(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	srv.SetAllowedHosts([]string{"gridctl.internal"})
+
+	for _, host := range []string{"gridctl.internal", "gridctl.internal:8180"} {
+		t.Run(host, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			srv.ServeHTTP(w, hostReq(t, host, nil))
+
+			if w.Code != http.StatusOK {
+				t.Errorf("expected 200 for allowlisted Host %s, got %d", host, w.Code)
+			}
+		})
+	}
+}
+
+func TestStreamableHTTPServer_HostValidation_RejectsPortMismatch(t *testing.T) {
+	// A loopback name aimed at another port is still someone else's service.
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	local := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8180}
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, hostReq(t, "localhost:9999", local))
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for loopback Host on the wrong port, got %d", w.Code)
+	}
+}
+
+func TestStreamableHTTPServer_HostValidation_SkipsNonLoopbackArrival(t *testing.T) {
+	// A deployment deliberately exposed on the network must keep working:
+	// remote clients legitimately send their own Host.
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	local := &net.TCPAddr{IP: net.IPv4(10, 0, 0, 5), Port: 8180}
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, hostReq(t, "gridctl.corp.example.com", local))
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 for non-loopback arrival, got %d", w.Code)
+	}
+}
+
+func TestStreamableHTTPServer_HostValidation_RejectsMissingHost(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, hostReq(t, "", nil))
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for missing Host, got %d", w.Code)
+	}
+}
+
+func TestStreamableHTTPServer_MethodNotAllowed(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+
+	req := loopbackRequest(http.MethodPut, "/mcp", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 for PUT, got %d", w.Code)
+	}
+}
+
+
+func TestStreamableHTTPServer_SessionCount(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+
+	if srv.SessionCount() != 0 {
+		t.Errorf("expected 0 sessions initially, got %d", srv.SessionCount())
+	}
+
+	id1 := initializeStreamable(t, srv)
+	if srv.SessionCount() != 1 {
+		t.Errorf("expected 1 session, got %d", srv.SessionCount())
+	}
+
+	_ = initializeStreamable(t, srv)
+	if srv.SessionCount() != 2 {
+		t.Errorf("expected 2 sessions, got %d", srv.SessionCount())
+	}
+
+	// Delete first session
+	req := loopbackRequest(http.MethodDelete, "/mcp", nil)
+	req.Header.Set("Mcp-Session-Id", id1)
+	srv.ServeHTTP(httptest.NewRecorder(), req)
+
+	if srv.SessionCount() != 1 {
+		t.Errorf("expected 1 session after delete, got %d", srv.SessionCount())
+	}
+}
+
+func TestStreamableHTTPServer_Close(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+
+	initializeStreamable(t, srv)
+	initializeStreamable(t, srv)
+
+	if srv.SessionCount() != 2 {
+		t.Fatalf("expected 2 sessions before close, got %d", srv.SessionCount())
+	}
+
+	srv.Close()
+
+	if srv.SessionCount() != 0 {
+		t.Errorf("expected 0 sessions after Close, got %d", srv.SessionCount())
+	}
+}
+
+func TestStreamableHTTPServer_Close_CancelsSSEStream(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	sessionID := initializeStreamable(t, srv)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req := loopbackRequest(http.MethodGet, "/mcp", nil).WithContext(ctx)
+	req.Header.Set("Mcp-Session-Id", sessionID)
+	w := httptest.NewRecorder()
+
+	streamDone := make(chan struct{})
+	go func() {
+		defer close(streamDone)
+		srv.ServeHTTP(w, req)
+	}()
+
+	// Give the SSE stream time to start
+	time.Sleep(10 * time.Millisecond)
+
+	// Close the server — should cancel the stream
+	srv.Close()
+
+	select {
+	case <-streamDone:
+		// Stream was cancelled — correct
+	case <-time.After(200 * time.Millisecond):
+		t.Error("expected SSE stream to be cancelled after Close()")
+		cancel()
+	}
+}
+
+func TestStreamableHTTPServer_NotificationsInitialized(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	sessionID := initializeStreamable(t, srv)
+
+	resp := streamablePost(t, srv, sessionID, "notifications/initialized", nil)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %s", resp.Error.Message)
+	}
+}
+
+func TestStreamableHTTPServer_UnknownMethod(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	sessionID := initializeStreamable(t, srv)
+
+	resp := streamablePost(t, srv, sessionID, "nonexistent/method", nil)
+	if resp.Error == nil {
+		t.Fatal("expected error for unknown method")
+	}
+	if resp.Error.Code != jsonrpc.MethodNotFound {
+		t.Errorf("expected MethodNotFound code %d, got %d", jsonrpc.MethodNotFound, resp.Error.Code)
+	}
+}
+
+func TestStreamableHTTPServer_Get_CancelCancelsOldStream(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	sessionID := initializeStreamable(t, srv)
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	req1 := loopbackRequest(http.MethodGet, "/mcp", nil).WithContext(ctx1)
+	req1.Header.Set("Mcp-Session-Id", sessionID)
+	w1 := httptest.NewRecorder()
+
+	done1 := make(chan struct{})
+	go func() {
+		defer close(done1)
+		srv.ServeHTTP(w1, req1)
+	}()
+
+	// Wait for first stream to register
+	time.Sleep(10 * time.Millisecond)
+
+	// Open a second GET stream for the same session — should cancel the first
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	req2 := loopbackRequest(http.MethodGet, "/mcp", nil).WithContext(ctx2)
+	req2.Header.Set("Mcp-Session-Id", sessionID)
+	w2 := httptest.NewRecorder()
+
+	done2 := make(chan struct{})
+	go func() {
+		defer close(done2)
+		srv.ServeHTTP(w2, req2)
+	}()
+
+	// First stream should have been cancelled
+	select {
+	case <-done1:
+		// First stream was cancelled — correct
+	case <-time.After(200 * time.Millisecond):
+		t.Error("expected first SSE stream to be cancelled when second opens")
+	}
+
+	cancel2()
+	<-done2
+}
+
+func TestStreamableHTTPServer_GatewaySessionCount(t *testing.T) {
+	g := NewGateway()
+	srv := NewStreamableHTTPServer(g, nil)
+
+	if g.SessionCount() != 0 {
+		t.Errorf("expected 0 gateway sessions initially, got %d", g.SessionCount())
+	}
+
+	id1 := initializeStreamable(t, srv)
+	if g.SessionCount() != 1 {
+		t.Errorf("expected 1 gateway session after initialize, got %d", g.SessionCount())
+	}
+
+	// Delete via DELETE /mcp
+	req := loopbackRequest(http.MethodDelete, "/mcp", nil)
+	req.Header.Set("Mcp-Session-Id", id1)
+	srv.ServeHTTP(httptest.NewRecorder(), req)
+
+	if g.SessionCount() != 0 {
+		t.Errorf("expected 0 gateway sessions after DELETE, got %d", g.SessionCount())
+	}
+}
+
+func TestStreamableHTTPServer_ToolsCall_InvalidParams(t *testing.T) {
+	srv := NewStreamableHTTPServer(NewGateway(), nil)
+	sessionID := initializeStreamable(t, srv)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":"invalid"}`
+	req := loopbackRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set("Mcp-Session-Id", sessionID)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	var resp jsonrpc.Response
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Error == nil {
+		t.Fatal("expected error for invalid tools/call params")
+	}
+	if resp.Error.Code != jsonrpc.InvalidParams {
+		t.Errorf("expected InvalidParams code %d, got %d", jsonrpc.InvalidParams, resp.Error.Code)
+	}
+}
+
+// streamableTestPromptProvider wraps a MockAgentClient for prompt tests.
+type streamableTestPromptProvider struct {
+	AgentClient
+	prompts []PromptData
+}
+
+func (p *streamableTestPromptProvider) ListPromptData() []PromptData { return p.prompts }
+func (p *streamableTestPromptProvider) GetPromptData(name string) (*PromptData, error) {
+	for _, pd := range p.prompts {
+		if pd.Name == name {
+			return &pd, nil
+		}
+	}
+	return nil, fmt.Errorf("prompt %q: not found", name)
+}
+
+// recordingPromptGetObserver captures ObservePromptGet calls for assertions.
+// The gateway fires the observer on a goroutine, so tests synchronize on the
+// channel rather than reading shared state. Shared by the handler and
+// streamable transport tests (both in package mcp).
+type recordingPromptGetObserver struct {
+	calls chan PromptGetObservation
+}
+
+func newRecordingPromptGetObserver() *recordingPromptGetObserver {
+	return &recordingPromptGetObserver{calls: make(chan PromptGetObservation, 8)}
+}
+
+func (o *recordingPromptGetObserver) ObservePromptGet(obs PromptGetObservation) {
+	o.calls <- obs
+}
+
+// waitForObservation returns the next observation or fails after a timeout.
+func (o *recordingPromptGetObserver) waitForObservation(t *testing.T) PromptGetObservation {
+	t.Helper()
+	select {
+	case obs := <-o.calls:
+		return obs
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for prompt-get observation")
+		return PromptGetObservation{}
+	}
+}
+
+// expectNoObservation asserts the observer does not fire within a short window.
+// Used to confirm a failed prompts/get records nothing.
+func (o *recordingPromptGetObserver) expectNoObservation(t *testing.T) {
+	t.Helper()
+	select {
+	case got := <-o.calls:
+		t.Fatalf("observer fired unexpectedly: %+v", got)
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func setupStreamableWithRegistry(t *testing.T) (*StreamableHTTPServer, string) {
+	t.Helper()
+	ctrl := gomock.NewController(t)
+	g := NewGateway()
+	mock := setupMockAgentClient(ctrl, "registry", nil)
+	pp := &streamableTestPromptProvider{
+		AgentClient: mock,
+		prompts: []PromptData{
+			{
+				Name:        "code-review",
+				Description: "Review code",
+				Content:     "Review this {{language}} code: {{code}}",
+				Arguments: []PromptArgumentData{
+					{Name: "language", Required: true},
+					{Name: "code", Required: true},
+				},
+			},
+		},
+	}
+	g.Router().AddClient(pp)
+
+	srv := NewStreamableHTTPServer(g, nil)
+	sessionID := initializeStreamable(t, srv)
+	return srv, sessionID
+}
+
+func TestStreamableHTTPServer_PromptsList(t *testing.T) {
+	srv, sessionID := setupStreamableWithRegistry(t)
+
+	resp := streamablePost(t, srv, sessionID, "prompts/list", nil)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %s", resp.Error.Message)
+	}
+	var result PromptsListResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Prompts) != 1 {
+		t.Errorf("expected 1 prompt, got %d", len(result.Prompts))
+	}
+}
+
+func TestStreamableHTTPServer_PromptsGet(t *testing.T) {
+	srv, sessionID := setupStreamableWithRegistry(t)
+
+	resp := streamablePost(t, srv, sessionID, "prompts/get", map[string]any{
+		"name":      "code-review",
+		"arguments": map[string]any{"language": "Go", "code": "func main() {}"},
+	})
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %s", resp.Error.Message)
+	}
+	var result PromptsGetResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	expected := "Review this Go code: func main() {}"
+	if result.Messages[0].Content.Text != expected {
+		t.Errorf("expected %q, got %q", expected, result.Messages[0].Content.Text)
+	}
+}
+
+func TestStreamableHTTPServer_PromptsGet_FiresObserver(t *testing.T) {
+	srv, sessionID := setupStreamableWithRegistry(t)
+	obs := newRecordingPromptGetObserver()
+	srv.gateway.SetPromptGetObserver(obs)
+
+	resp := streamablePost(t, srv, sessionID, "prompts/get", map[string]any{
+		"name":      "code-review",
+		"arguments": map[string]any{"language": "Go", "code": "func main() {}"},
+	})
+	// Serving behavior is unchanged by the observer.
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %s", resp.Error.Message)
+	}
+	var result PromptsGetResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if want := "Review this Go code: func main() {}"; result.Messages[0].Content.Text != want {
+		t.Errorf("content = %q, want %q", result.Messages[0].Content.Text, want)
+	}
+
+	got := obs.waitForObservation(t)
+	if got.PromptName != "code-review" {
+		t.Errorf("observed prompt = %q, want code-review", got.PromptName)
+	}
+	// The streamable transport attributes usage to the initializing client.
+	if got.ClientID != "test-client" {
+		t.Errorf("observed clientID = %q, want test-client", got.ClientID)
+	}
+}
+
+func TestStreamableHTTPServer_PromptsGet_NotFoundDoesNotFireObserver(t *testing.T) {
+	srv, sessionID := setupStreamableWithRegistry(t)
+	obs := newRecordingPromptGetObserver()
+	srv.gateway.SetPromptGetObserver(obs)
+
+	resp := streamablePost(t, srv, sessionID, "prompts/get", map[string]any{"name": "nonexistent"})
+	if resp.Error == nil {
+		t.Fatal("expected error for unknown prompt")
+	}
+	obs.expectNoObservation(t)
+}
+
+func TestStreamableHTTPServer_PromptsGet_NilParams(t *testing.T) {
+	srv, sessionID := setupStreamableWithRegistry(t)
+
+	resp := streamablePost(t, srv, sessionID, "prompts/get", nil)
+	if resp.Error == nil {
+		t.Fatal("expected error for nil params on prompts/get")
+	}
+}
+
+func TestStreamableHTTPServer_ResourcesList(t *testing.T) {
+	srv, sessionID := setupStreamableWithRegistry(t)
+
+	resp := streamablePost(t, srv, sessionID, "resources/list", nil)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %s", resp.Error.Message)
+	}
+	var result ResourcesListResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Resources) != 1 {
+		t.Errorf("expected 1 resource, got %d", len(result.Resources))
+	}
+}
+
+func TestStreamableHTTPServer_ResourcesRead(t *testing.T) {
+	srv, sessionID := setupStreamableWithRegistry(t)
+
+	resp := streamablePost(t, srv, sessionID, "resources/read", map[string]any{
+		"uri": "skills://registry/code-review",
+	})
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %s", resp.Error.Message)
+	}
+	var result ResourcesReadResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Contents) != 1 {
+		t.Fatalf("expected 1 content, got %d", len(result.Contents))
+	}
+}
+
+func TestStreamableHTTPServer_ResourcesRead_NilParams(t *testing.T) {
+	srv, sessionID := setupStreamableWithRegistry(t)
+
+	resp := streamablePost(t, srv, sessionID, "resources/read", nil)
+	if resp.Error == nil {
+		t.Fatal("expected error for nil params on resources/read")
+	}
+}

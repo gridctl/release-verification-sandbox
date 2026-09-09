@@ -1,0 +1,97 @@
+import { describe, it, expect, afterEach } from 'vitest';
+import '@testing-library/jest-dom';
+import { render, screen, fireEvent } from '@testing-library/react';
+import { MemoryRouter } from 'react-router';
+import { WorkspaceSwitcher } from '../components/shell/WorkspaceSwitcher';
+import { WORKSPACE_CONFIG } from '../types/workspace';
+import { useToolsDirtyStore } from '../stores/useToolsDirtyStore';
+
+function renderAt(path: string) {
+  return render(
+    <MemoryRouter initialEntries={[path]}>
+      <WorkspaceSwitcher />
+    </MemoryRouter>,
+  );
+}
+
+describe('WorkspaceSwitcher', () => {
+  it('renders one pill per workspace, in WORKSPACE_CONFIG order', () => {
+    renderAt('/stack');
+    const tablist = screen.getByRole('tablist', { name: /workspace/i });
+    expect(tablist).toBeInTheDocument();
+    const tabs = screen.getAllByRole('tab');
+    expect(tabs).toHaveLength(WORKSPACE_CONFIG.length);
+    expect(tabs.map((t) => t.textContent?.trim())).toEqual(
+      WORKSPACE_CONFIG.map((w) => w.label),
+    );
+  });
+
+  it('marks the active workspace with aria-selected=true and others false', () => {
+    renderAt('/library');
+    for (const ws of WORKSPACE_CONFIG) {
+      const tab = screen.getByRole('tab', { name: ws.label });
+      expect(tab).toHaveAttribute(
+        'aria-selected',
+        ws.id === 'library' ? 'true' : 'false',
+      );
+    }
+  });
+
+  it('marks the Library pill active for /library and deep-link paths', () => {
+    renderAt('/library/incident-triage');
+    expect(screen.getByRole('tab', { name: 'Library' })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+  });
+
+  it('marks the Variables pill active for /vault', () => {
+    renderAt('/vault');
+    expect(screen.getByRole('tab', { name: 'Variables' })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+  });
+
+  it('links each pill to its workspace route', () => {
+    renderAt('/stack');
+    for (const ws of WORKSPACE_CONFIG) {
+      expect(screen.getByRole('tab', { name: ws.label })).toHaveAttribute(
+        'href',
+        `/${ws.id}`,
+      );
+    }
+  });
+});
+
+describe('WorkspaceSwitcher — Tools dirty guard', () => {
+  afterEach(() => {
+    useToolsDirtyStore.setState({ dirty: false, exitNavTarget: null });
+  });
+
+  it('cancels leaving /tools with a dirty editor and stashes the target', () => {
+    useToolsDirtyStore.setState({ dirty: true, exitNavTarget: null });
+    renderAt('/tools');
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Metrics' }));
+
+    expect(useToolsDirtyStore.getState().exitNavTarget).toBe('/metrics');
+    // The NavLink was cancelled — Tools stays the active pill.
+    expect(screen.getByRole('tab', { name: 'Tools' })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+  });
+
+  it('does not intercept when the Tools editor is clean', () => {
+    renderAt('/tools');
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Metrics' }));
+
+    expect(useToolsDirtyStore.getState().exitNavTarget).toBeNull();
+    expect(screen.getByRole('tab', { name: 'Metrics' })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+  });
+});

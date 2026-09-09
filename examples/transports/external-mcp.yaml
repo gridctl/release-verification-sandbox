@@ -1,0 +1,67 @@
+# External MCP Server Example
+#
+# This stack demonstrates connecting to external MCP servers that run
+# outside of Gridctl's Docker container management. External servers are
+# identified by providing a `url` field instead of `image` or `source`.
+#
+# Use cases:
+#   - Connecting to MCP servers running on Cloudflare Workers
+#   - Connecting to existing local MCP servers during development
+#   - Connecting to production MCP servers in separate deployments
+#   - Connecting to MCP servers managed by other orchestration systems
+#
+# Prerequisites (for a fast start):
+#   Run `task mock:servers` from the project root to build and start mock servers.
+#   This starts mock-mcp-server on ports 9001 (HTTP) and 9002 (SSE).
+#   Or start manually:
+#     cd examples/_mock-servers/mock-mcp-server
+#     go run main.go -port 9001           # HTTP mode
+#     go run main.go -port 9002 -sse      # SSE mode
+#   Start order is not critical: a server that is not reachable at deploy
+#   time registers as failed, and the gateway retries automatically until
+#   it comes up.
+#
+# Usage:
+#   gridctl apply examples/transports/external-mcp.yaml
+#
+# Note: External servers don't require Docker and skip container creation.
+# The gateway connects directly to the provided URL.
+
+version: "1"
+name: external-mcp-demo
+
+network:
+  name: external-mcp-net
+  driver: bridge
+
+mcp-servers:
+
+  # External HTTP MCP server
+  # Ideally running at this URL before deploying; if it is not, the gateway
+  # keeps retrying and registers it once it comes up.
+  - name: mock-http
+    url: http://localhost:9001/mcp
+    transport: http
+    # Optional: pin the MCP protocol generation instead of auto-probing.
+    # `auto` (the default when omitted) probes server/discover and falls
+    # back to the legacy initialize handshake; `handshake` or `stateless`
+    # skip the probe for peers that mis-answer it.
+    protocol_generation: auto
+
+  # External SSE MCP server
+  # Run with: go run main.go -port 9002 -sse
+  - name: mock-sse
+    url: http://localhost:9002/mcp
+    transport: sse
+
+# You can mix external and container-based servers in the same stack:
+#
+# mcp-servers:
+#   - name: external-api
+#     url: https://api.example.com/mcp
+#     transport: http
+#
+#   - name: local-tools
+#     image: mcp-tools:latest
+#     port: 8080
+#     transport: http

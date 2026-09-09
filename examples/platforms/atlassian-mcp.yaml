@@ -1,0 +1,35 @@
+# Atlassian MCP Server Example
+#
+# This stack provides access to Atlassian's official Rovo MCP server, enabling
+# AI agents to interact with Jira, Confluence, and Compass via natural language.
+#
+# Prerequisites:
+#   - An Atlassian Cloud account with access to Jira, Confluence, or Compass
+#
+# Usage:
+#   gridctl apply examples/platforms/atlassian-mcp.yaml
+#   gridctl auth login atlassian     # one browser authorization, shared by
+#                                    # every connected client; tokens refresh
+#                                    # automatically
+#
+# Reference:
+#   https://github.com/atlassian/atlassian-mcp-server
+
+version: "1"
+name: atlassian-mcp
+
+mcp-servers:
+  # Streamable HTTP endpoint (the default transport). Atlassian retired the
+  # older /v1/sse endpoint on 30 June 2026; /v1/mcp/authv2 is the URL its
+  # docs give MCP clients that broker OAuth themselves.
+  - name: atlassian
+    url: https://mcp.atlassian.com/v1/mcp/authv2
+    auth:
+      type: oauth
+
+  # Legacy alternative: bridge through the mcp-remote npm package instead of
+  # gridctl's native OAuth brokering (requires Node.js, stores tokens in
+  # plaintext under ~/.mcp-auth):
+  #
+  # - name: atlassian
+  #   command: ["npx", "mcp-remote", "https://mcp.atlassian.com/v1/mcp/authv2"]

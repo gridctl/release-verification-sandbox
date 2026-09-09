@@ -1,0 +1,304 @@
+name: Gatekeeper
+'on':
+  workflow_call:
+    outputs:
+      source-sha:
+        description: Exact source commit whose required gates succeeded
+        value: ${{ jobs.required.outputs.source-sha }}
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - name: Set up Go
+      uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+      with:
+        go-version-file: go.mod
+        cache: true
+    - name: Install Go dependencies
+      run: go mod download
+    - name: golangci-lint
+      uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa
+      with:
+        version: v2.11.3
+        args: --timeout=3m
+    - name: Go tests with coverage
+      run: 'go test -race -coverprofile=coverage.out ./...
+
+        go tool cover -func=coverage.out | tail -1
+
+        '
+    - name: Check coverage threshold
+      run: "COVERAGE=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}'\
+        \ | sed 's/%//')\necho \"Total coverage: ${COVERAGE}%\"\nif (( $(echo \"$COVERAGE\
+        \ < 64\" | bc -l) )); then\n  echo \"Coverage ${COVERAGE}% is below 64% threshold\"\
+        \n  exit 1\nfi\n"
+    - name: Per-package coverage thresholds
+      run: bash scripts/check-coverage.sh
+    - name: Go vulnerability check
+      run: 'go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+
+        bash scripts/govulncheck.sh
+
+        '
+    - name: Release policy regressions
+      run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_*.py'
+        -v
+    - name: Set up Task
+      uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e
+      with:
+        version: 3.52.0
+    - name: Build Go binary
+      run: task build:go
+    - name: Validate example stacks
+      run: "# Add example stack YAML files under examples/ to have them validated\
+        \ here.\n# Exit codes: 0=valid, 1=errors (fail), 2=warnings only (pass)\n\
+        # skills.yaml is a skill-source list and gridctl-pack.yaml a pack\n# manifest\
+        \ (different schemas) \u2014 neither is a stack.\n#\n# gateway-remote.yaml\
+        \ is excluded because it is the one example that\n# requires a secret: a non-loopback\
+        \ bind refuses to start without\n# gateway.auth.token, and the variable it\
+        \ references cannot exist in\n# CI, so validation reads the unset value as\
+        \ a missing required\n# field. Giving it a default would ship a working credential\
+        \ in a\n# public repo, which is worse than not validating the file.\n# examples/model-policy\
+        \ holds a gridctl models policy and a LiteLLM\n# proxy config (different schemas)\
+        \ \u2014 neither is a stack.\nmapfile -t files < <(find examples -name \"\
+        *.yaml\" -not -name \"skills.yaml\" -not -name \"gridctl-pack.yaml\" -not\
+        \ -name \"gateway-remote.yaml\" -not -path \"examples/model-policy/*\" | sort)\n\
+        if [ ${#files[@]} -eq 0 ]; then\n  echo \"No example stacks found, skipping\
+        \ validation\"\n  exit 0\nfi\nfailed=0\nfor f in \"${files[@]}\"; do\n  echo\
+        \ \"Validating $f...\"\n  ./gridctl validate \"$f\" && rc=0 || rc=$?\n  if\
+        \ [ $rc -eq 1 ]; then\n    echo \"  FAILED: $f\"\n    failed=1\n  fi\ndone\n\
+        exit $failed\n"
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: test
+    steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - name: Set up Go
+      uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+      with:
+        go-version-file: go.mod
+        cache: true
+    - name: Install Go dependencies
+      run: go mod download
+    - name: Integration tests
+      run: go test -tags=integration -race -timeout 15m ./tests/integration/...
+  litellm-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: test
+    steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - name: Set up Go
+      uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+      with:
+        go-version-file: go.mod
+        cache: true
+    - name: Install Go dependencies
+      run: go mod download
+    - name: Pull pinned LiteLLM image
+      run: docker pull ghcr.io/berriai/litellm:v1.97.0@sha256:468c25f35f3e5ec4e414974f00deab93337b1b4d9953cabcfd3722e59415f834
+    - name: LiteLLM config contract test
+      run: go test -tags=integration -race -timeout 10m -run TestLiteLLMBootsRenderedFragment
+        -v ./tests/integration/...
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: test
+    steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - name: Set up Go
+      uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+      with:
+        go-version-file: go.mod
+        cache: true
+    - name: Set up Node
+      uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+      with:
+        node-version: '22'
+    - name: Install Go dependencies
+      run: go mod download
+    - name: MCP conformance suite
+      run: go test -tags=integration -race -timeout 10m -run TestConformance ./tests/integration/...
+  podman-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    needs: test
+    env:
+      NETAVARK_VERSION: v1.17.2
+      AARDVARK_DNS_VERSION: v1.17.1
+    steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - name: Set up Go
+      uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+      with:
+        go-version-file: go.mod
+        cache: true
+    - name: Install Podman
+      run: "sudo apt-get update -qq\nsudo apt-get install -y -qq podman\n# Do NOT\
+        \ force the archive Podman ahead of a newer preinstalled one.\n# That was\
+        \ tried and reverted: on images shipping Podman 5.x, pointing\n# PATH at the\
+        \ archive's 4.9.3 breaks container startup outright\n# (conmon failures across\
+        \ every container test), which is far worse\n# than the single rootless-DNS\
+        \ failure it was meant to address (#1092).\n#\n# netavark and aardvark-dns\
+        \ are deliberately NOT installed from the\n# archive here. The archive caps\
+        \ them at 1.4.0 on 24.04, and the next\n# step provisions a matched pair from\
+        \ upstream instead. Printing what\n# the image happened to ship keeps the\
+        \ drift visible in the log.\necho \"podman:                  $(command -v\
+        \ podman) \u2014 $(podman --version)\"\necho \"netavark (from image):   $(dpkg-query\
+        \ -W -f='${Version}' netavark 2>/dev/null || echo absent)\"\necho \"aardvark-dns\
+        \ (image):    $(dpkg-query -W -f='${Version}' aardvark-dns 2>/dev/null ||\
+        \ echo absent)\"\n"
+    - name: Pin Podman network stack
+      run: "set -euo pipefail\ntmp=\"$(mktemp -d)\"\n\nfetch() {\n  repo=\"$1\"; version=\"\
+        $2\"; name=\"$3\"\n  base=\"https://github.com/containers/${repo}/releases/download/${version}\"\
+        \n  curl -fsSL --retry 3 --retry-delay 2 -o \"${tmp}/${name}.gz\" \"${base}/${name}.gz\"\
+        \n  curl -fsSL --retry 3 --retry-delay 2 -o \"${tmp}/${name}.sha256sum\" \"\
+        ${base}/sha256sum\"\n  # The release checksum file also lists a vendor tarball\
+        \ this job does\n  # not download. --ignore-missing skips that entry while\
+        \ still failing\n  # if the binary that WAS downloaded does not match.\n \
+        \ ( cd \"${tmp}\" && sha256sum --check --ignore-missing --status \"${name}.sha256sum\"\
+        \ )\n  gunzip -f \"${tmp}/${name}.gz\"\n}\n\nfetch netavark \"${NETAVARK_VERSION}\"\
+        \ netavark\nfetch aardvark-dns \"${AARDVARK_DNS_VERSION}\" aardvark-dns\n\n\
+        # Write to every directory Podman searches for helper binaries rather\n# than\
+        \ guessing which one wins. Overwriting all of them means the\n# resolved pair\
+        \ is the pinned pair no matter how the image lays itself\n# out or which order\
+        \ the lookup takes. Only netavark and aardvark-dns\n# are replaced \u2014\
+        \ every other helper in these directories (rootlessport,\n# pasta, catatonit)\
+        \ is left exactly as the image shipped it.\nfor dir in /usr/local/libexec/podman\
+        \ /usr/local/lib/podman /usr/libexec/podman /usr/lib/podman; do\n  sudo install\
+        \ -Dm755 \"${tmp}/netavark\" \"${dir}/netavark\"\n  sudo install -Dm755 \"\
+        ${tmp}/aardvark-dns\" \"${dir}/aardvark-dns\"\ndone\n"
+    - name: Start Podman socket
+      run: 'systemctl --user enable --now podman.socket
+
+        podman system service --time=0 &
+
+        sleep 1
+
+        echo "DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock" >> "$GITHUB_ENV"
+
+        '
+    - name: Verify Podman
+      run: "set -euo pipefail\npodman info --format '{{.Version.Version}}'\npodman\
+        \ info --format 'network_backend={{.Host.NetworkBackend}}'\n\n# Assert Podman\
+        \ actually resolved the pinned pair. Without this the pin\n# is only a hope:\
+        \ if a future image moves the helper directories, the\n# binaries land somewhere\
+        \ Podman never looks and the job goes back to\n# failing four minutes later\
+        \ inside a test, with the same misleading\n# \"gridctl cannot resolve DNS\"\
+        \ symptom.\n#\n# Versions are read with jq, not a Go template. A template\
+        \ naming a\n# field that moved errors the step out with nothing useful; an\
+        \ absent\n# JSON key reads as empty here and lands in the failure message\
+        \ with\n# the whole document attached. The guard this job previously relied\
+        \ on\n# failed silently for precisely that reason.\ninfo=\"$(podman info --format\
+        \ json)\"\nbackend=\"$(jq -c '.host.networkBackendInfo' <<<\"${info}\")\"\n\
+        netavark=\"$(jq -r '.host.networkBackendInfo.version // \"\"' <<<\"${info}\"\
+        )\"\naardvark=\"$(jq -r '.host.networkBackendInfo.dns.version // \"\"' <<<\"\
+        ${info}\")\"\necho \"netavark:     ${netavark:-<unreported>}\"\necho \"aardvark-dns:\
+        \ ${aardvark:-<unreported>}\"\n\nfail() {\n  echo \"::error::Podman resolved\
+        \ an unpinned network stack: $1\"\n  echo \"networkBackendInfo: ${backend}\"\
+        \n  exit 1\n}\ncase \"${netavark}\" in\n  *\"${NETAVARK_VERSION#v}\"*) ;;\n\
+        \  *) fail \"netavark is '${netavark:-<unreported>}', want ${NETAVARK_VERSION#v}\"\
+        \ ;;\nesac\ncase \"${aardvark}\" in\n  *\"${AARDVARK_DNS_VERSION#v}\"*) ;;\n\
+        \  *) fail \"aardvark-dns is '${aardvark:-<unreported>}', want ${AARDVARK_DNS_VERSION#v}\"\
+        \ ;;\nesac\n"
+    - name: Install Go dependencies
+      run: go mod download
+    - name: Integration tests (Podman)
+      env:
+        GRIDCTL_RUNTIME: podman
+      run: go test -tags=integration -race -timeout 15m ./tests/integration/...
+    - name: Podman network diagnostics
+      if: failure()
+      run: 'set +e
+
+        echo "--- helper processes ---"
+
+        pgrep -a aardvark-dns || echo "aardvark-dns: not running"
+
+        pgrep -a netavark || echo "netavark: not running"
+
+        echo "--- resolved helper paths ---"
+
+        podman info --format json | jq -c ''.host.networkBackendInfo''
+
+        echo "--- networks ---"
+
+        podman network ls
+
+        echo "--- aardvark-dns state ---"
+
+        ls -la "${XDG_RUNTIME_DIR}/containers/networks/aardvark-dns/" 2>&1 | head
+        -20
+
+        head -n 40 "${XDG_RUNTIME_DIR}"/containers/networks/aardvark-dns/* 2>&1
+
+        echo "--- podman user service log ---"
+
+        journalctl --user -u podman.socket -u podman.service -n 80 --no-pager 2>&1
+        | tail -40
+
+        exit 0
+
+        '
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - name: Set up Node.js
+      uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+      with:
+        node-version: '22'
+        cache: npm
+        cache-dependency-path: web/package-lock.json
+    - name: Install dependencies
+      run: npm ci
+      working-directory: web
+    - name: Type check
+      run: npx tsc --noEmit
+      working-directory: web
+    - name: Lint
+      run: npm run lint
+      working-directory: web
+    - name: Tests with coverage
+      run: npx vitest run --coverage
+      working-directory: web
+    - name: Security audit
+      run: npm audit --audit-level=high
+      working-directory: web
+    - name: Build
+      run: npm run build
+      working-directory: web
+  required:
+    if: ${{ always() }}
+    needs:
+    - test
+    - integration
+    - litellm-contract
+    - conformance
+    - podman-integration
+    - frontend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      source-sha: ${{ steps.gates.outputs.source-sha }}
+    steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      with:
+        persist-credentials: false
+    - name: Require every exact-commit gate
+      id: gates
+      env:
+        RELEASE_GATES: ${{ toJSON(needs) }}
+      run: 'python3 scripts/release.py gates
+
+        test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+        printf ''source-sha=%s\n'' "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+        '

@@ -1,0 +1,980 @@
+// Package controller implements the stack lifecycle management for gridctl.
+// It extracts orchestration logic from cmd/gridctl/deploy.go into testable,
+// interface-backed components.
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/gridctl/gridctl/pkg/config"
+	"github.com/gridctl/gridctl/pkg/flags"
+	"github.com/gridctl/gridctl/pkg/logging"
+	"github.com/gridctl/gridctl/pkg/mcp"
+	"github.com/gridctl/gridctl/pkg/output"
+	"github.com/gridctl/gridctl/pkg/pins"
+	"github.com/gridctl/gridctl/pkg/registry"
+	"github.com/gridctl/gridctl/pkg/runtime"
+	"github.com/gridctl/gridctl/pkg/skillpins"
+	"github.com/gridctl/gridctl/pkg/skills"
+	"github.com/gridctl/gridctl/pkg/state"
+	"github.com/gridctl/gridctl/pkg/vault"
+)
+
+// vaultSetAdapter wraps vault.Store to satisfy config.VaultSetLookup.
+type vaultSetAdapter struct {
+	store *vault.Store
+}
+
+func newVaultSetAdapter(store *vault.Store) *vaultSetAdapter {
+	return &vaultSetAdapter{store: store}
+}
+
+func (a *vaultSetAdapter) Get(key string) (string, bool) {
+	return a.store.Get(key)
+}
+
+func (a *vaultSetAdapter) GetSetSecrets(setName string) []config.VaultSecret {
+	secrets := a.store.GetSetSecrets(setName)
+	result := make([]config.VaultSecret, len(secrets))
+	for i, s := range secrets {
+		result[i] = config.VaultSecret{Key: s.Key, Value: s.Value}
+	}
+	return result
+}
+
+// DefaultBindAddress is the listen address used when none is configured.
+// The literal IPv4 loopback is deliberate: the name "localhost" can resolve
+// to ::1 first on some systems, which silently changes which interface is
+// bound and which clients can reach it.
+const DefaultBindAddress = "127.0.0.1"
+
+// BindAllAddress is the opt-in value that restores listening on every
+// interface. Named rather than typed as a bare "0.0.0.0" so the intent is
+// greppable in configs and support threads.
+const BindAllAddress = "0.0.0.0"
+
+// Config holds all deploy configuration, replacing package-level variables.
+type Config struct {
+	StackPath string
+	Port      int
+
+	// Bind is the address the HTTP listener binds. Empty means loopback
+	// (DefaultBindAddress), which keeps the API, web UI, and gateway
+	// unreachable from other hosts and from containers gridctl launches.
+	// Widening it is an explicit act: see EffectiveBind.
+	Bind string
+
+	// AllowUnauthenticated permits a non-loopback bind with no configured
+	// authentication, which gridctl otherwise refuses to start. Named for
+	// what it costs, not what it enables.
+	AllowUnauthenticated bool
+	BasePort             int
+	Verbose              bool
+	Quiet                bool
+	NoCache              bool
+	NoExpand             bool
+	Foreground           bool
+	Watch                bool
+	DaemonChild          bool
+	CodeMode             bool       // Enable code mode via CLI flag
+	Runtime              string     // Explicit runtime selection (docker, podman)
+	Replace              bool       // Stop a running stack before deploying (used by plan apply)
+	LogFile              string     // Path to log file (overrides stack.yaml logging.file)
+	LogLevel             slog.Level // Minimum slog level (global --log-level; zero value is info)
+
+	// OnReady fires once the gateway HTTP listener is serving and MCP server
+	// registration has run — the same readiness the daemon parent polls via
+	// /ready. Only the foreground path invokes it (the daemon parent
+	// health-waits and acts after Deploy returns instead); the daemon child
+	// never sets it. Used by `gridctl apply` for post-ready client linking
+	// (declared link: reconcile and --flash).
+	OnReady func(port int)
+}
+
+// EffectiveBind resolves the listen address, defaulting to loopback.
+func (c Config) EffectiveBind() string {
+	if c.Bind == "" {
+		return DefaultBindAddress
+	}
+	return c.Bind
+}
+
+// BindIsLoopback reports whether the resolved bind address is confined to the
+// loopback interface.
+func (c Config) BindIsLoopback() bool { return bindIsLoopback(c.EffectiveBind()) }
+
+// bindIsLoopback reports whether a listen address is confined to loopback.
+// An unparseable address is treated as non-loopback so callers warn rather
+// than stay silent about an address they could not vet.
+func bindIsLoopback(bind string) bool {
+	if strings.EqualFold(bind, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(bind)
+	return ip != nil && ip.IsLoopback()
+}
+
+// effectiveLogLevel resolves the slog level for handlers built from cfg.
+// Verbose only ever raises verbosity: it lowers the threshold to debug but
+// never mutes an explicit --log-level.
+func effectiveLogLevel(cfg Config) slog.Level {
+	lvl := cfg.LogLevel
+	if cfg.Verbose && lvl > slog.LevelDebug {
+		lvl = slog.LevelDebug
+	}
+	return lvl
+}
+
+// StackController orchestrates the full deploy lifecycle.
+type StackController struct {
+	config     Config
+	version    string
+	webFS      WebFSFunc
+	vaultStore *vault.Store
+}
+
+// New creates a StackController.
+func New(cfg Config) *StackController {
+	return &StackController{config: cfg}
+}
+
+// credentialResolver returns a runtime.CredentialResolver that expands
+// references like "${vault:GIT_TOKEN}" against the controller's live vault.
+// An unresolved reference is a hard error — we never fall through to an
+// unauthenticated clone.
+func (sc *StackController) credentialResolver() runtime.CredentialResolver {
+	return func(ref string) (string, error) {
+		if sc.vaultStore == nil {
+			return "", fmt.Errorf("vault not configured; cannot resolve %s", ref)
+		}
+		expanded, unresolved, _, problems := config.ExpandStringResolved(ref, sc.vaultStore)
+		if len(problems) > 0 {
+			return "", problems[0]
+		}
+		if len(unresolved) > 0 {
+			return "", fmt.Errorf("vault key %q not found", unresolved[0])
+		}
+		return expanded, nil
+	}
+}
+
+// SetVersion sets the version string for the gateway.
+func (sc *StackController) SetVersion(v string) {
+	sc.version = v
+}
+
+// SetWebFS sets the function for getting embedded web files.
+func (sc *StackController) SetWebFS(fn WebFSFunc) {
+	sc.webFS = fn
+}
+
+// Serve starts the API server and web UI in stackless mode.
+// No stack file is required; no container runtime is started.
+// Vault and wizard endpoints are fully functional; stack-dependent endpoints
+// return 503 until a stack is deployed.
+func (sc *StackController) Serve(ctx context.Context) error {
+	cfg := sc.config
+
+	// Daemon child path: run gateway directly, save state.
+	if cfg.DaemonChild {
+		return sc.runStacklessDaemonChild(ctx)
+	}
+
+	// Load vault (best-effort; errors are non-fatal in stackless mode)
+	if vaultDir, err := state.VaultDir(); err == nil {
+		vaultStore := vault.NewStore(vaultDir)
+		if err := vaultStore.Load(); err == nil {
+			if vaultStore.IsLocked() {
+				if pass := os.Getenv("GRIDCTL_VAULT_PASSPHRASE"); pass != "" {
+					_ = vaultStore.Unlock(pass)
+				}
+			}
+			sc.vaultStore = vaultStore
+		}
+	}
+
+	// Foreground mode: run gateway directly without daemonizing.
+	if cfg.Foreground {
+		return sc.buildAndRunStackless(ctx, !cfg.Quiet)
+	}
+
+	// Daemon mode: fork child process, wait for health, print summary.
+	return sc.runStacklessDaemonMode()
+}
+
+// runStacklessDaemonChild is the daemon child path for stackless mode.
+// It saves state and runs the gateway directly.
+func (sc *StackController) runStacklessDaemonChild(ctx context.Context) error {
+	// Load vault best-effort
+	if vaultDir, err := state.VaultDir(); err == nil {
+		vaultStore := vault.NewStore(vaultDir)
+		if err := vaultStore.Load(); err == nil {
+			if vaultStore.IsLocked() {
+				if pass := os.Getenv("GRIDCTL_VAULT_PASSPHRASE"); pass != "" {
+					_ = vaultStore.Unlock(pass)
+				}
+			}
+			sc.vaultStore = vaultStore
+		}
+	}
+
+	st := &state.DaemonState{
+		StackName: "gridctl",
+		StackFile: "",
+		PID:       os.Getpid(),
+		Port:      sc.config.Port,
+		StartedAt: time.Now(),
+	}
+	if err := state.Save(st); err != nil {
+		return fmt.Errorf("failed to save state: %w", err)
+	}
+	// State-file lifetime tracks process lifetime: this defer is the
+	// only point where the file is removed, so an orphaned daemon
+	// remains discoverable until it actually exits.
+	defer func() { _ = state.Delete("gridctl") }()
+
+	return sc.buildAndRunStackless(ctx, false)
+}
+
+// runStacklessDaemonMode forks a stackless child and waits for health.
+func (sc *StackController) runStacklessDaemonMode() error {
+	daemon := NewDaemonManager(sc.config)
+	pid, err := daemon.ForkStackless()
+	if err != nil {
+		return fmt.Errorf("failed to start daemon: %w", err)
+	}
+
+	logPath, _ := state.LogPath("gridctl")
+	if err := daemon.WaitForHealth(sc.config.Port, 30*time.Second); err != nil {
+		return fmt.Errorf("daemon failed to start: %w\nCheck logs at %s", err, logPath)
+	}
+
+	fmt.Printf("gridctl started in stackless mode\n")
+	fmt.Printf("  Web UI: http://localhost:%d\n", sc.config.Port)
+	fmt.Printf("  PID:    %d\n", pid)
+	fmt.Printf("  Logs:   %s\n", logPath)
+	// Teardown instructions always print (scripts capture them); extra
+	// conversational hints go through Printer.Hint and are TTY-only.
+	fmt.Printf("\nUse 'gridctl stop' to stop.\n")
+	output.New().Hint("Load a stack with 'gridctl apply <stack.yaml>', or 'gridctl open' for the web UI")
+	return nil
+}
+
+// buildAndRunStackless builds and runs the gateway in stackless mode.
+func (sc *StackController) buildAndRunStackless(ctx context.Context, verbose bool) error {
+	// Try to create a real container runtime so Save & Load can actually bring up
+	// containers once the user loads a stack via POST /api/stack/initialize. Fall
+	// back to an empty orchestrator if detection fails — the daemon still starts;
+	// initialize will surface a clear error instead of panicking.
+	rt, err := sc.createRuntime()
+	if err != nil {
+		rt = runtime.NewOrchestrator(nil, nil)
+	}
+	stack := &config.Stack{Name: "gridctl"}
+	builder := NewGatewayBuilder(sc.config, stack, "", rt, &runtime.UpResult{})
+	builder.SetVersion(sc.version)
+	builder.SetWebFS(sc.webFS)
+	if sc.vaultStore != nil {
+		builder.SetVaultStore(sc.vaultStore)
+	}
+	pinStore, err := newPinStore(stack.Name)
+	if err != nil {
+		return err
+	}
+	builder.SetPinStore(pinStore)
+	skillPinStore, err := newSkillPinStore(stack.Name)
+	if err != nil {
+		return err
+	}
+	builder.SetSkillPinStore(skillPinStore)
+	return builder.BuildAndRun(ctx, verbose)
+}
+
+// Deploy orchestrates the full stack lifecycle.
+func (sc *StackController) Deploy(ctx context.Context) error {
+	cfg := sc.config
+
+	// Resolve absolute path for daemon child
+	absPath, err := filepath.Abs(cfg.StackPath)
+	if err != nil {
+		return fmt.Errorf("failed to resolve path: %w", err)
+	}
+	cfg.StackPath = absPath
+	sc.config = cfg
+
+	// Load vault
+	vaultDir, err := state.VaultDir()
+	if err != nil {
+		return fmt.Errorf("loading vault: %w", err)
+	}
+	vaultStore := vault.NewStore(vaultDir)
+	if err := vaultStore.Load(); err != nil {
+		return fmt.Errorf("loading vault: %w", err)
+	}
+
+	// Automatically unlock if encrypted and passphrase is provided via environment
+	if vaultStore.IsLocked() {
+		if pass := os.Getenv("GRIDCTL_VAULT_PASSPHRASE"); pass != "" {
+			if err := vaultStore.Unlock(pass); err != nil {
+				return fmt.Errorf("unlocking vault: %w", err)
+			}
+		}
+	}
+
+	sc.vaultStore = vaultStore
+
+	// Load stack with vault resolution and set injection
+	stack, err := config.LoadStack(cfg.StackPath, config.WithVault(vaultStore), config.WithVaultSets(newVaultSetAdapter(vaultStore)))
+	if err != nil {
+		return fmt.Errorf("failed to load stack: %w", err)
+	}
+
+	// Check state lock and existing daemon
+	if err := sc.checkState(stack); err != nil {
+		return err
+	}
+
+	// Daemon child path: run gateway directly
+	if cfg.DaemonChild {
+		return sc.runDaemonChild(ctx, stack)
+	}
+
+	// Create output printer and phase reporter
+	printer := sc.createPrinter(stack)
+	reporter := sc.createReporter()
+
+	// Surface experimental flag issues (unknown names, concluded flags,
+	// malformed env overrides) at apply time. Warnings only — a stack.yaml
+	// written against a newer gridctl must still deploy on this one.
+	// Foreground mode skips this pass: the gateway builder logs the same
+	// warnings via slog, which reaches the terminal directly there, and
+	// printing both would duplicate every line.
+	if printer != nil && !cfg.Foreground {
+		for _, w := range flags.Resolve(flags.Default(), stack.Experimental).Warnings {
+			printer.Warn(w.Message)
+		}
+	}
+
+	// Surface skills-policy denials at apply time: a policy hiding an
+	// active skill must never be silent. Warning only — denial is the
+	// configured intent; the warning makes it visible. Foreground skips
+	// for the same duplicate-logging reason as the flags pass above.
+	if printer != nil && !cfg.Foreground {
+		for _, w := range DeniedActiveSkillWarnings(stack) {
+			printer.Warn(w)
+		}
+	}
+
+	// Start containers
+	rt, err := sc.createRuntime()
+	if err != nil {
+		return fmt.Errorf("failed to create runtime: %w", err)
+	}
+	defer rt.Close()
+
+	// Print detected runtime at startup
+	if printer != nil {
+		if info := rt.RuntimeInfo(); info != nil {
+			printer.Info("Runtime detected", "runtime", info.DisplayName())
+			if info.IsRootless() {
+				if !info.IsSupportedPodmanVersion() {
+					printer.Warn(fmt.Sprintf("Podman %s detected — upgrade to 4.0+ for multi-container networking support", info.Version))
+				}
+				if !info.HasNetavark {
+					printer.Warn("netavark not found — rootless multi-container networking requires netavark",
+						"install_fedora_rhel", "sudo dnf install netavark aardvark-dns",
+						"install_debian_ubuntu", "sudo apt install netavark")
+				} else if !info.HasAardvarkDNS {
+					printer.Warn("aardvark-dns not found — inter-container DNS requires aardvark-dns",
+						"install_fedora_rhel", "sudo dnf install aardvark-dns",
+						"install_debian_ubuntu", "sudo apt install aardvark-dns")
+				}
+			}
+		}
+	}
+
+	// Set up logging for orchestrator
+	logBuffer, bufferHandler := sc.setupOrchestratorLogging(rt)
+
+	// Run workloads. The pull/build window streams orchestrator logs, so
+	// this phase renders static lines only (no spinner interleave).
+	reporter.StartPhase("Pulling images & starting workloads", false)
+	result, err := rt.Up(ctx, stack, runtime.UpOptions{
+		NoCache:  cfg.NoCache,
+		BasePort: cfg.BasePort,
+	})
+	if err != nil {
+		reporter.EndPhase(false)
+		return fmt.Errorf("failed to start stack: %w", err)
+	}
+	reporter.EndPhase(true)
+
+	// Foreground mode: run gateway directly
+	if cfg.Foreground {
+		builder, err := sc.newGatewayBuilder(stack, rt, result)
+		if err != nil {
+			return err
+		}
+		builder.SetExistingLogInfra(logBuffer, bufferHandler)
+		return builder.BuildAndRun(ctx, !cfg.Quiet)
+	}
+
+	// Daemon mode: fork child process
+	return sc.runDaemonMode(ctx, stack, result, printer, reporter)
+}
+
+// checkState acquires a lock, cleans stale state, and checks if already running.
+// When Replace is set, a running stack is stopped instead of returning an error.
+func (sc *StackController) checkState(stack *config.Stack) error {
+	var existingState *state.DaemonState
+	err := state.WithLock(stack.Name, 5*time.Second, func() error {
+		cleaned, cleanErr := state.CheckAndClean(stack.Name)
+		if cleanErr != nil {
+			return fmt.Errorf("checking state: %w", cleanErr)
+		}
+		if cleaned {
+			fmt.Printf("Cleaned up stale state for '%s'\n", stack.Name)
+		}
+		existingState, _ = state.Load(stack.Name)
+
+		// Replace mode: stop the running stack within the lock
+		if sc.config.Replace && existingState != nil && state.IsRunning(existingState) {
+			// Preserve the running port for redeployment
+			if sc.config.Port == 0 {
+				sc.config.Port = existingState.Port
+			}
+
+			fmt.Printf("Stopping running stack '%s'...\n", stack.Name)
+			if killErr := state.KillDaemon(existingState); killErr != nil {
+				fmt.Printf("Warning: could not kill daemon: %v\n", killErr)
+			}
+			if delErr := state.Delete(stack.Name); delErr != nil {
+				return fmt.Errorf("deleting state: %w", delErr)
+			}
+			existingState = nil
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if existingState != nil && state.IsRunning(existingState) {
+		return fmt.Errorf("stack '%s' is already running on port %d (PID: %d)\nUse 'gridctl destroy %s' to stop it first",
+			stack.Name, existingState.Port, existingState.PID, sc.config.StackPath)
+	}
+
+	// Replace mode: also stop containers outside the lock
+	if sc.config.Replace && stack.NeedsContainerRuntime() {
+		rt, rtErr := sc.createRuntime()
+		if rtErr == nil {
+			_ = rt.Down(context.Background(), stack.Name)
+			rt.Close()
+		}
+	}
+
+	return nil
+}
+
+// runDaemonChild runs the gateway as a daemon child process.
+func (sc *StackController) runDaemonChild(ctx context.Context, stack *config.Stack) error {
+	rt, err := sc.createRuntime()
+	if err != nil {
+		return fmt.Errorf("failed to create runtime: %w", err)
+	}
+	defer rt.Close()
+
+	result, err := getRunningContainers(ctx, rt, stack)
+	if err != nil {
+		return fmt.Errorf("failed to get container info: %w", err)
+	}
+
+	token, header, authType := authStateFrom(stack)
+	st := &state.DaemonState{
+		StackName:  stack.Name,
+		StackFile:  sc.config.StackPath,
+		PID:        os.Getpid(),
+		Port:       sc.config.Port,
+		StartedAt:  time.Now(),
+		AuthToken:  token,
+		AuthHeader: header,
+		AuthType:   authType,
+	}
+	if err := state.Save(st); err != nil {
+		return fmt.Errorf("failed to save state: %w", err)
+	}
+	// State-file lifetime tracks process lifetime; see runStacklessDaemonChild.
+	defer func() { _ = state.Delete(stack.Name) }()
+
+	builder, err := sc.newGatewayBuilder(stack, rt, result)
+	if err != nil {
+		return err
+	}
+	return builder.BuildAndRun(ctx, false)
+}
+
+// createPrinter creates the output printer unless quiet mode is enabled.
+func (sc *StackController) createPrinter(stack *config.Stack) *output.Printer {
+	if sc.config.Quiet {
+		return nil
+	}
+
+	printer := output.New()
+	printer.Banner(sc.version)
+	printer.Info("Parsing & checking stack", "file", sc.config.StackPath)
+
+	if sc.config.Verbose {
+		printer.Info("Stack summary", "servers", len(stack.MCPServers), "resources", len(stack.Resources),
+			"gateway_configured", stack.Gateway != nil, "telemetry_configured", stack.Telemetry != nil,
+			"code_mode_enabled", stack.Gateway != nil && stack.Gateway.CodeMode == "on",
+			"gateway_auth_configured", stack.Gateway != nil && stack.Gateway.Auth != nil)
+		for i, server := range stack.MCPServers {
+			transport := server.Transport
+			switch transport {
+			case "stdio", "http", "sse", "streamable-http", "":
+			default:
+				transport = "other"
+			}
+			printer.Info("Server summary", "index", i, "transport", transport, "auth_configured", server.Auth != nil)
+		}
+	}
+
+	return printer
+}
+
+// createReporter builds the apply phase reporter. Quiet mode and daemon
+// children get nil (a no-op reporter): quiet promises no chrome, and the
+// child's stderr is the daemon log file. The reporter writes to stderr
+// (spinner convention) and animates only on an interactive, non-CI
+// terminal.
+func (sc *StackController) createReporter() *output.Reporter {
+	if sc.config.Quiet || sc.config.DaemonChild {
+		return nil
+	}
+	return output.NewReporter(os.Stderr)
+}
+
+// setupOrchestratorLogging configures logging for the runtime orchestrator.
+func (sc *StackController) setupOrchestratorLogging(rt *runtime.Orchestrator) (*logging.LogBuffer, slog.Handler) {
+	cfg := sc.config
+
+	// Helper to register vault values on a redacting handler
+	registerVault := func(h *logging.RedactingHandler) {
+		if sc.vaultStore != nil {
+			h.RegisterRedactValues(sc.vaultStore.Values())
+		}
+	}
+
+	if cfg.Foreground && !cfg.Quiet {
+		logBuffer := logging.NewLogBuffer(1000)
+		innerHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: effectiveLogLevel(cfg)})
+		bufferHandler := logging.NewBufferHandler(logBuffer, innerHandler)
+		redactHandler := logging.NewRedactingHandler(bufferHandler)
+		registerVault(redactHandler)
+		rt.SetLogger(slog.New(redactHandler).With("component", "orchestrator"))
+		return logBuffer, redactHandler
+	}
+
+	if !cfg.Quiet {
+		textHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: effectiveLogLevel(cfg)})
+		redactHandler := logging.NewRedactingHandler(textHandler)
+		registerVault(redactHandler)
+		rt.SetLogger(slog.New(redactHandler))
+	}
+
+	return nil, nil
+}
+
+// runDaemonMode forks a child process and waits for readiness.
+func (sc *StackController) runDaemonMode(ctx context.Context, stack *config.Stack, result *runtime.UpResult, printer *output.Printer, reporter *output.Reporter) error {
+	// Nothing else writes during the readiness wait, so this phase may
+	// animate. The reporter stops the spinner before any error returns.
+	reporter.StartPhase("Starting gateway", true)
+
+	daemon := NewDaemonManager(sc.config)
+	pid, err := daemon.Fork(stack)
+	if err != nil {
+		reporter.EndPhase(false)
+		return fmt.Errorf("failed to start daemon: %w", err)
+	}
+
+	stackLogPath, _ := state.LogPath(stack.Name)
+	if err := daemon.WaitForReady(sc.config.Port, 60*time.Second); err != nil {
+		reporter.EndPhase(false)
+		return fmt.Errorf("daemon failed to become ready: %w\nCheck logs at %s", err, stackLogPath)
+	}
+
+	st, err := state.Load(stack.Name)
+	if err != nil {
+		reporter.EndPhase(false)
+		return fmt.Errorf("daemon may have failed to start - check logs at %s", stackLogPath)
+	}
+	reporter.EndPhase(true)
+
+	// Print summary
+	if printer != nil {
+		summaries := BuildWorkloadSummaries(stack, result)
+		printer.Summary(summaries)
+		printer.Info("Gateway running", "url", fmt.Sprintf("http://localhost:%d", st.Port))
+		// Teardown instructions always print (scripts capture them); extra
+		// conversational hints go through Printer.Hint and are TTY-only.
+		printer.Print("\nUse 'gridctl destroy %s' to stop\n", sc.config.StackPath)
+		printer.Hint("Follow the daemon with 'gridctl logs', or 'gridctl open' for the web UI")
+	} else {
+		fmt.Printf("Stack '%s' started successfully\n", stack.Name)
+		fmt.Printf("  Gateway: http://localhost:%d\n", st.Port)
+		fmt.Printf("  PID: %d\n", pid)
+		fmt.Printf("  Logs: %s\n", stackLogPath)
+		fmt.Printf("\nUse 'gridctl destroy %s' to stop\n", sc.config.StackPath)
+	}
+
+	return nil
+}
+
+// newGatewayBuilder creates a configured GatewayBuilder.
+func (sc *StackController) newGatewayBuilder(stack *config.Stack, rt *runtime.Orchestrator, result *runtime.UpResult) (*GatewayBuilder, error) {
+	builder := NewGatewayBuilder(sc.config, stack, sc.config.StackPath, rt, result)
+	builder.SetVersion(sc.version)
+	builder.SetWebFS(sc.webFS)
+	builder.SetVaultStore(sc.vaultStore)
+	pinStore, err := newPinStore(stack.Name)
+	if err != nil {
+		return nil, err
+	}
+	builder.SetPinStore(pinStore)
+	skillPinStore, err := newSkillPinStore(stack.Name)
+	if err != nil {
+		return nil, err
+	}
+	builder.SetSkillPinStore(skillPinStore)
+	return builder, nil
+}
+
+// newPinStore loads the on-disk schema pin store for a stack so the running
+// daemon and the `gridctl pins` CLI share the same
+// ~/.gridctl/pins/{stack}.json.
+func newPinStore(stackName string) (*pins.PinStore, error) {
+	return loadPinStore(pins.New(stackName), stackName)
+}
+
+// loadPinStore applies the daemon's load policy. A missing file is the normal
+// first run and a corrupt file is discarded with a warning so the daemon still
+// starts (servers re-pin on first connect). Any other failure aborts: a pin
+// file written by a newer gridctl must not be replaced by an empty store, or
+// the first save would re-pin every server over the newer file's trust state.
+func loadPinStore(ps *pins.PinStore, stackName string) (*pins.PinStore, error) {
+	if err := ps.Load(); err != nil {
+		if errors.Is(err, pins.ErrCorrupt) {
+			slog.Warn("pins: corrupt pin file; starting with an empty store",
+				"stack", stackName, "error", err)
+			return ps, nil
+		}
+		return nil, err
+	}
+	return ps, nil
+}
+
+// DeniedActiveSkillWarnings loads the registry read-only and names every
+// active skill the stack's `skills:` policy would hide, with the matching
+// rule. Best-effort: an unreadable registry yields no warnings rather than
+// blocking a deploy.
+func DeniedActiveSkillWarnings(stack *config.Stack) []string {
+	if stack == nil || stack.Skills == nil {
+		return nil
+	}
+	policy := mcp.NewSkillPolicy(skillsPolicySpec(stack))
+	base, err := state.BaseDir()
+	if err != nil {
+		return nil
+	}
+	store := registry.NewStore(filepath.Join(base, "registry"))
+	if err := store.Load(); err != nil {
+		return nil
+	}
+	var warnings []string
+	for _, sk := range store.ActiveSkills() {
+		if allowed, rule := policy.Evaluate(sk.Name); !allowed {
+			warnings = append(warnings, fmt.Sprintf(
+				"skill %q is active but denied by the skills policy (rule: %s); it will not be exposed or projected", sk.Name, rule))
+		}
+	}
+	return warnings
+}
+
+// ModelPreferenceWarnings loads the registry read-only and reports the
+// content-level model preference lint findings pkg/config cannot
+// compute alone (it deliberately never reads the registry):
+//
+//   - model-preference-unhonored: one aggregate line per rewriting
+//     scope naming how many items resolve a preference while some of
+//     that kind's projection targets ignore or drop the key. Aggregate
+//     by design: a per-item warning would repeat the same fact for
+//     every skill in the registry. Surfacing-only scopes (rewrite
+//     false) project nothing and are skipped.
+//   - model-preference-portability: an active skill declares top-level
+//     `model:`, which spec-strict consumers outside Claude Code reject
+//     (`metadata` is the portable placement, string values only).
+//
+// All findings are advisory; the cmd layer appends them as warnings that
+// never block a deploy. Best-effort: an unreadable registry yields
+// nothing.
+func ModelPreferenceWarnings(stack *config.Stack) []string {
+	if stack == nil || stack.ModelPreferences == nil {
+		return nil
+	}
+	skillPolicy, agentPolicy := stack.ModelPolicies()
+	base, err := state.BaseDir()
+	if err != nil {
+		return nil
+	}
+	registryDir := filepath.Join(base, "registry")
+	store := registry.NewStore(registryDir)
+	if err := store.Load(); err != nil {
+		return nil
+	}
+
+	dropTargetsOf := func(matrix map[string]registry.HonorStatus) []string {
+		var out []string
+		for slug, status := range matrix {
+			if status == registry.HonorIgnored || status == registry.HonorDropped {
+				out = append(out, slug)
+			}
+		}
+		sort.Strings(out)
+		return out
+	}
+
+	var warnings []string
+
+	skillRewrite := stack.ModelPreferences.Skills != nil && stack.ModelPreferences.Skills.Rewrite
+	if drop := dropTargetsOf(registry.SkillHonorMatrix()); skillRewrite && len(drop) > 0 {
+		resolving := 0
+		for _, sk := range store.ActiveSkills() {
+			if resolved, _ := skillPolicy.Resolve(sk.Name, registry.ExtractModelPreference(sk).Value()); resolved != "" {
+				resolving++
+			}
+		}
+		if resolving > 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"model-preference-unhonored: %d active skill(s) resolve a model preference under rewrite, and these skill projection targets do not honor the key: %s",
+				resolving, strings.Join(drop, ", ")))
+		}
+	}
+
+	agentRewrite := stack.ModelPreferences.Agents != nil && stack.ModelPreferences.Agents.Rewrite
+	if drop := dropTargetsOf(registry.AgentHonorMatrix()); agentRewrite && len(drop) > 0 {
+		resolving := 0
+		if agents, err := skills.ListAgents(registryDir); err == nil {
+			for _, a := range agents {
+				declared, _ := a.Definition.DeclaredModel()
+				if resolved, _ := agentPolicy.Resolve(a.Name, declared); resolved != "" {
+					resolving++
+				}
+			}
+		}
+		if resolving > 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"model-preference-unhonored: %d imported agent(s) resolve a model preference under rewrite; rendered dialects drop the key by design: %s",
+				resolving, strings.Join(drop, ", ")))
+		}
+	}
+
+	for _, sk := range store.ActiveSkills() {
+		if pref := registry.ExtractModelPreference(sk); pref != nil && pref.SourceKey == registry.ModelSourceTopLevel {
+			warnings = append(warnings, fmt.Sprintf(
+				"model-preference-portability: skill %q declares top-level `model:`, which spec-strict consumers outside Claude Code reject as an unknown key; `metadata` is the portable placement (string values)",
+				sk.Name))
+		}
+	}
+	return warnings
+}
+
+// newSkillPinStore loads the on-disk skill pin store for a stack so the
+// running daemon and the `gridctl skill pins` CLI share the same
+// ~/.gridctl/pins/{stack}.skills.json. Load policy matches loadPinStore:
+// corrupt files are discarded with a warning (skills re-pin on the next
+// refresh); a newer-version file aborts startup rather than being replaced.
+func newSkillPinStore(stackName string) (*skillpins.Store, error) {
+	ps := skillpins.New(stackName)
+	if err := ps.Load(); err != nil {
+		if errors.Is(err, skillpins.ErrCorrupt) {
+			slog.Warn("skillpins: corrupt pin file; starting with an empty store",
+				"stack", stackName, "error", err)
+			return ps, nil
+		}
+		return nil, err
+	}
+	return ps, nil
+}
+
+// createRuntime detects the container runtime and creates an Orchestrator.
+// The vault-backed credential resolver is wired in here so every caller —
+// Deploy, runDaemonChild, plan/replace flows — gets MCP source.auth
+// resolution without needing to remember the registration step.
+func (sc *StackController) createRuntime() (*runtime.Orchestrator, error) {
+	rt, err := sc.newRuntime()
+	if err != nil {
+		return nil, err
+	}
+	if sc.vaultStore != nil {
+		rt.SetCredentialResolver(sc.credentialResolver())
+	}
+	return rt, nil
+}
+
+func (sc *StackController) newRuntime() (*runtime.Orchestrator, error) {
+	if sc.config.Runtime != "" {
+		info, err := runtime.DetectRuntime(runtime.DetectOptions{Explicit: sc.config.Runtime})
+		if err != nil {
+			return nil, err
+		}
+		return runtime.NewWithInfo(info)
+	}
+	// Try auto-detection, fall back to default factory
+	info, err := runtime.DetectRuntime(runtime.DetectOptions{})
+	if err != nil {
+		// If auto-detection fails, try the default factory (backward compat)
+		return runtime.New()
+	}
+	return runtime.NewWithInfo(info)
+}
+
+// BuildWorkloadSummaries creates summary data for the status table.
+func BuildWorkloadSummaries(stack *config.Stack, result *runtime.UpResult) []output.WorkloadSummary {
+	var summaries []output.WorkloadSummary
+
+	serverTransports := make(map[string]string)
+	for _, s := range stack.MCPServers {
+		transport := s.Transport
+		if transport == "" {
+			transport = "http"
+		}
+		if s.IsExternal() {
+			transport = "external"
+		} else if s.IsLocalProcess() {
+			transport = "local"
+		} else if s.IsSSH() {
+			transport = "ssh"
+		} else if s.IsOpenAPI() {
+			transport = "openapi"
+		}
+		serverTransports[s.Name] = transport
+	}
+
+	for _, server := range result.MCPServers {
+		transport := serverTransports[server.Name]
+		summaries = append(summaries, output.WorkloadSummary{
+			Name:      server.Name,
+			Type:      "mcp-server",
+			Transport: transport,
+			State:     "running",
+		})
+	}
+
+	for _, res := range stack.Resources {
+		summaries = append(summaries, output.WorkloadSummary{
+			Name:      res.Name,
+			Type:      "resource",
+			Transport: "container",
+			State:     "running",
+		})
+	}
+
+	return summaries
+}
+
+// getRunningContainers retrieves info about already-running containers and external servers.
+func getRunningContainers(ctx context.Context, rt *runtime.Orchestrator, stack *config.Stack) (*runtime.UpResult, error) {
+	result := &runtime.UpResult{}
+	foundServers := make(map[string]bool)
+
+	// Only query Docker for container statuses when the stack has container workloads
+	var statuses []runtime.WorkloadStatus
+	if stack.NeedsContainerRuntime() {
+		var err error
+		statuses, err = rt.Status(ctx, stack.Name)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	for _, status := range statuses {
+		var workloadName string
+		if status.Labels != nil {
+			if name, ok := status.Labels[runtime.LabelMCPServer]; ok {
+				workloadName = name
+			} else if name, ok := status.Labels[runtime.LabelResource]; ok {
+				workloadName = name
+			}
+		}
+
+		if status.Type == runtime.WorkloadTypeMCPServer {
+			var containerPort int
+			for _, s := range stack.MCPServers {
+				if s.Name == workloadName {
+					containerPort = s.Port
+					break
+				}
+			}
+
+			hostPort, _ := runtime.GetContainerHostPort(ctx, rt.DockerClient(), string(status.ID), containerPort)
+
+			result.MCPServers = append(result.MCPServers, runtime.MCPServerResult{
+				Name:       workloadName,
+				WorkloadID: status.ID,
+				HostPort:   hostPort,
+			})
+			foundServers[workloadName] = true
+		}
+	}
+
+	// Add non-container MCP servers from config
+	for _, server := range stack.MCPServers {
+		if foundServers[server.Name] {
+			continue
+		}
+		switch {
+		case server.IsExternal():
+			result.MCPServers = append(result.MCPServers, runtime.MCPServerResult{
+				Name: server.Name, External: true, URL: server.URL,
+			})
+		case server.IsLocalProcess():
+			result.MCPServers = append(result.MCPServers, runtime.MCPServerResult{
+				Name: server.Name, LocalProcess: true, Command: server.Command,
+			})
+		case server.IsSSH():
+			result.MCPServers = append(result.MCPServers, runtime.MCPServerResult{
+				Name: server.Name, SSH: true, Command: server.Command,
+				SSHHost: server.SSH.Host, SSHUser: server.SSH.User,
+				SSHPort: server.SSH.Port, SSHIdentityFile: server.SSH.IdentityFile,
+			})
+		case server.IsOpenAPI():
+			result.MCPServers = append(result.MCPServers, runtime.MCPServerResult{
+				Name: server.Name, OpenAPI: true, OpenAPIConfig: server.OpenAPI,
+			})
+		}
+	}
+
+	return result, nil
+}
+
+// authStateFrom copies the gateway's inbound auth settings into the daemon
+// state so local subcommands can authenticate against the API. The token is
+// already resolved here: the config loader expands ${VAR} before it reaches
+// this point, so the CLI never needs the stack file or the vault.
+func authStateFrom(stack *config.Stack) (token, header, authType string) {
+	if stack == nil || stack.Gateway == nil || stack.Gateway.Auth == nil {
+		return "", "", ""
+	}
+	a := stack.Gateway.Auth
+	return a.Token, a.Header, a.Type
+}

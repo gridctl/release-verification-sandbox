@@ -1,0 +1,38 @@
+# Registry Advanced Example
+#
+# Demonstrates cross-server Agent Skills with two MCP servers. Skills can
+# reference tools from different servers using the server__tool naming
+# convention, enabling workflows that span server boundaries.
+#
+# Prerequisites:
+#   Run `task mock:servers` from the project root to build the mock server.
+#
+# Usage:
+#   gridctl apply examples/registry/registry-advanced.yaml
+#
+# After deploying, copy the pre-made skills and activate one:
+#   cp -r examples/registry/items/* ~/.gridctl/registry/skills/
+#   curl -X POST http://localhost:8180/api/registry/skills/code-review/activate
+#
+# To make a skill span both servers below, list tools from each in its
+# frontmatter, e.g.:
+#   allowed-tools: math-server__add, text-server__echo
+
+version: "1"
+name: registry-advanced
+
+network:
+  name: registry-advanced-net
+  driver: bridge
+
+mcp-servers:
+
+  # Math server — same binary, registered under a different name.
+  # Skills reference its tools as math-server__add, math-server__get_time.
+  - name: math-server
+    command: ["../_mock-servers/local-stdio-server/mock-stdio-server"]
+
+  # Text server — provides echo for formatting/piping results.
+  # Skills reference its tools as text-server__echo.
+  - name: text-server
+    command: ["../_mock-servers/local-stdio-server/mock-stdio-server"]

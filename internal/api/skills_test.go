@@ -1,0 +1,622 @@
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/object"
+
+	"github.com/gridctl/gridctl/pkg/mcp"
+	"github.com/gridctl/gridctl/pkg/registry"
+	"github.com/gridctl/gridctl/pkg/skills"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// --- Skills Sources Endpoints ---
+
+// seedSkillSource writes a minimal lock-file entry so handlers can iterate a
+// source without going through the importer (which would clone a real repo).
+func seedSkillSource(t *testing.T, srv *Server, sourceName, repo string, skillNames ...string) {
+	t.Helper()
+	lf := &skills.LockFile{Sources: map[string]skills.LockedSource{}}
+	locked := skills.LockedSource{
+		Repo:      repo,
+		Ref:       "main",
+		CommitSHA: "abc1234567890abc1234567890abc1234567890a",
+		FetchedAt: time.Now().UTC(),
+		Skills:    map[string]skills.LockedSkill{},
+	}
+	for _, name := range skillNames {
+		locked.Skills[name] = skills.LockedSkill{Path: name, ContentHash: "h"}
+	}
+	lf.Sources[sourceName] = locked
+	if err := skills.WriteLockFile(srv.lockFilePath(), lf); err != nil {
+		t.Fatalf("write lock: %v", err)
+	}
+}
+
+func TestHandleSkills_SourcesList_PopulatesUpdateAvailFromCache(t *testing.T) {
+	srv, regServer := setupRegistryTestServer(t)
+	seedSkill(t, regServer, "skill-a", registry.StateActive)
+	seedSkillSource(t, srv, "my-source", "https://github.com/org/repo", "skill-a")
+
+	// Seed the update cache: skill-a has a pending update.
+	status := &skills.UpdateStatus{
+		CheckedAt: time.Now().UTC(),
+		Updates: map[string]skills.SkillUpdate{
+			"skill-a": {CurrentSHA: "old", LatestSHA: "new", Repo: "https://github.com/org/repo", Ref: "main"},
+		},
+	}
+	if err := skills.WriteUpdateCacheAt(srv.updateCachePath(), status); err != nil {
+		t.Fatalf("write cache: %v", err)
+	}
+
+	handler := srv.Handler()
+	req := loopbackRequest(http.MethodGet, "/api/skills/sources", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result []SkillSourceStatus
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("expected 1 source, got %d", len(result))
+	}
+	if !result[0].UpdateAvail {
+		t.Errorf("expected updateAvailable=true for source with pending skill update")
+	}
+}
+
+func TestHandleSkills_SourcesList_ReportsSupportingFileInstall(t *testing.T) {
+	srv, regServer := setupRegistryTestServer(t)
+	seedSkill(t, regServer, "skill-a", registry.StateActive)
+	seedSkillSource(t, srv, "my-source", "https://github.com/org/repo", "skill-a")
+	skillDir := filepath.Join(regServer.Store().Dir(), "skills", "skill-a")
+	require.NoError(t, skills.WriteOrigin(skillDir, &skills.Origin{
+		Repo:                     "https://github.com/org/repo",
+		SupportingFilesInstalled: true,
+	}))
+
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, loopbackRequest(http.MethodGet, "/api/skills/sources", nil))
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var result []SkillSourceStatus
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&result))
+	require.Len(t, result, 1)
+	require.Len(t, result[0].Skills, 1)
+	assert.True(t, result[0].Skills[0].SupportingFilesInstalled)
+}
+
+func TestHandleSkills_SourcesList_MissingCacheFailsOpen(t *testing.T) {
+	srv, regServer := setupRegistryTestServer(t)
+	seedSkill(t, regServer, "skill-a", registry.StateActive)
+	seedSkillSource(t, srv, "my-source", "https://github.com/org/repo", "skill-a")
+	// No cache file written.
+
+	handler := srv.Handler()
+	req := loopbackRequest(http.MethodGet, "/api/skills/sources", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var result []SkillSourceStatus
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("expected 1 source, got %d", len(result))
+	}
+	if result[0].UpdateAvail {
+		t.Errorf("expected updateAvailable=false with missing cache")
+	}
+}
+
+func TestHandleSkills_SourcesList_Empty(t *testing.T) {
+	srv, _ := setupRegistryTestServer(t)
+
+	handler := srv.Handler()
+	req := loopbackRequest(http.MethodGet, "/api/skills/sources", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result []SkillSourceStatus
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	if len(result) != 0 {
+		t.Errorf("expected empty sources, got %d", len(result))
+	}
+}
+
+func TestHandleSkills_SourceAdd_MissingRepo(t *testing.T) {
+	srv, _ := setupRegistryTestServer(t)
+
+	handler := srv.Handler()
+	body := strings.NewReader(`{}`)
+	req := loopbackRequest(http.MethodPost, "/api/skills/sources", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var errResp map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&errResp); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	if !strings.Contains(errResp["error"], "repo") {
+		t.Errorf("expected error about repo, got %q", errResp["error"])
+	}
+}
+
+func TestHandleSkills_SourceAdd_InvalidJSON(t *testing.T) {
+	srv, _ := setupRegistryTestServer(t)
+
+	handler := srv.Handler()
+	body := strings.NewReader(`{invalid}`)
+	req := loopbackRequest(http.MethodPost, "/api/skills/sources", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleSkills_UpdatesEmpty(t *testing.T) {
+	srv, _ := setupRegistryTestServer(t)
+
+	handler := srv.Handler()
+	req := loopbackRequest(http.MethodGet, "/api/skills/updates", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var summary UpdateSummary
+	if err := json.NewDecoder(rec.Body).Decode(&summary); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	if summary.Available != 0 {
+		t.Errorf("expected 0 updates, got %d", summary.Available)
+	}
+}
+
+func TestHandleSkills_SourceRemove_NotFound(t *testing.T) {
+	srv, _ := setupRegistryTestServer(t)
+
+	handler := srv.Handler()
+	req := loopbackRequest(http.MethodDelete, "/api/skills/sources/nonexistent", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleSkills_SourceCheck_NotFound(t *testing.T) {
+	srv, _ := setupRegistryTestServer(t)
+
+	handler := srv.Handler()
+	req := loopbackRequest(http.MethodPost, "/api/skills/sources/nonexistent/check", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleSkills_SyncAll_HonorsPinsAndCountsFailures(t *testing.T) {
+	srv, regServer := setupRegistryTestServer(t)
+	seedSkill(t, regServer, "pinned-skill", registry.StateActive)
+	seedSkill(t, regServer, "floating-skill", registry.StateActive)
+
+	// Seed a pinned source (Ref looks like a semver tag) and an unpinned
+	// source pointing at a non-existent repo so its Update will error.
+	// Exercises error accounting without needing a live git fixture.
+	lf := &skills.LockFile{Sources: map[string]skills.LockedSource{
+		"pinned-source": {
+			Repo:      "https://github.com/example/pinned",
+			Ref:       "v1.0.0",
+			CommitSHA: "abc1234567890abc1234567890abc1234567890a",
+			Skills:    map[string]skills.LockedSkill{"pinned-skill": {Path: "pinned-skill"}},
+		},
+		"floating-source": {
+			Repo:      "/nonexistent/path/to/repo",
+			Ref:       "main",
+			CommitSHA: "def1234567890def1234567890def1234567890d",
+			Skills:    map[string]skills.LockedSkill{"floating-skill": {Path: "floating-skill"}},
+		},
+	}}
+	if err := skills.WriteLockFile(srv.lockFilePath(), lf); err != nil {
+		t.Fatalf("write lock: %v", err)
+	}
+
+	handler := srv.Handler()
+	req := loopbackRequest(http.MethodPost, "/api/skills/sources/update", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var summary SourceSyncSummary
+	if err := json.NewDecoder(rec.Body).Decode(&summary); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	if summary.PinnedSources != 1 {
+		t.Errorf("expected 1 pinned source, got %d", summary.PinnedSources)
+	}
+	if summary.FailedSources != 1 {
+		t.Errorf("expected 1 failed source, got %d", summary.FailedSources)
+	}
+	if summary.SyncedSources != 0 {
+		t.Errorf("expected 0 cleanly-synced sources, got %d", summary.SyncedSources)
+	}
+	if summary.UpdatedSkills != 0 {
+		t.Errorf("expected 0 updated skills, got %d", summary.UpdatedSkills)
+	}
+	if len(summary.Sources) != 2 {
+		t.Fatalf("expected 2 source results, got %d", len(summary.Sources))
+	}
+
+	// Sources are returned in deterministic alphabetical order.
+	if summary.Sources[0].Name != "floating-source" {
+		t.Errorf("expected floating-source first, got %s", summary.Sources[0].Name)
+	}
+	if !summary.Sources[1].Pinned {
+		t.Errorf("expected pinned-source to be marked pinned")
+	}
+	if summary.Sources[1].Skills != nil {
+		t.Errorf("expected pinned-source to have no skills attempted")
+	}
+}
+
+// TestHandleSkills_SyncAll_PrunesGhostSkill verifies that a lock entry whose
+// skill no longer exists in the registry is skipped (not reported as a failure)
+// and pruned from the lock file. Regression for ghost-skill sync failures: the
+// skill was deleted from the registry but its lock entry lingered.
+func TestHandleSkills_SyncAll_PrunesGhostSkill(t *testing.T) {
+	srv, _ := setupRegistryTestServer(t)
+	// Note: the ghost skill is NOT seeded into the registry — only into the
+	// lock file, simulating a skill deleted out from under the lock entry.
+	seedSkillSource(t, srv, "ghost-source", "https://github.com/org/repo", "ghost-skill")
+
+	handler := srv.Handler()
+	req := loopbackRequest(http.MethodPost, "/api/skills/sources/update", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var summary SourceSyncSummary
+	if err := json.NewDecoder(rec.Body).Decode(&summary); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	if summary.FailedSources != 0 {
+		t.Errorf("expected ghost not to fail the source, got FailedSources=%d", summary.FailedSources)
+	}
+	if len(summary.Sources) != 1 || len(summary.Sources[0].Skills) != 1 {
+		t.Fatalf("expected 1 source with 1 skill result, got %+v", summary.Sources)
+	}
+	if got := summary.Sources[0].Skills[0]; got.Error != "" {
+		t.Errorf("expected no error for ghost skill, got %q", got.Error)
+	}
+
+	// The stale entry should be pruned; the now-empty source dropped.
+	lf, err := skills.ReadLockFile(srv.lockFilePath())
+	if err != nil {
+		t.Fatalf("read lock: %v", err)
+	}
+	if _, _, found := lf.FindSkillSource("ghost-skill"); found {
+		t.Errorf("expected ghost-skill pruned from lock file, still present")
+	}
+}
+
+// TestHandleSkills_SyncAll_RetainsPresentSkillOnUpdateError verifies that a
+// skill still present in the registry whose update fails (e.g. transient/repo
+// error) is reported as a failure and is NOT pruned from the lock file. Guards
+// against the ghost-prune logic over-pruning live skills.
+func TestHandleSkills_SyncAll_RetainsPresentSkillOnUpdateError(t *testing.T) {
+	srv, regServer := setupRegistryTestServer(t)
+	seedSkill(t, regServer, "live-skill", registry.StateActive)
+	// Source points at a non-existent repo so Update errors, but the skill is
+	// present in the registry, so it must not be treated as a ghost.
+	seedSkillSource(t, srv, "live-source", "/nonexistent/path/to/repo", "live-skill")
+
+	handler := srv.Handler()
+	req := loopbackRequest(http.MethodPost, "/api/skills/sources/update", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var summary SourceSyncSummary
+	if err := json.NewDecoder(rec.Body).Decode(&summary); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	if summary.FailedSources != 1 {
+		t.Errorf("expected the update error to fail the source, got FailedSources=%d", summary.FailedSources)
+	}
+	if len(summary.Sources) != 1 || len(summary.Sources[0].Skills) != 1 {
+		t.Fatalf("expected 1 source with 1 skill result, got %+v", summary.Sources)
+	}
+	if summary.Sources[0].Skills[0].Error == "" {
+		t.Errorf("expected an error reported for the present-but-failing skill")
+	}
+
+	// The live skill's lock entry must be retained.
+	lf, err := skills.ReadLockFile(srv.lockFilePath())
+	if err != nil {
+		t.Fatalf("read lock: %v", err)
+	}
+	if _, _, found := lf.FindSkillSource("live-skill"); !found {
+		t.Errorf("expected live-skill retained in lock file, was pruned")
+	}
+}
+
+func TestHandleSkills_SyncAll_EmptyLockFile(t *testing.T) {
+	srv, _ := setupRegistryTestServer(t)
+
+	handler := srv.Handler()
+	req := loopbackRequest(http.MethodPost, "/api/skills/sources/update", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var summary SourceSyncSummary
+	if err := json.NewDecoder(rec.Body).Decode(&summary); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if len(summary.Sources) != 0 {
+		t.Errorf("expected empty sources, got %d", len(summary.Sources))
+	}
+	if summary.SyncedSources != 0 || summary.UpdatedSkills != 0 ||
+		summary.FailedSources != 0 || summary.PinnedSources != 0 {
+		t.Errorf("expected zero counters on empty lock file, got %+v", summary)
+	}
+}
+
+func TestHandleSkills_SourceUpdate_NotFound(t *testing.T) {
+	srv, _ := setupRegistryTestServer(t)
+
+	handler := srv.Handler()
+	req := loopbackRequest(http.MethodPost, "/api/skills/sources/nonexistent/update", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleSkills_SourcePreview_MissingRepo(t *testing.T) {
+	srv, _ := setupRegistryTestServer(t)
+
+	handler := srv.Handler()
+	req := loopbackRequest(http.MethodGet, "/api/skills/sources/newrepo/preview", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleSkills_NoRegistry(t *testing.T) {
+	gateway := mcp.NewGateway()
+	srv := NewServer(gateway, nil)
+	// No registry set
+
+	handler := srv.Handler()
+	req := loopbackRequest(http.MethodGet, "/api/skills/sources", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleSkills_RoutingMethodNotAllowed(t *testing.T) {
+	srv, _ := setupRegistryTestServer(t)
+
+	handler := srv.Handler()
+
+	// GET on sources should work
+	req := loopbackRequest(http.MethodGet, "/api/skills/sources", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for GET sources, got %d", rec.Code)
+	}
+}
+
+func TestStoreDir(t *testing.T) {
+	dir := t.TempDir()
+	store := registry.NewStore(dir)
+
+	if store.Dir() != dir {
+		t.Errorf("expected Dir() = %q, got %q", dir, store.Dir())
+	}
+}
+
+// initPreviewTestRepo creates a local git repo with one valid and one
+// malformed SKILL.md for exercising the source-preview handler.
+func initPreviewTestRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	repo, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatalf("init repo: %v", err)
+	}
+
+	files := map[string]string{
+		"skills/good/SKILL.md":   "---\nname: good-skill\ndescription: valid\n---\n\nBody.\n",
+		"skills/broken/SKILL.md": "---\nname: [unclosed\ndescription: broken\n---\n\nBody.\n",
+		"agents/reviewer.md":     "---\nname: reviewer\ndescription: Reviews code\n---\n\nReview.\n",
+		"agents/broken.md":       "# not an agent definition\n",
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+	for path, content := range files {
+		full := filepath.Join(dir, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if _, err := wt.Add(path); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+	}
+	if _, err := wt.Commit("initial", &git.CommitOptions{
+		Author: &object.Signature{Name: "test", Email: "test@test.com"},
+	}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	return dir
+}
+
+// TestHandleSkills_SourcePreview_ReportsMalformed pins the wire contract of
+// the preview response: valid skills under "skills", parse failures under
+// "malformed" with "path" and "error" keys (the wizard depends on all three).
+func TestHandleSkills_SourcePreview_ReportsMalformed(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	srv, _ := setupRegistryTestServer(t)
+	repoDir := initPreviewTestRepo(t)
+
+	body := strings.NewReader(`{"repo": ` + strconv.Quote(repoDir) + `}`)
+	req := loopbackRequest(http.MethodPost, "/api/skills/sources/test-source/preview", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp struct {
+		Skills []struct {
+			Name string `json:"name"`
+		} `json:"skills"`
+		Malformed []struct {
+			Path  string `json:"path"`
+			Error string `json:"error"`
+		} `json:"malformed"`
+		Agents []struct {
+			Name  string `json:"name"`
+			Valid bool   `json:"valid"`
+		} `json:"agents"`
+		MalformedAgents []struct {
+			Path  string `json:"path"`
+			Error string `json:"error"`
+		} `json:"malformedAgents"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	if len(resp.Skills) != 1 || resp.Skills[0].Name != "good-skill" {
+		t.Fatalf("expected one good-skill preview, got %+v", resp.Skills)
+	}
+	if len(resp.Malformed) != 1 {
+		t.Fatalf("expected one malformed entry, got %+v", resp.Malformed)
+	}
+	if resp.Malformed[0].Path != filepath.Join("skills", "broken", "SKILL.md") {
+		t.Errorf("malformed path = %q", resp.Malformed[0].Path)
+	}
+	if !strings.Contains(resp.Malformed[0].Error, "parsing frontmatter") {
+		t.Errorf("malformed error = %q, want frontmatter parse error", resp.Malformed[0].Error)
+	}
+	if len(resp.Agents) != 1 || resp.Agents[0].Name != "reviewer" || !resp.Agents[0].Valid {
+		t.Fatalf("expected one valid reviewer agent preview, got %+v", resp.Agents)
+	}
+	if len(resp.MalformedAgents) != 1 || resp.MalformedAgents[0].Path != filepath.Join("agents", "broken.md") {
+		t.Fatalf("expected one malformed agent entry, got %+v", resp.MalformedAgents)
+	}
+}
+
+// TestHandleSkills_SourceAdd_SelectedAgents pins the selection contract the
+// wizard depends on: a skill selection alone skips agents (legacy importer
+// behavior), so the request must carry selectedAgents for agents to import.
+func TestHandleSkills_SourceAdd_SelectedAgents(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	srv, regServer := setupRegistryTestServer(t)
+	repoDir := initPreviewTestRepo(t)
+
+	body := strings.NewReader(`{"repo": ` + strconv.Quote(repoDir) + `, "selected": ["good-skill"], "selectedAgents": ["reviewer"]}`)
+	req := loopbackRequest(http.MethodPost, "/api/skills/sources", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp struct {
+		Imported []struct {
+			Name string `json:"name"`
+		} `json:"imported"`
+		ImportedAgents []struct {
+			Name string `json:"name"`
+		} `json:"importedAgents"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if len(resp.Imported) != 1 || resp.Imported[0].Name != "good-skill" {
+		t.Fatalf("expected good-skill imported, got %+v", resp.Imported)
+	}
+	if len(resp.ImportedAgents) != 1 || resp.ImportedAgents[0].Name != "reviewer" {
+		t.Fatalf("expected reviewer agent imported, got %+v", resp.ImportedAgents)
+	}
+	if _, err := skills.GetAgent(regServer.Store().Dir(), "reviewer"); err != nil {
+		t.Fatalf("agent not in canonical store after import: %v", err)
+	}
+}

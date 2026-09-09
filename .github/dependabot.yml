@@ -1,0 +1,51 @@
+# Dependabot version updates
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# Note: chore commits are excluded from CHANGELOG generation (cliff.toml).
+# This is intentional — dependency bump PRs do not appear in release notes.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore"
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore"
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore"
+    groups:
+      rjsf:
+        patterns:
+          - "@rjsf/*"
+      # react-dom pins its peer react to the exact same version, so a solo
+      # bump of either one fails npm ci with an unresolvable peer conflict
+      # (see the react-dom 19.2.8 bump). Group them so they move in lockstep.
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
+    ignore:
+      # typescript-eslint caps its typescript peer at <6.1.0, so a TS 7 bump
+      # fails npm ci with ERESOLVE (see PR #1124). Forcing the install past it
+      # does not help: typescript-eslint hard-errors on load under TS 7.0 with
+      # "typescript-eslint does not support TS 7.0", and upstream is targeting
+      # TS >=7.1 only (typescript-eslint#10940). The compiler itself is fine,
+      # tsc -b passes clean on 7.0.2. Drop this ignore once typescript-eslint
+      # ships TS 7 support and TS >=7.1 is released.
+      - dependency-name: "typescript"
+        update-types:
+          - "version-update:semver-major"

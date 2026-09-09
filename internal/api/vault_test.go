@@ -1,0 +1,757 @@
+package api
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gridctl/gridctl/pkg/vault"
+)
+
+func setupVaultServer(t *testing.T) (*Server, *vault.Store) {
+	t.Helper()
+	store := vault.NewStore(t.TempDir())
+	server := &Server{vaultStore: store}
+	return server, store
+}
+
+func TestHandleVault_List_Empty(t *testing.T) {
+	server, _ := setupVaultServer(t)
+	handler := server.Handler()
+
+	req := loopbackRequest(http.MethodGet, "/api/vault", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var keys []map[string]string
+	_ = json.NewDecoder(w.Body).Decode(&keys)
+	if len(keys) != 0 {
+		t.Errorf("expected empty list, got %d entries", len(keys))
+	}
+}
+
+func TestHandleVault_CreateAndGet(t *testing.T) {
+	server, _ := setupVaultServer(t)
+	handler := server.Handler()
+
+	// Create
+	body := `{"key":"API_KEY","value":"secret123"}`
+	req := loopbackRequest(http.MethodPost, "/api/vault", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("create status = %d, want %d", w.Code, http.StatusCreated)
+	}
+
+	// Get
+	req = loopbackRequest(http.MethodGet, "/api/vault/API_KEY", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("get status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var result map[string]string
+	_ = json.NewDecoder(w.Body).Decode(&result)
+	if result["value"] != "secret123" {
+		t.Errorf("value = %q, want %q", result["value"], "secret123")
+	}
+}
+
+func TestHandleVault_List_NoValues(t *testing.T) {
+	server, store := setupVaultServer(t)
+	_ = store.Set("SECRET", "hidden-value")
+	handler := server.Handler()
+
+	req := loopbackRequest(http.MethodGet, "/api/vault", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	// Verify response contains key but not value
+	body := w.Body.String()
+	if !bytes.Contains([]byte(body), []byte("SECRET")) {
+		t.Error("list should contain key name")
+	}
+	if bytes.Contains([]byte(body), []byte("hidden-value")) {
+		t.Error("list should NOT contain secret value")
+	}
+}
+
+func TestHandleVault_Delete(t *testing.T) {
+	server, store := setupVaultServer(t)
+	_ = store.Set("TO_DELETE", "value")
+	handler := server.Handler()
+
+	req := loopbackRequest(http.MethodDelete, "/api/vault/TO_DELETE", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Errorf("delete status = %d, want %d", w.Code, http.StatusNoContent)
+	}
+
+	if store.Has("TO_DELETE") {
+		t.Error("key should be deleted")
+	}
+}
+
+func TestHandleVault_NotFound(t *testing.T) {
+	server, _ := setupVaultServer(t)
+	handler := server.Handler()
+
+	req := loopbackRequest(http.MethodGet, "/api/vault/MISSING", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestHandleVault_Import(t *testing.T) {
+	server, store := setupVaultServer(t)
+	handler := server.Handler()
+
+	body := `{"secrets":{"KEY1":"val1","KEY2":"val2"}}`
+	req := loopbackRequest(http.MethodPost, "/api/vault/import", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("import status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	if !store.Has("KEY1") || !store.Has("KEY2") {
+		t.Error("imported keys should exist")
+	}
+}
+
+func TestHandleVault_RejectsInternalCredentialMutations(t *testing.T) {
+	server, _ := setupVaultServer(t)
+	handler := server.Handler()
+
+	tests := []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{method: http.MethodPost, path: "/api/var", body: `{"key":"GRIDCTL_VAULT_PASSPHRASE","value":"blocked"}`},
+		{method: http.MethodPut, path: "/api/var/OP_CONNECT_TOKEN", body: `{"value":"blocked"}`},
+	}
+	for _, tc := range tests {
+		req := loopbackRequest(tc.method, tc.path, strings.NewReader(tc.body))
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s %s status = %d, want 400; body=%s", tc.method, tc.path, w.Code, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "blocked") {
+			t.Fatal("response leaked denied value")
+		}
+	}
+}
+
+func TestHandleVault_ImportReportsSkippedInternalCredentials(t *testing.T) {
+	server, store := setupVaultServer(t)
+	body := `{"variables":[{"key":"SAFE","value":"ok","type":"string"},{"key":"GRIDCTL_PRIVATE","value":"blocked","type":"string"},{"key":"OP_SERVICE_ACCOUNT_TOKEN","value":"blocked-too","type":"string"}]}`
+	req := loopbackRequest(http.MethodPost, "/api/var/import", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	server.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var result vault.ImportResult
+	if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Imported != 1 || len(result.Skipped) != 2 || result.Skipped[0] != "GRIDCTL_PRIVATE" || result.Skipped[1] != "OP_SERVICE_ACCOUNT_TOKEN" {
+		t.Fatalf("result = %+v", result)
+	}
+	if !store.Has("SAFE") || store.Has("GRIDCTL_PRIVATE") || store.Has("OP_SERVICE_ACCOUNT_TOKEN") {
+		t.Fatalf("unexpected keys: %v", store.Keys())
+	}
+	if strings.Contains(w.Body.String(), "blocked") {
+		t.Fatal("response leaked skipped values")
+	}
+}
+
+func TestHandleVault_NotAvailable(t *testing.T) {
+	server := &Server{} // no vault store
+	handler := server.Handler()
+
+	req := loopbackRequest(http.MethodGet, "/api/vault", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestHandleVault_Update(t *testing.T) {
+	server, store := setupVaultServer(t)
+	_ = store.Set("KEY", "old")
+	handler := server.Handler()
+
+	body := `{"value":"new"}`
+	req := loopbackRequest(http.MethodPut, "/api/vault/KEY", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("update status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	got, _ := store.Get("KEY")
+	if got != "new" {
+		t.Errorf("value = %q, want %q", got, "new")
+	}
+}
+
+func TestHandleVault_CreateMissingKey(t *testing.T) {
+	server, _ := setupVaultServer(t)
+	handler := server.Handler()
+
+	body := `{"value":"val"}`
+	req := loopbackRequest(http.MethodPost, "/api/vault", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+// --- Variable Set API Tests ---
+
+func TestHandleVault_ListSets_Empty(t *testing.T) {
+	server, _ := setupVaultServer(t)
+	handler := server.Handler()
+
+	req := loopbackRequest(http.MethodGet, "/api/vault/sets", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var sets []map[string]any
+	_ = json.NewDecoder(w.Body).Decode(&sets)
+	if len(sets) != 0 {
+		t.Errorf("expected empty sets, got %d", len(sets))
+	}
+}
+
+func TestHandleVault_CreateSet(t *testing.T) {
+	server, _ := setupVaultServer(t)
+	handler := server.Handler()
+
+	body := `{"name":"github"}`
+	req := loopbackRequest(http.MethodPost, "/api/vault/sets", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("create set status = %d, want %d; body: %s", w.Code, http.StatusCreated, w.Body.String())
+	}
+
+	// Verify set exists
+	req = loopbackRequest(http.MethodGet, "/api/vault/sets", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	var sets []map[string]any
+	_ = json.NewDecoder(w.Body).Decode(&sets)
+	if len(sets) != 1 {
+		t.Fatalf("expected 1 set, got %d", len(sets))
+	}
+	if sets[0]["name"] != "github" {
+		t.Errorf("set name = %q, want github", sets[0]["name"])
+	}
+}
+
+func TestHandleVault_DeleteSet(t *testing.T) {
+	server, store := setupVaultServer(t)
+	_ = store.CreateSet("temp")
+	handler := server.Handler()
+
+	req := loopbackRequest(http.MethodDelete, "/api/vault/sets/temp", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Errorf("delete set status = %d, want %d", w.Code, http.StatusNoContent)
+	}
+}
+
+func TestHandleVault_AssignSet(t *testing.T) {
+	server, store := setupVaultServer(t)
+	_ = store.Set("KEY", "value")
+	_ = store.CreateSet("group")
+	handler := server.Handler()
+
+	body := `{"set":"group"}`
+	req := loopbackRequest(http.MethodPut, "/api/vault/KEY/set", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("assign status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	// Verify assignment
+	secrets := store.GetSetSecrets("group")
+	if len(secrets) != 1 || secrets[0].Key != "KEY" {
+		t.Errorf("secret not assigned to set; got %v", secrets)
+	}
+}
+
+func TestHandleVault_CreateWithSet(t *testing.T) {
+	server, store := setupVaultServer(t)
+	_ = store.CreateSet("mygroup")
+	handler := server.Handler()
+
+	body := `{"key":"NEW_KEY","value":"val","set":"mygroup"}`
+	req := loopbackRequest(http.MethodPost, "/api/vault", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("create with set status = %d, want %d", w.Code, http.StatusCreated)
+	}
+
+	secrets := store.GetSetSecrets("mygroup")
+	if len(secrets) != 1 || secrets[0].Key != "NEW_KEY" {
+		t.Errorf("secret not in set; got %v", secrets)
+	}
+}
+
+func TestHandleVault_ListIncludesSet(t *testing.T) {
+	server, store := setupVaultServer(t)
+	_ = store.SetWithSet("TOKEN", "secret", "github")
+	handler := server.Handler()
+
+	req := loopbackRequest(http.MethodGet, "/api/vault", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	var entries []map[string]string
+	_ = json.NewDecoder(w.Body).Decode(&entries)
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if entries[0]["set"] != "github" {
+		t.Errorf("entry set = %q, want github", entries[0]["set"])
+	}
+}
+
+// --- Vault Encryption API Tests ---
+
+func TestHandleVault_Status_Unlocked(t *testing.T) {
+	server, store := setupVaultServer(t)
+	_ = store.Set("KEY", "val")
+	handler := server.Handler()
+
+	req := loopbackRequest(http.MethodGet, "/api/vault/status", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status code = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var result map[string]any
+	_ = json.NewDecoder(w.Body).Decode(&result)
+	if result["locked"] != false {
+		t.Errorf("locked = %v, want false", result["locked"])
+	}
+	if result["encrypted"] != false {
+		t.Errorf("encrypted = %v, want false", result["encrypted"])
+	}
+	if result["secrets_count"] != float64(1) {
+		t.Errorf("secrets_count = %v, want 1", result["secrets_count"])
+	}
+}
+
+func TestHandleVault_Lock(t *testing.T) {
+	server, store := setupVaultServer(t)
+	_ = store.Set("API_KEY", "secret123")
+	handler := server.Handler()
+
+	body := `{"passphrase":"testpass"}`
+	req := loopbackRequest(http.MethodPost, "/api/vault/lock", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("lock status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var result map[string]string
+	_ = json.NewDecoder(w.Body).Decode(&result)
+	if result["status"] != "locked" {
+		t.Errorf("status = %q, want locked", result["status"])
+	}
+}
+
+func TestHandleVault_LockAndUnlock(t *testing.T) {
+	server, store := setupVaultServer(t)
+	_ = store.Set("API_KEY", "secret123")
+	handler := server.Handler()
+
+	// Lock
+	body := `{"passphrase":"testpass"}`
+	req := loopbackRequest(http.MethodPost, "/api/vault/lock", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("lock status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	// Reload store to simulate fresh start
+	_ = store.Load()
+
+	// Verify locked status
+	req = loopbackRequest(http.MethodGet, "/api/vault/status", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	var status map[string]any
+	_ = json.NewDecoder(w.Body).Decode(&status)
+	if status["locked"] != true {
+		t.Errorf("expected locked=true after reload, got %v", status["locked"])
+	}
+
+	// Unlock
+	body = `{"passphrase":"testpass"}`
+	req = loopbackRequest(http.MethodPost, "/api/vault/unlock", bytes.NewBufferString(body))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("unlock status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	// Verify unlocked
+	req = loopbackRequest(http.MethodGet, "/api/vault/status", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	_ = json.NewDecoder(w.Body).Decode(&status)
+	if status["locked"] != false {
+		t.Errorf("expected locked=false after unlock, got %v", status["locked"])
+	}
+}
+
+func TestHandleVault_Unlock_WrongPassphrase(t *testing.T) {
+	server, store := setupVaultServer(t)
+	_ = store.Set("KEY", "val")
+	_ = store.Lock("correct")
+	_ = store.Load() // reload to get locked state
+	handler := server.Handler()
+
+	body := `{"passphrase":"wrong"}`
+	req := loopbackRequest(http.MethodPost, "/api/vault/unlock", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestHandleVault_LockedReturns423(t *testing.T) {
+	server, store := setupVaultServer(t)
+	_ = store.Set("KEY", "val")
+	_ = store.Lock("pass")
+	_ = store.Load() // reload to get locked state
+	handler := server.Handler()
+
+	// GET /api/vault should return 423
+	req := loopbackRequest(http.MethodGet, "/api/vault", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != 423 {
+		t.Errorf("locked list status = %d, want 423", w.Code)
+	}
+
+	var result map[string]string
+	_ = json.NewDecoder(w.Body).Decode(&result)
+	if result["error"] != "vault is locked" {
+		t.Errorf("error = %q, want 'vault is locked'", result["error"])
+	}
+}
+
+func TestHandleVault_LockedCreateReturns423(t *testing.T) {
+	server, store := setupVaultServer(t)
+	_ = store.Set("KEY", "val")
+	_ = store.Lock("pass")
+	_ = store.Load()
+	handler := server.Handler()
+
+	body := `{"key":"NEW","value":"val"}`
+	req := loopbackRequest(http.MethodPost, "/api/vault", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != 423 {
+		t.Errorf("locked create status = %d, want 423", w.Code)
+	}
+}
+
+func TestHandleVault_Lock_MissingPassphrase(t *testing.T) {
+	server, _ := setupVaultServer(t)
+	handler := server.Handler()
+
+	body := `{}`
+	req := loopbackRequest(http.MethodPost, "/api/vault/lock", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandleVault_StatusShowsEncrypted(t *testing.T) {
+	server, store := setupVaultServer(t)
+	_ = store.Set("KEY", "val")
+	_ = store.Lock("pass")
+	handler := server.Handler()
+
+	// Status should show encrypted=true even when not locked (data in memory)
+	req := loopbackRequest(http.MethodGet, "/api/vault/status", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	var result map[string]any
+	_ = json.NewDecoder(w.Body).Decode(&result)
+	if result["encrypted"] != true {
+		t.Errorf("encrypted = %v, want true", result["encrypted"])
+	}
+}
+
+// TestHandleVault_List_ReflectsExternalWrites asserts that secrets written by
+// a separate Store instance against the same baseDir (i.e., a CLI
+// `gridctl vault import` run while the daemon is up) are visible to the
+// server's HTTP handler on the next request, without restarting the server.
+func TestHandleVault_List_ReflectsExternalWrites(t *testing.T) {
+	dir := t.TempDir()
+
+	// Server-side store, wired into the handler.
+	serverStore := vault.NewStore(dir)
+	if err := serverStore.Load(); err != nil {
+		t.Fatalf("server Load(): %v", err)
+	}
+	server := &Server{vaultStore: serverStore}
+	handler := server.Handler()
+
+	// First request returns an empty list.
+	req := loopbackRequest(http.MethodGet, "/api/vault", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("initial list status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var initial []map[string]any
+	_ = json.NewDecoder(w.Body).Decode(&initial)
+	if len(initial) != 0 {
+		t.Fatalf("initial list = %d entries, want 0", len(initial))
+	}
+
+	// CLI-side store writes through a separate instance.
+	cli := vault.NewStore(dir)
+	if err := cli.Load(); err != nil {
+		t.Fatalf("cli Load(): %v", err)
+	}
+	if _, err := cli.Import(map[string]string{"API_KEY": "abc", "DB_URL": "postgres://x"}); err != nil {
+		t.Fatalf("cli Import(): %v", err)
+	}
+
+	// Server's next request reflects the external writes.
+	req = loopbackRequest(http.MethodGet, "/api/vault", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("post-write list status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var entries []map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&entries); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("post-write list = %d entries, want 2", len(entries))
+	}
+
+	keys := map[string]bool{}
+	for _, e := range entries {
+		if k, ok := e["key"].(string); ok {
+			keys[k] = true
+		}
+	}
+	if !keys["API_KEY"] || !keys["DB_URL"] {
+		t.Errorf("missing expected keys in list: %v", entries)
+	}
+
+	// Single-key Get should also pick up the external write.
+	req = loopbackRequest(http.MethodGet, "/api/vault/API_KEY", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var got map[string]any
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if got["value"] != "abc" {
+		t.Errorf("Get value = %q, want %q", got["value"], "abc")
+	}
+}
+
+// TestHandleVar_CreateRoundtripsTypeAndIsSecret asserts the new /api/var
+// surface accepts type+is_secret on create and returns them on get/list.
+func TestHandleVar_CreateRoundtripsTypeAndIsSecret(t *testing.T) {
+	dir := t.TempDir()
+	store := vault.NewStore(dir)
+	if err := store.Load(); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{vaultStore: store}
+	handler := server.Handler()
+
+	body := `{"key":"REGION","value":"us-east-1","type":"string","is_secret":false}`
+	req := loopbackRequest(http.MethodPost, "/api/var", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST status = %d, want %d (body=%q)", w.Code, http.StatusCreated, w.Body.String())
+	}
+
+	req = loopbackRequest(http.MethodGet, "/api/var/REGION", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var got map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got["value"] != "us-east-1" {
+		t.Errorf("value = %v, want us-east-1", got["value"])
+	}
+	if got["is_secret"] != false {
+		t.Errorf("is_secret = %v, want false", got["is_secret"])
+	}
+	if got["type"] != "string" {
+		t.Errorf("type = %v, want string", got["type"])
+	}
+}
+
+// TestHandleVar_CreateDefaultsToSecret asserts the secure default (Article XII):
+// a POST without an explicit is_secret stores the variable as a secret.
+func TestHandleVar_CreateDefaultsToSecret(t *testing.T) {
+	dir := t.TempDir()
+	store := vault.NewStore(dir)
+	if err := store.Load(); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{vaultStore: store}
+	handler := server.Handler()
+
+	// Legacy payload: just key+value, no metadata.
+	body := `{"key":"DB_PASS","value":"p4ss"}`
+	req := loopbackRequest(http.MethodPost, "/api/var", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST status = %d, want %d", w.Code, http.StatusCreated)
+	}
+
+	v, ok := store.GetVariable("DB_PASS")
+	if !ok {
+		t.Fatal("DB_PASS not stored")
+	}
+	if !v.IsSecret {
+		t.Error("DB_PASS.IsSecret = false on default; want true (Article XII)")
+	}
+	if v.Type != vault.TypeString {
+		t.Errorf("DB_PASS.Type = %q, want string", v.Type)
+	}
+}
+
+// TestHandleVar_DeprecatedVaultPathAddsHeaders asserts that the legacy
+// /api/vault/* surface continues to work identically but tags every
+// response with the Deprecation/Sunset/Link triple.
+func TestHandleVar_DeprecatedVaultPathAddsHeaders(t *testing.T) {
+	dir := t.TempDir()
+	store := vault.NewStore(dir)
+	if err := store.Load(); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{vaultStore: store}
+	handler := server.Handler()
+
+	req := loopbackRequest(http.MethodGet, "/api/vault", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := w.Header().Get("Deprecation"); got != "true" {
+		t.Errorf("Deprecation header = %q, want %q", got, "true")
+	}
+	if got := w.Header().Get("Sunset"); got == "" {
+		t.Error("Sunset header missing on deprecated /api/vault response")
+	}
+	if got := w.Header().Get("Link"); !strings.Contains(got, "successor-version") {
+		t.Errorf("Link header missing successor-version: %q", got)
+	}
+
+	// Canonical /api/var must NOT carry the deprecation headers.
+	req = loopbackRequest(http.MethodGet, "/api/var", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if got := w.Header().Get("Deprecation"); got != "" {
+		t.Errorf("canonical /api/var has Deprecation header = %q", got)
+	}
+}
+
+// TestHandleVar_StatusIncludesVariablesCount verifies the rename + alias.
+func TestHandleVar_StatusIncludesVariablesCount(t *testing.T) {
+	dir := t.TempDir()
+	store := vault.NewStore(dir)
+	if err := store.Load(); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.Set("A", "1")
+
+	server := &Server{vaultStore: store}
+	handler := server.Handler()
+
+	req := loopbackRequest(http.MethodGet, "/api/var/status", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var got map[string]any
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if v, _ := got["variables_count"].(float64); int(v) != 1 {
+		t.Errorf("variables_count = %v, want 1", got["variables_count"])
+	}
+	if v, _ := got["secrets_count"].(float64); int(v) != 1 {
+		t.Errorf("secrets_count (legacy alias) = %v, want 1", got["secrets_count"])
+	}
+}

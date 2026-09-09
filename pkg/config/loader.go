@@ -1,0 +1,548 @@
+package config
+
+import (
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+
+	vaultpkg "github.com/gridctl/gridctl/pkg/vault"
+	"gopkg.in/yaml.v3"
+)
+
+// loadConfig holds options for LoadStack.
+type loadConfig struct {
+	vault    VaultLookup
+	vaultSet VaultSetLookup
+}
+
+// LoadOption configures LoadStack behavior.
+type LoadOption func(*loadConfig)
+
+// WithVault enables ${vault:KEY} resolution during stack loading.
+func WithVault(v VaultLookup) LoadOption {
+	return func(c *loadConfig) { c.vault = v }
+}
+
+// WithVaultSets enables secrets.sets injection during stack loading.
+func WithVaultSets(v VaultSetLookup) LoadOption {
+	return func(c *loadConfig) { c.vaultSet = v }
+}
+
+// LoadStack reads and parses a stack file.
+func LoadStack(path string, opts ...LoadOption) (*Stack, error) {
+	var cfg loadConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading stack file: %w", err)
+	}
+
+	var stack Stack
+	if err := yaml.Unmarshal(data, &stack); err != nil {
+		return nil, fmt.Errorf("parsing stack YAML: %w", err)
+	}
+
+	// Resolve extends chain before variable expansion
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolving stack path: %w", err)
+	}
+	visited := map[string]bool{absPath: true}
+	if err := resolveExtends(&stack, absPath, visited, 0); err != nil {
+		return nil, err
+	}
+
+	// Expand variable references in string values
+	unresolved, emptyVars, resolutionProblems := expandStackVarsResolved(&stack, newReferenceResolver(cfg.vault))
+	if len(resolutionProblems) > 0 {
+		return nil, fmt.Errorf("resolving stack variable: %w", resolutionProblems[0])
+	}
+
+	// Fail on unresolved variable references only if a store was provided.
+	if cfg.vault != nil && len(unresolved) > 0 {
+		msg := fmt.Sprintf("missing variable(s): %s", strings.Join(unresolved, ", "))
+		msg += "\n  To fix: gridctl var set <KEY>"
+		msg += "\n  Diagnose: gridctl var explain <KEY>"
+		return nil, fmt.Errorf("%s", msg)
+	}
+
+	// Hint about empty env vars that could use the variable store
+	if cfg.vault == nil {
+		for _, v := range emptyVars {
+			slog.Info("hint: "+v+" resolved to empty — use 'gridctl var set "+v+"' to store it securely", "var", v)
+		}
+	}
+
+	// Apply defaults
+	stack.SetDefaults()
+
+	// Resolve relative paths based on stack file location
+	basePath := filepath.Dir(path)
+	resolveRelativePaths(&stack, basePath)
+
+	// Validate the stack
+	if err := Validate(&stack); err != nil {
+		return nil, err
+	}
+
+	// Inject variable set secrets into container env
+	if stack.Secrets != nil && len(stack.Secrets.Sets) > 0 && cfg.vaultSet != nil {
+		injectSetSecrets(&stack, cfg.vaultSet)
+	}
+
+	return &stack, nil
+}
+
+// injectSetSecrets resolves secrets from variable sets and injects them into
+// container env. Explicit env values in YAML take precedence over set-injected
+// values.
+//
+// Each set entry decides its own reach: an unscoped entry fans out to every
+// server and resource (historic behavior), while a scoped entry reaches only
+// the workloads it names. Sets are applied in declaration order and an earlier
+// set wins a key collision, matching the "first writer wins" rule that already
+// gives explicit YAML env precedence.
+func injectSetSecrets(s *Stack, vault VaultSetLookup) {
+	// Resolve each set once. A name can still repeat here when every
+	// occurrence is bare (validation allows that for back-compat), which is
+	// idempotent: the same members, the same fan-out.
+	secretsFor := make(map[string]map[string]string, len(s.Secrets.Sets))
+	for _, ref := range s.Secrets.Sets {
+		if _, done := secretsFor[ref.Name]; done {
+			continue
+		}
+		members := make(map[string]string)
+		for _, sec := range vault.GetSetSecrets(ref.Name) {
+			if vaultpkg.IsInternalCredential(sec.Key) {
+				continue
+			}
+			members[sec.Key] = sec.Value
+		}
+		secretsFor[ref.Name] = members
+	}
+
+	inject := func(env map[string]string, values map[string]string) {
+		for k, v := range values {
+			if _, exists := env[k]; !exists {
+				env[k] = v
+			}
+		}
+	}
+
+	for i := range s.MCPServers {
+		srv := &s.MCPServers[i]
+		for _, ref := range s.Secrets.Sets {
+			values := secretsFor[ref.Name]
+			if len(values) == 0 || !ref.InjectsIntoServer(srv.Name) {
+				continue
+			}
+			if srv.Env == nil {
+				srv.Env = make(map[string]string)
+			}
+			inject(srv.Env, values)
+		}
+	}
+
+	for i := range s.Resources {
+		res := &s.Resources[i]
+		for _, ref := range s.Secrets.Sets {
+			values := secretsFor[ref.Name]
+			if len(values) == 0 || !ref.InjectsIntoResource(res.Name) {
+				continue
+			}
+			if res.Env == nil {
+				res.Env = make(map[string]string)
+			}
+			inject(res.Env, values)
+		}
+	}
+}
+
+// expandStackVars expands variable references in all stack string fields using
+// the unified ExpandString grammar, and as it goes records every variable-store
+// reference into s.References (the usage index). Returns unresolved vault
+// references and empty env vars.
+//
+// Every field expansion flows through the single expandField helper, which both
+// expands and indexes. This is deliberate: a reference can never be expanded
+// without also being indexed, so the usage index cannot drift from what
+// expansion recognizes (see references_test.go's parity test). When adding a
+// newly expandable field, route it through expandField and it is indexed for
+// free.
+func expandStackVars(s *Stack, resolve Resolver) (unresolvedVault []string, emptyEnvVars []string) {
+	resolved, empty, _ := expandStackVarsResolved(s, func(name string, _ bool) ResolutionResult {
+		value, ok := resolve(name)
+		if !ok {
+			return ResolutionResult{Verdict: ResolutionUnset}
+		}
+		return ResolutionResult{Value: value, Verdict: ResolutionEnvFallback}
+	})
+	return resolved, empty
+}
+
+func expandStackVarsResolved(s *Stack, resolve referenceResolver) (unresolvedVault []string, emptyEnvVars []string, resolutionProblems []error) {
+	index := ReferenceIndex{}
+
+	// expandField expands one field's value and records every ${var:KEY}
+	// reference it contains against the consumer site c.
+	expandField := func(c Consumer, val string) string {
+		result, denied := expandStringRefs(val, resolve)
+		for _, key := range result.storeRefs {
+			index.add(key, c)
+		}
+		unresolvedVault = append(unresolvedVault, result.unresolvedVault...)
+		emptyEnvVars = append(emptyEnvVars, result.emptyEnvVars...)
+		resolutionProblems = append(resolutionProblems, denied...)
+		return result.expanded
+	}
+
+	s.Name = expandField(Consumer{Kind: RefKindStack, Field: "name"}, s.Name)
+
+	if s.Gateway != nil {
+		for i := range s.Gateway.AllowedOrigins {
+			s.Gateway.AllowedOrigins[i] = expandField(
+				Consumer{Kind: RefKindGateway, Field: fmt.Sprintf("allowed_origins[%d]", i)},
+				s.Gateway.AllowedOrigins[i])
+		}
+		s.Gateway.Bind = expandField(
+			Consumer{Kind: RefKindGateway, Field: "bind"}, s.Gateway.Bind)
+		for i := range s.Gateway.AllowedHosts {
+			s.Gateway.AllowedHosts[i] = expandField(
+				Consumer{Kind: RefKindGateway, Field: fmt.Sprintf("allowed_hosts[%d]", i)},
+				s.Gateway.AllowedHosts[i])
+		}
+		if s.Gateway.Auth != nil {
+			s.Gateway.Auth.Token = expandField(
+				Consumer{Kind: RefKindGateway, Field: "auth.token"}, s.Gateway.Auth.Token)
+		}
+	}
+
+	s.Network.Name = expandField(Consumer{Kind: RefKindNetwork, Field: "name"}, s.Network.Name)
+
+	for i := range s.Networks {
+		s.Networks[i].Name = expandField(
+			Consumer{Kind: RefKindNetwork, Name: s.Networks[i].Name, Field: "name"}, s.Networks[i].Name)
+	}
+
+	for i := range s.MCPServers {
+		srv := &s.MCPServers[i]
+		// site builds a consumer for srv. srv.Name is read at call time, so
+		// every site after the name field below reflects the expanded name.
+		site := func(field string) Consumer {
+			return Consumer{Kind: RefKindMCPServer, Name: srv.Name, Field: field}
+		}
+
+		srv.Name = expandField(site("name"), srv.Name)
+		srv.Image = expandField(site("image"), srv.Image)
+		srv.URL = expandField(site("url"), srv.URL)
+		srv.Network = expandField(site("network"), srv.Network)
+
+		for j := range srv.Command {
+			srv.Command[j] = expandField(site(fmt.Sprintf("command[%d]", j)), srv.Command[j])
+		}
+
+		if srv.Source != nil {
+			srv.Source.URL = expandField(site("source.url"), srv.Source.URL)
+			srv.Source.Path = expandField(site("source.path"), srv.Source.Path)
+			srv.Source.ProjectPath = expandField(site("source.project_path"), srv.Source.ProjectPath)
+			srv.Source.Ref = expandField(site("source.ref"), srv.Source.Ref)
+			srv.Source.Dockerfile = expandField(site("source.dockerfile"), srv.Source.Dockerfile)
+			srv.Source.Package = expandField(site("source.package"), srv.Source.Package)
+			srv.Source.Python = expandField(site("source.python"), srv.Source.Python)
+			for j := range srv.Source.Extras {
+				srv.Source.Extras[j] = expandField(site(fmt.Sprintf("source.extras[%d]", j)), srv.Source.Extras[j])
+			}
+			for j := range srv.Source.With {
+				srv.Source.With[j] = expandField(site(fmt.Sprintf("source.with[%d]", j)), srv.Source.With[j])
+			}
+			for j := range srv.Source.Packages {
+				srv.Source.Packages[j] = expandField(site(fmt.Sprintf("source.packages[%d]", j)), srv.Source.Packages[j])
+			}
+			// Source.Auth.CredentialRef intentionally NOT expanded here:
+			// vault references stay literal until clone time so the
+			// orchestrator can resolve them against the live vault.
+			if srv.Source.Auth != nil {
+				srv.Source.Auth.SSHKeyPath = expandField(site("source.auth.ssh_key_path"), srv.Source.Auth.SSHKeyPath)
+				srv.Source.Auth.SSHUser = expandField(site("source.auth.ssh_user"), srv.Source.Auth.SSHUser)
+			}
+		}
+
+		for k, v := range srv.Env {
+			srv.Env[k] = expandField(site("env."+k), v)
+		}
+		for k, v := range srv.BuildArgs {
+			srv.BuildArgs[k] = expandField(site("build_args."+k), v)
+		}
+		for j := range srv.Volumes {
+			srv.Volumes[j] = expandField(site(fmt.Sprintf("volumes[%d]", j)), srv.Volumes[j])
+		}
+
+		if srv.SSH != nil {
+			srv.SSH.Host = expandField(site("ssh.host"), srv.SSH.Host)
+			srv.SSH.User = expandField(site("ssh.user"), srv.SSH.User)
+			srv.SSH.IdentityFile = expandField(site("ssh.identityFile"), srv.SSH.IdentityFile)
+			srv.SSH.KnownHostsFile = expandField(site("ssh.knownHostsFile"), srv.SSH.KnownHostsFile)
+			srv.SSH.JumpHost = expandField(site("ssh.jumpHost"), srv.SSH.JumpHost)
+		}
+
+		if srv.OpenAPI != nil {
+			srv.OpenAPI.Spec = expandField(site("openapi.spec"), srv.OpenAPI.Spec)
+			srv.OpenAPI.BaseURL = expandField(site("openapi.baseUrl"), srv.OpenAPI.BaseURL)
+		}
+
+		if srv.Auth != nil {
+			srv.Auth.Token = expandField(site("auth.token"), srv.Auth.Token)
+			srv.Auth.Value = expandField(site("auth.value"), srv.Auth.Value)
+			srv.Auth.ClientID = expandField(site("auth.client_id"), srv.Auth.ClientID)
+			srv.Auth.ClientSecret = expandField(site("auth.client_secret"), srv.Auth.ClientSecret)
+		}
+	}
+
+	for i := range s.Resources {
+		res := &s.Resources[i]
+		site := func(field string) Consumer {
+			return Consumer{Kind: RefKindResource, Name: res.Name, Field: field}
+		}
+
+		res.Name = expandField(site("name"), res.Name)
+		res.Image = expandField(site("image"), res.Image)
+		res.Network = expandField(site("network"), res.Network)
+
+		for k, v := range res.Env {
+			res.Env[k] = expandField(site("env."+k), v)
+		}
+	}
+
+	s.References = index
+	s.UnresolvedRefs = dedupeStrings(unresolvedVault)
+	return unresolvedVault, emptyEnvVars, resolutionProblems
+}
+
+// dedupeStrings returns the input with duplicates removed, preserving first-seen
+// order so callers get a stable list.
+func dedupeStrings(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// resolveRelativePaths resolves local source paths relative to the stack file.
+func resolveRelativePaths(s *Stack, basePath string) {
+	for i := range s.MCPServers {
+		if s.MCPServers[i].Source != nil && s.MCPServers[i].Source.Type == "local" {
+			if !filepath.IsAbs(s.MCPServers[i].Source.Path) {
+				s.MCPServers[i].Source.Path = filepath.Join(basePath, s.MCPServers[i].Source.Path)
+			}
+		}
+
+		// Resolve SSH identity file paths
+		if s.MCPServers[i].SSH != nil && s.MCPServers[i].SSH.IdentityFile != "" {
+			s.MCPServers[i].SSH.IdentityFile = expandTildeAndResolvePath(s.MCPServers[i].SSH.IdentityFile, basePath)
+		}
+		if s.MCPServers[i].SSH != nil && s.MCPServers[i].SSH.KnownHostsFile != "" {
+			s.MCPServers[i].SSH.KnownHostsFile = expandTildeAndResolvePath(s.MCPServers[i].SSH.KnownHostsFile, basePath)
+		}
+
+		// Resolve source.auth.ssh_key_path (mirrors SSH.IdentityFile handling).
+		if s.MCPServers[i].Source != nil && s.MCPServers[i].Source.Auth != nil && s.MCPServers[i].Source.Auth.SSHKeyPath != "" {
+			s.MCPServers[i].Source.Auth.SSHKeyPath = expandTildeAndResolvePath(s.MCPServers[i].Source.Auth.SSHKeyPath, basePath)
+		}
+
+		// Resolve OpenAPI spec paths (if not a URL)
+		if s.MCPServers[i].OpenAPI != nil && s.MCPServers[i].OpenAPI.Spec != "" {
+			if !isURL(s.MCPServers[i].OpenAPI.Spec) {
+				s.MCPServers[i].OpenAPI.Spec = expandTildeAndResolvePath(s.MCPServers[i].OpenAPI.Spec, basePath)
+			}
+		}
+	}
+
+}
+
+// expandTildeAndResolvePath expands ~ to home directory and resolves relative paths.
+func expandTildeAndResolvePath(path, basePath string) string {
+	// Expand ~ to home directory. Deliberately the real OS home, not
+	// state.Home(): the tilde appears in user-authored stack.yaml paths,
+	// where ~ means the user's actual home regardless of GRIDCTL_HOME
+	// (see pkg/state/homeguard_test.go).
+	if len(path) > 0 && path[0] == '~' {
+		if home, err := os.UserHomeDir(); err == nil {
+			if len(path) == 1 {
+				path = home
+			} else if path[1] == '/' || path[1] == filepath.Separator {
+				path = filepath.Join(home, path[2:])
+			}
+		}
+	}
+
+	// Resolve relative paths
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(basePath, path)
+	}
+
+	return path
+}
+
+// isURL checks if a string looks like a URL (http:// or https://).
+func isURL(s string) bool {
+	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
+}
+
+const maxExtendsDepth = 10
+
+// resolveExtends loads the parent stack referenced by child.Extends, merges it into
+// child, and clears child.Extends. Called recursively to support multi-level inheritance.
+// visited tracks absolute paths already in the chain to detect cycles.
+func resolveExtends(child *Stack, childAbsPath string, visited map[string]bool, depth int) error {
+	if child.Extends == "" {
+		return nil
+	}
+	if depth >= maxExtendsDepth {
+		return fmt.Errorf("extends: maximum inheritance depth (%d) exceeded", maxExtendsDepth)
+	}
+
+	// Resolve parent path relative to the child file's directory
+	parentPath := child.Extends
+	if !filepath.IsAbs(parentPath) {
+		parentPath = filepath.Join(filepath.Dir(childAbsPath), parentPath)
+	}
+	absParentPath, err := filepath.Abs(parentPath)
+	if err != nil {
+		return fmt.Errorf("extends: resolving path %q: %w", child.Extends, err)
+	}
+
+	// Cycle detection
+	if visited[absParentPath] {
+		return fmt.Errorf("extends: circular dependency detected: %s → %s", childAbsPath, absParentPath)
+	}
+	visited[absParentPath] = true
+
+	// Read and unmarshal parent
+	data, err := os.ReadFile(absParentPath)
+	if err != nil {
+		return fmt.Errorf("extends: reading parent stack: %w", err)
+	}
+
+	var parent Stack
+	if err := yaml.Unmarshal(data, &parent); err != nil {
+		return fmt.Errorf("extends: parsing parent stack: %w", err)
+	}
+
+	// Recurse before merging so the full ancestor chain is resolved first
+	if err := resolveExtends(&parent, absParentPath, visited, depth+1); err != nil {
+		return err
+	}
+	if err := checkDeclarationConflicts(child.Variables, parent.Variables); err != nil {
+		return fmt.Errorf("extends: %w", err)
+	}
+
+	// Resolve parent's relative paths against parent's directory before merging into child.
+	// Without this, inherited paths would be re-resolved against the child's directory.
+	resolveRelativePaths(&parent, filepath.Dir(absParentPath))
+
+	mergeStacks(child, &parent)
+	child.Extends = ""
+	return nil
+}
+
+// mergeStacks merges parent into child using child-wins semantics:
+//   - MCPServers and Resources: child entries kept as-is; parent-only entries appended
+//   - Gateway, Logging, Secrets, Network/Networks: inherited from parent when child omits them
+//
+// Everything absent from this switchboard is deliberately NOT inherited
+// across `extends`: clients, groups, limits, skills, link, telemetry,
+// experimental, and model_preferences all stay child-only (a policy
+// block silently inherited from a parent stack is a policy the operator
+// never sees). A new block needs an explicit decision here either way.
+func mergeStacks(child, parent *Stack) {
+	mergeVariableDeclarations(child, parent)
+	// MCPServers: child wins on name collision; parent-only servers appended
+	if len(parent.MCPServers) > 0 {
+		childNames := make(map[string]bool, len(child.MCPServers))
+		for _, s := range child.MCPServers {
+			childNames[s.Name] = true
+		}
+		for _, s := range parent.MCPServers {
+			if !childNames[s.Name] {
+				child.MCPServers = append(child.MCPServers, s)
+			}
+		}
+	}
+
+	// Resources: same merge-by-name algorithm
+	if len(parent.Resources) > 0 {
+		childResourceNames := make(map[string]bool, len(child.Resources))
+		for _, r := range child.Resources {
+			childResourceNames[r.Name] = true
+		}
+		for _, r := range parent.Resources {
+			if !childResourceNames[r.Name] {
+				child.Resources = append(child.Resources, r)
+			}
+		}
+	}
+
+	// Top-level blocks: inherit from parent when child has no value
+	if child.Gateway == nil {
+		child.Gateway = parent.Gateway
+	}
+	if child.Logging == nil {
+		child.Logging = parent.Logging
+	}
+	if child.Secrets == nil {
+		child.Secrets = parent.Secrets
+	}
+	if child.Network.Name == "" && len(child.Networks) == 0 {
+		child.Network = parent.Network
+		child.Networks = parent.Networks
+	}
+}
+
+func mergeVariableDeclarations(child, parent *Stack) {
+	if len(parent.Variables) == 0 {
+		return
+	}
+	if child.Variables == nil {
+		child.Variables = make(map[string]VariableDeclaration, len(parent.Variables))
+	}
+	for key, p := range parent.Variables {
+		c, ok := child.Variables[key]
+		if !ok {
+			child.Variables[key] = p
+			continue
+		}
+		if c.Required == nil {
+			c.Required = p.Required
+		} else if p.IsRequired() && !c.IsRequired() {
+			v := true
+			c.Required = &v
+		}
+		if c.Secret == nil {
+			c.Secret = p.Secret
+		}
+		if c.Type == "" {
+			c.Type = p.Type
+		}
+		if c.Description == "" {
+			c.Description = p.Description
+		}
+		if c.Docs == "" {
+			c.Docs = p.Docs
+		}
+		child.Variables[key] = c
+	}
+}

@@ -1,0 +1,993 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/gridctl/gridctl/pkg/config"
+	gitpkg "github.com/gridctl/gridctl/pkg/git"
+	"github.com/gridctl/gridctl/pkg/output"
+	"github.com/gridctl/gridctl/pkg/registry"
+	"github.com/gridctl/gridctl/pkg/skills"
+	"github.com/gridctl/gridctl/pkg/state"
+
+	"github.com/jedib0t/go-pretty/v6/table"
+	"github.com/spf13/cobra"
+)
+
+var skillCmd = &cobra.Command{
+	Use:   "skill",
+	Short: "Manage skills and agents: import, update, and project",
+	Long: "Import, update, and manage skills and agent definitions from remote " +
+		"git repositories, project them into native client directories with " +
+		"'skill project', and review skill-document pins with 'skill pins'.",
+}
+
+// Flags
+var (
+	skillAddRef            string
+	skillAddPath           string
+	skillAddNoActivate     bool
+	skillAddTrust          bool
+	skillAddForce          bool
+	skillAddRename         string
+	skillAddAuthToken      string
+	skillAddAuthTokenStdin bool
+	skillAddVaultKey       string
+	skillAddSSHKey         string
+	skillListRemote        bool
+	skillListFormat        string
+	skillListKind          string
+	skillRemoveKind        string
+	skillInfoKind          string
+	skillUpdateDryRun      bool
+	skillUpdateForce       bool
+	skillUpdateTrust       bool
+	skillTryDuration       string
+	skillTryAuthToken      string
+	skillTryAuthTokenStdin bool
+	skillTryVaultKey       string
+	skillTrySSHKey         string
+)
+
+var skillAddCmd = &cobra.Command{
+	Use:   "add <repo-url>",
+	Short: "Import skills and agents from a git repository",
+	Long: "Clone a repository, discover SKILL.md files and agent definitions " +
+		"(agents/*.md), and import them into the local registry. " +
+		"A repo shipping skills/ plus agents/ imports as a unit.",
+	Example: `  gridctl skill add https://github.com/acme/skills
+  gridctl skill add git@github.com:acme/private-skills.git --vault-key GH_TOKEN`,
+	Args:    cobra.ExactArgs(1),
+	PreRunE: validateSkillAuthFlags(&skillAddAuthToken, &skillAddVaultKey, &skillAddAuthTokenStdin),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runSkillAdd(args[0])
+	},
+}
+
+var skillListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List all skills with origin info",
+	Long: "List all skills showing source origin (local/remote) and update status. " +
+		"Pass --kind agent to list imported agent definitions instead.",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		var err error
+		if skillListFormat, err = resolveFormat(skillListFormat, cmd.Flags().Changed("format"), *skillListJSON); err != nil {
+			return err
+		}
+		if err := resolvePlain(*skillListPlain, skillListFormat); err != nil {
+			return err
+		}
+		if err := validProjectKind(skillListKind); err != nil {
+			return err
+		}
+		if skillListKind == skillProjectKindAgent {
+			return runSkillListAgents()
+		}
+		return runSkillList()
+	},
+}
+
+var (
+	skillListJSON  *bool
+	skillListPlain *bool
+)
+
+var skillUpdateCmd = &cobra.Command{
+	Use:     "update [name]",
+	Aliases: []string{"sync"},
+	Short:   "Update imported skills (alias: sync)",
+	Long: `Fetch latest from source repositories and apply updates.
+
+With no name, every imported skill is checked. By default, skills whose
+on-disk SKILL.md has been locally modified since the last import are
+refused; pass --force to overwrite them anyway.
+
+This command is also available as 'gridctl skill sync' for parity with the
+"Sync sources" affordance in the web UI Library.`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		name := ""
+		if len(args) > 0 {
+			name = args[0]
+		}
+		return runSkillUpdate(name)
+	},
+}
+
+var skillRemoveCmd = &cobra.Command{
+	Use:   "remove <name>",
+	Short: "Remove an imported skill or agent",
+	Long:  "Remove a skill (or, with --kind agent, an agent) and clean up its origin file and lock entry.",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := validProjectKind(skillRemoveKind); err != nil {
+			return err
+		}
+		return runSkillRemove(args[0], skillRemoveKind)
+	},
+}
+
+var skillPinCmd = &cobra.Command{
+	Use:   "pin <name> <ref>",
+	Short: "Pin a skill to a specific version",
+	Long:  "Pin an imported skill to a specific git ref, disabling auto-update.",
+	Args:  cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runSkillPin(args[0], args[1])
+	},
+}
+
+var skillInfoCmd = &cobra.Command{
+	Use:   "info <name>",
+	Short: "Show skill origin and update status",
+	Long:  "Display detailed information about a skill's (or, with --kind agent, an agent's) remote origin and update status.",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := validProjectKind(skillInfoKind); err != nil {
+			return err
+		}
+		return runSkillInfo(args[0], skillInfoKind)
+	},
+}
+
+var skillValidateCmd = &cobra.Command{
+	Use:   "validate <name>",
+	Short: "Validate a skill definition",
+	Long:  "Validate a skill's definition and display errors and warnings, including missing acceptance criteria.",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runSkillValidate(args[0])
+	},
+}
+
+var skillTryCmd = &cobra.Command{
+	Use:     "try <repo-url>",
+	Short:   "Temporarily import a skill",
+	Long:    "Import a skill temporarily for evaluation. Automatically removed after the specified duration.",
+	Args:    cobra.ExactArgs(1),
+	PreRunE: validateSkillAuthFlags(&skillTryAuthToken, &skillTryVaultKey, &skillTryAuthTokenStdin),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runSkillTry(args[0])
+	},
+}
+
+func init() {
+	skillAddCmd.Flags().StringVar(&skillAddRef, "ref", "", "Git ref (branch, tag, or commit)")
+	skillAddCmd.Flags().StringVar(&skillAddPath, "path", "", "Subdirectory path within the repository")
+	skillAddCmd.Flags().BoolVar(&skillAddNoActivate, "no-activate", false, "Import as draft instead of active")
+	skillAddCmd.Flags().BoolVar(&skillAddTrust, "trust", false, "Skip security scan confirmation")
+	skillAddCmd.Flags().BoolVar(&skillAddForce, "force", false, "Overwrite existing skills")
+	skillAddCmd.Flags().StringVar(&skillAddRename, "rename", "", "Rename the skill on import (single skill only)")
+	skillAddCmd.Flags().StringVar(&skillAddAuthToken, "auth-token", "", "Personal Access Token (HTTPS only; not persisted; intended for CI use). Pass \"-\" to read it from stdin")
+	skillAddCmd.Flags().BoolVar(&skillAddAuthTokenStdin, "auth-token-stdin", false, "Read the Personal Access Token from stdin (keeps it out of shell history)")
+	skillAddCmd.Flags().StringVar(&skillAddVaultKey, "vault-key", "", "Resolve the PAT from this vault key (e.g. GIT_TOKEN)")
+	skillAddCmd.Flags().StringVar(&skillAddSSHKey, "ssh-key", "", "Use an SSH private key at this path (SSH URLs only)")
+
+	skillListCmd.Flags().BoolVar(&skillListRemote, "remote", false, "Show only remote (imported) skills")
+	skillListCmd.Flags().StringVar(&skillListFormat, "format", "", "Output format (json)")
+	skillListCmd.Flags().StringVar(&skillListKind, "kind", "skill", "Resource kind to list: skill or agent")
+	skillListJSON = addJSONAlias(skillListCmd)
+	skillListPlain = addPlainFlag(skillListCmd)
+
+	skillRemoveCmd.Flags().StringVar(&skillRemoveKind, "kind", "skill", "Resource kind to remove: skill or agent")
+	skillInfoCmd.Flags().StringVar(&skillInfoKind, "kind", "skill", "Resource kind to inspect: skill or agent")
+
+	skillUpdateCmd.Flags().BoolVar(&skillUpdateDryRun, "dry-run", false, "Show changes without applying")
+	skillUpdateCmd.Flags().BoolVar(&skillUpdateForce, "force", false, "Force update even if no changes detected")
+	skillUpdateCmd.Flags().BoolVar(&skillUpdateTrust, "trust", false, "Skip security scan confirmation for updated content")
+
+	skillTryCmd.Flags().StringVar(&skillTryDuration, "duration", "10m", "Duration before auto-cleanup")
+	skillTryCmd.Flags().StringVar(&skillTryAuthToken, "auth-token", "", "Personal Access Token (HTTPS only; not persisted). Pass \"-\" to read it from stdin")
+	skillTryCmd.Flags().BoolVar(&skillTryAuthTokenStdin, "auth-token-stdin", false, "Read the Personal Access Token from stdin (keeps it out of shell history)")
+	skillTryCmd.Flags().StringVar(&skillTryVaultKey, "vault-key", "", "Resolve the PAT from this vault key")
+	skillTryCmd.Flags().StringVar(&skillTrySSHKey, "ssh-key", "", "Use an SSH private key at this path (SSH URLs only)")
+
+	skillCmd.AddCommand(skillAddCmd)
+	skillCmd.AddCommand(skillListCmd)
+	skillCmd.AddCommand(skillUpdateCmd)
+	skillCmd.AddCommand(skillRemoveCmd)
+	skillCmd.AddCommand(skillPinCmd)
+	skillCmd.AddCommand(skillInfoCmd)
+	skillCmd.AddCommand(skillValidateCmd)
+	skillCmd.AddCommand(skillTryCmd)
+}
+
+func loadRegistry() (*registry.Store, error) {
+	registryDir := registryDir()
+	store := registry.NewStore(registryDir)
+	if err := store.Load(); err != nil {
+		return nil, fmt.Errorf("loading registry: %w", err)
+	}
+	return store, nil
+}
+
+func registryDir() string {
+	base, err := state.BaseDir()
+	if err != nil {
+		// Effectively unreachable: the root command validates home
+		// resolution before any subcommand runs. CLI-layer exit keeps
+		// the ten call sites signature-free without hiding the error.
+		cobra.CheckErr(err)
+	}
+	return filepath.Join(base, "registry")
+}
+
+func skillDirPath(sk *registry.AgentSkill) string {
+	dir := sk.Name
+	if sk.Dir != "" {
+		dir = sk.Dir
+	}
+	return filepath.Join(registryDir(), "skills", dir)
+}
+
+func newImporter(store *registry.Store) *skills.Importer {
+	logger := slog.Default()
+	imp := skills.NewImporter(store, registryDir(), skills.LockFilePath(), logger)
+	imp.SetCredentialResolver(cliCredentialResolver)
+	return imp
+}
+
+// stdinTokenSentinel is the conventional "read it from stdin" value for a
+// flag that otherwise takes a literal, accepted alongside --auth-token-stdin.
+const stdinTokenSentinel = "-"
+
+// validateSkillAuthFlags returns a PreRunE that rejects mutually exclusive
+// auth flag combinations. The three ways to supply a token are exclusive;
+// --ssh-key is a different protocol and is checked by buildAuthConfigFromFlags
+// only insofar as it takes precedence.
+func validateSkillAuthFlags(token, vaultKey *string, tokenStdin *bool) func(*cobra.Command, []string) error {
+	return func(_ *cobra.Command, _ []string) error {
+		literal := *token != "" && *token != stdinTokenSentinel
+		fromStdin := *tokenStdin || *token == stdinTokenSentinel
+		switch {
+		case literal && *vaultKey != "":
+			return errors.New("--auth-token and --vault-key are mutually exclusive")
+		case fromStdin && *vaultKey != "":
+			return errors.New("--auth-token-stdin and --vault-key are mutually exclusive")
+		case literal && *tokenStdin:
+			return errors.New("--auth-token and --auth-token-stdin are mutually exclusive")
+		}
+		return nil
+	}
+}
+
+// readTokenFromStdin reads a single-line token from stdin, trimming trailing
+// newline and surrounding whitespace. Tokens copied out of a provider UI
+// routinely carry a trailing newline, and a token with whitespace attached
+// fails authentication in a way that looks like a wrong token.
+func readTokenFromStdin(stdin io.Reader) (string, error) {
+	data, err := io.ReadAll(io.LimitReader(stdin, 8192))
+	if err != nil {
+		return "", fmt.Errorf("reading token from stdin: %w", err)
+	}
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		return "", errors.New("no token read from stdin")
+	}
+	return token, nil
+}
+
+// warnLiteralToken tells the user that a token passed as a literal argument
+// is now in their shell history and in the process list, and names the two
+// forms that are not. Docker takes the same approach: keep the flag for CI
+// ergonomics, but say plainly that it is the unsafe form.
+func warnLiteralToken(stderr io.Writer) {
+	fmt.Fprintln(stderr, "warning: --auth-token puts the token in your shell history and in the process list; use --auth-token-stdin or --vault-key instead")
+}
+
+// buildAuthConfigFromFlags translates CLI auth flags into skills.AuthConfig.
+// When --vault-key is set, the vault is unlocked (prompting if necessary)
+// and the reference is resolved immediately so Import sees a ready Token.
+//
+// Only --vault-key yields a CredentialRef, and so only --vault-key survives
+// the import: a literal or piped token is transient by construction, which is
+// why an update of a repo imported that way falls back to ambient credentials.
+func buildAuthConfigFromFlags(stderr io.Writer, stdin io.Reader, token string, tokenStdin bool, vaultKey, sshKey string) (skills.AuthConfig, error) {
+	fromStdin := tokenStdin || token == stdinTokenSentinel
+	switch {
+	case sshKey != "":
+		return skills.AuthConfig{
+			Method:        "ssh-key",
+			SSHKeyPath:    sshKey,
+			SSHPassphrase: os.Getenv("GRIDCTL_SSH_KEY_PASSPHRASE"),
+		}, nil
+	case fromStdin:
+		resolved, err := readTokenFromStdin(stdin)
+		if err != nil {
+			return skills.AuthConfig{}, err
+		}
+		return skills.AuthConfig{Method: "token", Token: resolved}, nil
+	case token != "":
+		warnLiteralToken(stderr)
+		return skills.AuthConfig{Method: "token", Token: token}, nil
+	case vaultKey != "":
+		ref := fmt.Sprintf("${var:%s}", vaultKey)
+		resolved, err := cliCredentialResolver(ref)
+		if err != nil {
+			return skills.AuthConfig{}, err
+		}
+		return skills.AuthConfig{Method: "token", Token: resolved, CredentialRef: ref}, nil
+	}
+	return skills.AuthConfig{}, nil
+}
+
+// cliCredentialResolver resolves a "${var:KEY}" (or legacy "${vault:KEY}")
+// reference via the local
+// vault, unlocking it if necessary. Wired onto the CLI's Importer so
+// `skill update` can re-resolve stored references automatically.
+func cliCredentialResolver(ref string) (string, error) {
+	store, err := loadVault()
+	if err != nil {
+		return "", err
+	}
+	if err := ensureUnlocked(store); err != nil {
+		return "", err
+	}
+	expanded, unresolved, _, problems := config.ExpandStringResolved(ref, store)
+	if len(problems) > 0 {
+		return "", problems[0]
+	}
+	if len(unresolved) > 0 {
+		return "", fmt.Errorf("vault key %q not found", unresolved[0])
+	}
+	return expanded, nil
+}
+
+// printSkillAuthHint emits an actionable suggestion for a classified git
+// auth error. Returns true when a hint was printed.
+//
+// repo may be empty; when it names an SSH URL the ssh-agent hint can offer the
+// HTTPS equivalent, which is the one remedy that needs no agent at all.
+func printSkillAuthHint(stderr io.Writer, repo string, err error) bool {
+	switch {
+	case errors.Is(err, gitpkg.ErrAuthRequired), errors.Is(err, gitpkg.ErrNotFound):
+		fmt.Fprintln(stderr, "hint: this repository may be private; add credentials with --vault-key (recommended) or --auth-token")
+		return true
+	case errors.Is(err, gitpkg.ErrAuthFailed):
+		fmt.Fprintln(stderr, "hint: credentials were rejected; verify the token has repo-read access")
+		return true
+	case errors.Is(err, gitpkg.ErrSSHAgentMissing):
+		if https, ok := gitpkg.HTTPSEquivalent(repo); ok {
+			fmt.Fprintf(stderr, "hint: retry over HTTPS with a credential: %s --vault-key GIT_TOKEN\n", https)
+		} else {
+			fmt.Fprintln(stderr, "hint: retry over HTTPS with --vault-key (recommended) or --auth-token-stdin")
+		}
+		fmt.Fprintln(stderr, `hint: or start an agent and restart the daemon so it inherits the socket: eval "$(ssh-agent -s)" && ssh-add`)
+		fmt.Fprintln(stderr, "hint: or name the key directly with --ssh-key <path>")
+		return true
+	case errors.Is(err, gitpkg.ErrHostKeyMismatch):
+		fmt.Fprintln(stderr, "hint: the SSH host key does not match ~/.ssh/known_hosts — investigate before retrying")
+		return true
+	}
+	return false
+}
+
+func runSkillAdd(repoURL string) error {
+	store, err := loadRegistry()
+	if err != nil {
+		return err
+	}
+
+	authCfg, err := buildAuthConfigFromFlags(os.Stderr, os.Stdin, skillAddAuthToken, skillAddAuthTokenStdin, skillAddVaultKey, skillAddSSHKey)
+	if err != nil {
+		return err
+	}
+
+	imp := newImporter(store)
+	result, err := imp.Import(skills.ImportOptions{
+		Repo:       repoURL,
+		Ref:        skillAddRef,
+		Path:       skillAddPath,
+		Trust:      skillAddTrust,
+		NoActivate: skillAddNoActivate,
+		Force:      skillAddForce,
+		Rename:     skillAddRename,
+		Auth:       authCfg,
+	})
+	if err != nil {
+		classified := gitpkg.ClassifyError(err)
+		printSkillAuthHint(os.Stderr, repoURL, classified)
+		return gitpkg.RedactError(classified)
+	}
+
+	printer := output.New()
+
+	for _, imported := range result.Imported {
+		printer.Info("Imported skill", "name", imported.Name)
+		if len(imported.Findings) > 0 {
+			fmt.Print(skills.FormatFindings(imported.Findings))
+		}
+	}
+
+	for _, imported := range result.ImportedAgents {
+		printer.Info("Imported agent", "name", imported.Name)
+		if len(imported.Findings) > 0 {
+			fmt.Print(skills.FormatFindings(imported.Findings))
+		}
+	}
+
+	for _, skipped := range result.Skipped {
+		printer.Warn("Skipped skill", "name", skipped.Name, "reason", skipped.Reason)
+	}
+
+	for _, skipped := range result.SkippedAgents {
+		printer.Warn("Skipped agent", "name", skipped.Name, "reason", skipped.Reason)
+	}
+
+	for _, warning := range result.Warnings {
+		printer.Warn(warning)
+	}
+
+	if len(result.Imported) == 0 && len(result.ImportedAgents) == 0 {
+		return fmt.Errorf("nothing was imported")
+	}
+
+	fmt.Printf("Imported %d skill(s), %d agent(s) from %s\n", len(result.Imported), len(result.ImportedAgents), repoURL)
+	if len(result.ImportedAgents) > 0 {
+		fmt.Println("List agents with 'gridctl skill list --kind agent', project them with 'gridctl skill project sync --kind agent'.")
+	}
+
+	return nil
+}
+
+// runSkillListAgents implements `skill list --kind agent`.
+func runSkillListAgents() error {
+	agents, err := skills.ListAgents(registryDir())
+	if err != nil {
+		return err
+	}
+	if len(agents) == 0 {
+		fmt.Println("No agents in registry. Import some with 'gridctl skill add <repo-url>'.")
+		return nil
+	}
+
+	type agentEntry struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Model       string `json:"model,omitempty"`
+		Repo        string `json:"repo,omitempty"`
+		Ref         string `json:"ref,omitempty"`
+	}
+
+	var entries []agentEntry
+	for _, a := range agents {
+		entry := agentEntry{Name: a.Name, Description: a.Definition.Description}
+		entry.Model, _ = a.Definition.DeclaredModel()
+		if origin, err := skills.ReadOrigin(a.Dir); err == nil {
+			entry.Repo = origin.Repo
+			entry.Ref = origin.Ref
+		}
+		entries = append(entries, entry)
+	}
+
+	if skillListFormat == "json" {
+		data, _ := json.MarshalIndent(entries, "", "  ")
+		fmt.Println(string(data))
+		return nil
+	}
+
+	t := output.NewTableWriter(os.Stdout, *skillListPlain)
+	t.AppendHeader(table.Row{"Name", "Description", "Model", "Repo"})
+	for _, e := range entries {
+		repo := e.Repo
+		if repo != "" && e.Ref != "" {
+			repo = fmt.Sprintf("%s@%s", repo, e.Ref)
+		}
+		t.AppendRow(table.Row{e.Name, e.Description, e.Model, repo})
+	}
+	t.Render()
+	return nil
+}
+
+func runSkillList() error {
+	store, err := loadRegistry()
+	if err != nil {
+		return err
+	}
+
+	allSkills := store.ListSkills()
+	if len(allSkills) == 0 {
+		fmt.Println("No skills in registry")
+		return nil
+	}
+
+	type skillEntry struct {
+		Name   string `json:"name"`
+		State  string `json:"state"`
+		Source string `json:"source"`
+		Model  string `json:"model,omitempty"`
+		Repo   string `json:"repo,omitempty"`
+		Ref    string `json:"ref,omitempty"`
+	}
+
+	var entries []skillEntry
+
+	for _, sk := range allSkills {
+		entry := skillEntry{
+			Name:   sk.Name,
+			State:  string(sk.State),
+			Source: "local",
+			Model:  registry.ExtractModelPreference(sk).Value(),
+		}
+
+		skillDir := skillDirPath(sk)
+
+		if origin, err := skills.ReadOrigin(skillDir); err == nil {
+			entry.Source = "remote"
+			entry.Repo = origin.Repo
+			entry.Ref = origin.Ref
+		}
+
+		if skillListRemote && entry.Source != "remote" {
+			continue
+		}
+
+		entries = append(entries, entry)
+	}
+
+	if skillListFormat == "json" {
+		data, _ := json.MarshalIndent(entries, "", "  ")
+		fmt.Println(string(data))
+		return nil
+	}
+
+	t := output.NewTableWriter(os.Stdout, *skillListPlain)
+	t.AppendHeader(table.Row{"Name", "State", "Source", "Model", "Repo"})
+	for _, e := range entries {
+		repo := e.Repo
+		if repo != "" && e.Ref != "" {
+			repo = fmt.Sprintf("%s@%s", repo, e.Ref)
+		}
+		t.AppendRow(table.Row{e.Name, e.State, e.Source, e.Model, repo})
+	}
+	t.Render()
+
+	// Show update notice if available
+	if notice := skills.FormatUpdateNotice(); notice != "" {
+		fmt.Print(notice)
+	}
+
+	return nil
+}
+
+// driftedImports returns the names of skills or agents with local edits
+// to their on-disk SKILL.md/AGENT.md. When name is non-empty, only that
+// resource is inspected (so `gridctl skill update foo` doesn't pay to
+// hash every installed skill).
+func driftedImports(store *registry.Store, name string) ([]string, error) {
+	if name != "" {
+		sk, err := store.GetSkill(name)
+		if err != nil {
+			// The name may be an imported agent; agents share the
+			// drift-safe update gate.
+			return driftedAgent(name)
+		}
+		dir := sk.Dir
+		if dir == "" {
+			dir = sk.Name
+		}
+		skillDir := filepath.Join(registryDir(), "skills", dir)
+		origin, err := skills.ReadOrigin(skillDir)
+		if err != nil || origin.InstalledHash == "" {
+			return nil, nil
+		}
+		current, err := skills.ContentHashFile(filepath.Join(skillDir, "SKILL.md"))
+		if err != nil {
+			return nil, nil
+		}
+		if current != origin.InstalledHash {
+			return []string{name}, nil
+		}
+		return nil, nil
+	}
+	drifted, err := skills.DetectDrift(context.Background(), store, skills.LockFilePath(), "")
+	if err != nil {
+		return nil, err
+	}
+	driftedAgents, err := skills.DetectAgentDrift(context.Background(), registryDir())
+	if err != nil {
+		return nil, err
+	}
+	return append(drifted, driftedAgents...), nil
+}
+
+// driftedAgent inspects one imported agent for local edits.
+func driftedAgent(name string) ([]string, error) {
+	agentDir := skills.AgentDir(registryDir(), name)
+	origin, err := skills.ReadOrigin(agentDir)
+	if err != nil || origin.InstalledHash == "" {
+		return nil, nil // not an agent, or pre-hash import — let imp.Update decide
+	}
+	current, err := skills.ContentHashFile(filepath.Join(agentDir, "AGENT.md"))
+	if err != nil {
+		return nil, nil
+	}
+	if current != origin.InstalledHash {
+		return []string{name}, nil
+	}
+	return nil, nil
+}
+
+func runSkillUpdate(name string) error {
+	store, err := loadRegistry()
+	if err != nil {
+		return err
+	}
+
+	imp := newImporter(store)
+	printer := output.New()
+
+	// Drift check (unless --force or --dry-run). Refuse rather than silently
+	// overwrite local edits to imported SKILL.md files.
+	if !skillUpdateForce && !skillUpdateDryRun {
+		drifted, err := driftedImports(store, name)
+		if err != nil {
+			return fmt.Errorf("checking drift: %w", err)
+		}
+		if len(drifted) > 0 {
+			fmt.Fprintln(os.Stderr, "The following skills have local edits that would be overwritten:")
+			for _, d := range drifted {
+				fmt.Fprintf(os.Stderr, "  - %s\n", d)
+			}
+			fmt.Fprintln(os.Stderr, "\nRe-run with --force to overwrite, or revert local changes first.")
+			return fmt.Errorf("refusing to overwrite locally-edited skills")
+		}
+	}
+
+	if name != "" {
+		result, err := imp.Update(name, skillUpdateDryRun, skillUpdateForce, skillUpdateTrust)
+		if err != nil {
+			return err
+		}
+		for _, w := range result.Warnings {
+			printer.Info(w)
+		}
+		for _, imported := range result.Imported {
+			printer.Info("Updated skill", "name", imported.Name)
+		}
+		for _, imported := range result.ImportedAgents {
+			printer.Info("Updated agent", "name", imported.Name)
+		}
+		return nil
+	}
+
+	// Update all remote skills, grouped by source so we can honor pins and
+	// print an aggregate summary at the end.
+	allSkills := store.ListSkills()
+	type skillRef struct {
+		name   string
+		ref    string
+		source string
+	}
+	var remoteSkills []skillRef
+	sourcesSeen := map[string]string{} // source name → ref (one is enough for pin check)
+	for _, sk := range allSkills {
+		skillDir := skillDirPath(sk)
+		if !skills.HasOrigin(skillDir) {
+			continue
+		}
+		origin, err := skills.ReadOrigin(skillDir)
+		if err != nil {
+			continue
+		}
+		sourceName := skills.RepoToName(origin.Repo)
+		sourcesSeen[sourceName] = origin.Ref
+		remoteSkills = append(remoteSkills, skillRef{name: sk.Name, ref: origin.Ref, source: sourceName})
+	}
+
+	// Sources that ship only agents have no skill to carry them into the
+	// loop; one agent per such source stands in. Sources already covered
+	// by a skill are skipped: updating any resource re-imports the whole
+	// source, agents included.
+	if agents, err := skills.ListAgents(registryDir()); err == nil {
+		for _, a := range agents {
+			origin, oerr := skills.ReadOrigin(a.Dir)
+			if oerr != nil {
+				continue
+			}
+			sourceName := skills.RepoToName(origin.Repo)
+			if _, ok := sourcesSeen[sourceName]; ok {
+				continue
+			}
+			sourcesSeen[sourceName] = origin.Ref
+			remoteSkills = append(remoteSkills, skillRef{name: a.Name, ref: origin.Ref, source: sourceName})
+		}
+	}
+
+	var (
+		updatedSkills int
+		failedSources = map[string]bool{}
+		syncedSources = map[string]bool{}
+		pinnedSources = map[string]bool{}
+	)
+
+	for _, sr := range remoteSkills {
+		if skills.IsPinnedRef(sr.ref) {
+			pinnedSources[sr.source] = true
+			continue
+		}
+
+		result, err := imp.Update(sr.name, skillUpdateDryRun, skillUpdateForce, skillUpdateTrust)
+		if err != nil {
+			printer.Warn("Failed to update", "skill", sr.name, "error", err)
+			failedSources[sr.source] = true
+			continue
+		}
+		for _, w := range result.Warnings {
+			printer.Info(w)
+		}
+		for _, imported := range result.Imported {
+			printer.Info("Updated skill", "name", imported.Name)
+			updatedSkills++
+		}
+		for _, imported := range result.ImportedAgents {
+			printer.Info("Updated agent", "name", imported.Name)
+			updatedSkills++
+		}
+		if !failedSources[sr.source] {
+			syncedSources[sr.source] = true
+		}
+	}
+
+	// Sources can show up in both syncedSources and failedSources; the
+	// failed-skill loop sets failedSources but doesn't unset syncedSources.
+	// Reconcile so a source with any failure counts as failed.
+	for src := range failedSources {
+		delete(syncedSources, src)
+	}
+
+	if skillUpdateDryRun {
+		return nil
+	}
+
+	if len(pinnedSources) > 0 {
+		names := make([]string, 0, len(pinnedSources))
+		for n := range pinnedSources {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		fmt.Printf("Skipped pinned sources: %s (use 'gridctl skill update <name>' to force)\n", strings.Join(names, ", "))
+	}
+
+	fmt.Printf("Synced %d source(s), %d skill(s) updated, %d failed, %d pinned\n",
+		len(syncedSources), updatedSkills, len(failedSources), len(pinnedSources))
+
+	return nil
+}
+
+func runSkillRemove(name, kind string) error {
+	store, err := loadRegistry()
+	if err != nil {
+		return err
+	}
+
+	imp := newImporter(store)
+	printer := output.New()
+	if kind == skillProjectKindAgent {
+		if err := imp.RemoveAgent(name); err != nil {
+			return err
+		}
+		printer.Info("Removed agent", "name", name)
+		return nil
+	}
+	if err := imp.Remove(name); err != nil {
+		return err
+	}
+
+	printer.Info("Removed skill", "name", name)
+	return nil
+}
+
+func runSkillPin(name, ref string) error {
+	store, err := loadRegistry()
+	if err != nil {
+		return err
+	}
+
+	imp := newImporter(store)
+	if err := imp.Pin(name, ref); err != nil {
+		return err
+	}
+
+	printer := output.New()
+	printer.Info("Pinned skill", "name", name, "ref", ref)
+	return nil
+}
+
+func runSkillInfo(name, kind string) error {
+	store, err := loadRegistry()
+	if err != nil {
+		return err
+	}
+
+	imp := newImporter(store)
+	var info *skills.SkillInfo
+	if kind == skillProjectKindAgent {
+		info, err = imp.AgentInfo(name)
+	} else {
+		info, err = imp.Info(name)
+	}
+	if err != nil {
+		return err
+	}
+
+	printer := output.New()
+
+	label := "skill"
+	if kind == skillProjectKindAgent {
+		label = "agent"
+	}
+	if !info.IsRemote {
+		printer.Info("Local "+label, "name", info.Name)
+	} else {
+		printer.Info("Remote "+label,
+			"name", info.Name,
+			"repo", info.Origin.Repo,
+			"ref", info.Origin.Ref,
+			"commit", info.Origin.CommitSHA[:8],
+			"imported", info.Origin.ImportedAt.Format(time.RFC3339),
+		)
+
+		if !info.LastChecked.IsZero() {
+			fmt.Printf("  Last checked: %s\n", info.LastChecked.Format(time.RFC3339))
+		}
+	}
+
+	if sk, err := store.GetSkill(name); err == nil && len(sk.AcceptanceCriteria) > 0 {
+		fmt.Println("\nAcceptance Criteria:")
+		for i, c := range sk.AcceptanceCriteria {
+			fmt.Printf("  %d. %s\n", i+1, c)
+		}
+	}
+
+	return nil
+}
+
+func runSkillValidate(name string) error {
+	store, err := loadRegistry()
+	if err != nil {
+		return err
+	}
+
+	sk, err := store.GetSkill(name)
+	if err != nil {
+		return err
+	}
+
+	result := registry.ValidateSkillFull(sk)
+
+	if !result.Valid() {
+		for _, e := range result.Errors {
+			fmt.Printf("  ✗ %s: %s\n", name, e)
+		}
+	}
+
+	for _, w := range result.Warnings {
+		fmt.Printf("⚠  %s: %s\n", name, w)
+	}
+
+	if result.Valid() && len(result.Warnings) == 0 {
+		fmt.Printf("✓ %s is valid\n", name)
+	}
+
+	return nil
+}
+
+func runSkillTry(repoURL string) error {
+	duration, err := time.ParseDuration(skillTryDuration)
+	if err != nil {
+		return fmt.Errorf("invalid duration: %w", err)
+	}
+
+	store, err := loadRegistry()
+	if err != nil {
+		return err
+	}
+
+	authCfg, err := buildAuthConfigFromFlags(os.Stderr, os.Stdin, skillTryAuthToken, skillTryAuthTokenStdin, skillTryVaultKey, skillTrySSHKey)
+	if err != nil {
+		return err
+	}
+
+	imp := newImporter(store)
+	result, err := imp.Import(skills.ImportOptions{
+		Repo:  repoURL,
+		Trust: true,
+		Force: true,
+		Auth:  authCfg,
+	})
+	if err != nil {
+		classified := gitpkg.ClassifyError(err)
+		printSkillAuthHint(os.Stderr, repoURL, classified)
+		return gitpkg.RedactError(classified)
+	}
+
+	printer := output.New()
+	var importedNames []string
+	for _, imported := range result.Imported {
+		printer.Info("Temporarily imported", "name", imported.Name, "duration", duration)
+		importedNames = append(importedNames, imported.Name)
+	}
+
+	if len(importedNames) == 0 {
+		return fmt.Errorf("no skills were imported")
+	}
+
+	fmt.Printf("\nSkill(s) will be automatically removed in %s\n", duration)
+	fmt.Println("Press Ctrl+C to remove immediately and exit.")
+
+	// Countdown with periodic updates
+	deadline := time.Now().Add(duration)
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	cleanup := func() {
+		cleanStore, err := loadRegistry()
+		if err != nil {
+			slog.Warn("failed to load registry for cleanup", "error", err)
+			return
+		}
+		cleanImp := skills.NewImporter(cleanStore, registryDir(), skills.LockFilePath(), slog.Default())
+		for _, name := range importedNames {
+			if err := cleanImp.Remove(name); err != nil {
+				slog.Warn("failed to clean up ephemeral skill", "name", name, "error", err)
+			} else {
+				printer.Info("Removed ephemeral skill", "name", name)
+			}
+		}
+	}
+
+	for {
+		select {
+		case <-sigCh:
+			fmt.Println("\nCleaning up ephemeral skills...")
+			cleanup()
+			return nil
+		case <-ticker.C:
+			remaining := time.Until(deadline).Round(time.Second)
+			if remaining > 0 {
+				fmt.Printf("  ⏱ %s remaining before auto-cleanup\n", remaining)
+			}
+		case <-time.After(time.Until(deadline)):
+			fmt.Println("\nDuration expired. Cleaning up ephemeral skills...")
+			cleanup()
+			return nil
+		}
+	}
+}

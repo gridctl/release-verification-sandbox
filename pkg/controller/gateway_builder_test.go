@@ -1,0 +1,865 @@
+package controller
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/gridctl/gridctl/pkg/config"
+	"github.com/gridctl/gridctl/pkg/logging"
+	"github.com/gridctl/gridctl/pkg/mcp"
+	"github.com/gridctl/gridctl/pkg/runtime"
+	"github.com/gridctl/gridctl/pkg/state"
+	"github.com/gridctl/gridctl/pkg/vault"
+)
+
+func TestGatewayBuilder_BuildLogging_Fresh(t *testing.T) {
+	cfg := Config{Verbose: true}
+	stack := &config.Stack{Name: "test"}
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", nil, &runtime.UpResult{})
+
+	logBuffer, handler, _ := builder.buildLogging(true)
+	if logBuffer == nil {
+		t.Fatal("expected logBuffer to be non-nil")
+	}
+	if handler == nil {
+		t.Fatal("expected handler to be non-nil")
+	}
+}
+
+func TestGatewayBuilder_BuildLogging_Existing(t *testing.T) {
+	cfg := Config{}
+	stack := &config.Stack{Name: "test"}
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", nil, &runtime.UpResult{})
+
+	existingBuffer := logging.NewLogBuffer(100)
+	existingHandler := logging.NewRedactingHandler(logging.NewBufferHandler(existingBuffer, nil))
+	builder.SetExistingLogInfra(existingBuffer, existingHandler)
+
+	logBuffer, handler, _ := builder.buildLogging(false)
+	if logBuffer != existingBuffer {
+		t.Error("expected existing buffer to be returned")
+	}
+	if handler != existingHandler {
+		t.Error("expected existing handler to be returned")
+	}
+}
+
+func TestBuildTracingConfig_MaxTraces(t *testing.T) {
+	// The documented default ring buffer capacity (docs/config-schema.md).
+	const defaultMaxTraces = 1000
+
+	tests := []struct {
+		name string
+		gw   *config.GatewayConfig
+		want int
+	}{
+		{
+			name: "nil gateway uses default",
+			gw:   nil,
+			want: defaultMaxTraces,
+		},
+		{
+			name: "nil tracing block uses default",
+			gw:   &config.GatewayConfig{},
+			want: defaultMaxTraces,
+		},
+		{
+			name: "explicit value is honored",
+			gw:   &config.GatewayConfig{Tracing: &config.TracingConfig{Enabled: boolPtr(true), MaxTraces: 50}},
+			want: 50,
+		},
+		{
+			name: "zero value preserves default",
+			gw:   &config.GatewayConfig{Tracing: &config.TracingConfig{Enabled: boolPtr(true), MaxTraces: 0}},
+			want: defaultMaxTraces,
+		},
+		{
+			name: "negative value preserves default",
+			gw:   &config.GatewayConfig{Tracing: &config.TracingConfig{Enabled: boolPtr(true), MaxTraces: -5}},
+			want: defaultMaxTraces,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := buildTracingConfig(tt.gw)
+			if cfg.MaxTraces != tt.want {
+				t.Errorf("MaxTraces = %d, want %d", cfg.MaxTraces, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildTracingConfig_Enabled(t *testing.T) {
+	tests := []struct {
+		name string
+		gw   *config.GatewayConfig
+		want bool
+	}{
+		{
+			name: "nil gateway defaults to enabled",
+			gw:   nil,
+			want: true,
+		},
+		{
+			name: "nil tracing block defaults to enabled",
+			gw:   &config.GatewayConfig{},
+			want: true,
+		},
+		{
+			name: "tracing block without enabled preserves default",
+			gw:   &config.GatewayConfig{Tracing: &config.TracingConfig{Sampling: 0.5}},
+			want: true,
+		},
+		{
+			name: "explicit false disables",
+			gw:   &config.GatewayConfig{Tracing: &config.TracingConfig{Enabled: boolPtr(false)}},
+			want: false,
+		},
+		{
+			name: "explicit true enables",
+			gw:   &config.GatewayConfig{Tracing: &config.TracingConfig{Enabled: boolPtr(true)}},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := buildTracingConfig(tt.gw)
+			if cfg.Enabled != tt.want {
+				t.Errorf("Enabled = %v, want %v", cfg.Enabled, tt.want)
+			}
+		})
+	}
+}
+
+func TestGatewayBuilder_SetVersion(t *testing.T) {
+	builder := NewGatewayBuilder(Config{}, &config.Stack{}, "", nil, &runtime.UpResult{})
+	builder.SetVersion("v0.1.0")
+	if builder.version != "v0.1.0" {
+		t.Errorf("expected version 'v0.1.0', got '%s'", builder.version)
+	}
+}
+
+func TestGatewayBuilder_Build_WithEmptyRegistry(t *testing.T) {
+	regDir := t.TempDir() // Empty directory — no prompts or skills
+
+	cfg := Config{Port: 8180}
+	stack := &config.Stack{Name: "test"}
+	rt := runtime.NewOrchestrator(nil, nil)
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", rt, &runtime.UpResult{})
+	builder.registryDir = regDir
+
+	inst, err := builder.Build(false)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+
+	if inst.RegistryServer == nil {
+		t.Fatal("expected RegistryServer to be non-nil")
+	}
+	if inst.RegistryServer.HasContent() {
+		t.Error("expected empty registry to have no content")
+	}
+
+	// Registry should NOT be in the router (progressive disclosure)
+	client := inst.Gateway.Router().GetClient("registry")
+	if client != nil {
+		t.Error("expected registry to NOT be registered in router when empty")
+	}
+
+	// API server should have the registry server
+	if inst.APIServer.RegistryServer() == nil {
+		t.Error("expected API server to have registry server set")
+	}
+}
+
+func TestGatewayBuilder_Build_WithPopulatedRegistry(t *testing.T) {
+	regDir := t.TempDir()
+
+	// Create a SKILL.md file in directory-based layout
+	skillDir := filepath.Join(regDir, "skills", "test-skill")
+	if err := os.MkdirAll(skillDir, 0755); err != nil {
+		t.Fatalf("creating skill dir: %v", err)
+	}
+	skillMD := `---
+name: test-skill
+description: A test skill
+state: active
+---
+
+# Test Skill
+
+Execute some-server__some-tool with key=value.
+`
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(skillMD), 0644); err != nil {
+		t.Fatalf("writing SKILL.md: %v", err)
+	}
+
+	cfg := Config{Port: 8180}
+	stack := &config.Stack{Name: "test"}
+	rt := runtime.NewOrchestrator(nil, nil)
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", rt, &runtime.UpResult{})
+	builder.registryDir = regDir
+
+	inst, err := builder.Build(false)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+
+	if inst.RegistryServer == nil {
+		t.Fatal("expected RegistryServer to be non-nil")
+	}
+	if !inst.RegistryServer.HasContent() {
+		t.Error("expected populated registry to have content")
+	}
+
+	// Registry SHOULD be in the router (progressive disclosure — content present)
+	client := inst.Gateway.Router().GetClient("registry")
+	if client == nil {
+		t.Fatal("expected registry to be registered in router when it has content")
+	}
+
+	// Registry should NOT expose tools — skills are served as prompts/resources
+	tools := inst.Gateway.Router().AggregatedTools()
+	for _, tool := range tools {
+		if tool.Name == mcp.PrefixTool("registry", "test-skill") {
+			t.Error("registry should not expose skills as tools")
+		}
+	}
+
+	// Skills should be available as prompts
+	prompts := inst.RegistryServer.ListPromptData()
+	if len(prompts) != 1 {
+		t.Fatalf("expected 1 prompt, got %d", len(prompts))
+	}
+	if prompts[0].Name != "test-skill" {
+		t.Errorf("prompt name = %q, want %q", prompts[0].Name, "test-skill")
+	}
+
+	// API server should have the registry server
+	if inst.APIServer.RegistryServer() == nil {
+		t.Error("expected API server to have registry server set")
+	}
+}
+
+func TestGatewayBuilder_BuildLogging_DaemonChild(t *testing.T) {
+	cfg := Config{DaemonChild: true}
+	stack := &config.Stack{Name: "test"}
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", nil, &runtime.UpResult{})
+
+	logBuffer, handler, _ := builder.buildLogging(false)
+	if logBuffer == nil {
+		t.Fatal("expected non-nil logBuffer")
+	}
+	if handler == nil {
+		t.Fatal("expected non-nil handler")
+	}
+}
+
+func TestGatewayBuilder_BuildLogging_NeitherVerboseNorDaemon(t *testing.T) {
+	cfg := Config{}
+	stack := &config.Stack{Name: "test"}
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", nil, &runtime.UpResult{})
+
+	logBuffer, handler, _ := builder.buildLogging(false)
+	if logBuffer == nil {
+		t.Fatal("expected non-nil logBuffer")
+	}
+	if handler == nil {
+		t.Fatal("expected non-nil handler")
+	}
+}
+
+func TestGatewayBuilder_BuildLogging_WithVaultStore(t *testing.T) {
+	cfg := Config{Verbose: true}
+	stack := &config.Stack{Name: "test"}
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", nil, &runtime.UpResult{})
+	builder.SetVaultStore(vault.NewStore(t.TempDir()))
+
+	logBuffer, handler, _ := builder.buildLogging(true)
+	if logBuffer == nil {
+		t.Fatal("expected non-nil logBuffer")
+	}
+	if handler == nil {
+		t.Fatal("expected non-nil handler")
+	}
+}
+
+func TestGatewayBuilder_SetWebFS(t *testing.T) {
+	builder := NewGatewayBuilder(Config{}, &config.Stack{}, "", nil, &runtime.UpResult{})
+	builder.SetWebFS(func() (fs.FS, error) { return nil, nil })
+	if builder.webFS == nil {
+		t.Error("expected webFS to be set")
+	}
+}
+
+func TestGatewayBuilder_SetVaultStore(t *testing.T) {
+	builder := NewGatewayBuilder(Config{}, &config.Stack{}, "", nil, &runtime.UpResult{})
+	store := vault.NewStore(t.TempDir())
+	builder.SetVaultStore(store)
+	if builder.vaultStore != store {
+		t.Error("expected vaultStore to be set")
+	}
+}
+
+func TestGatewayBuilder_Build_CodeModeFromCLI(t *testing.T) {
+	regDir := t.TempDir()
+	cfg := Config{Port: 8180, CodeMode: true}
+	stack := &config.Stack{Name: "test"}
+	rt := runtime.NewOrchestrator(nil, nil)
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", rt, &runtime.UpResult{})
+	builder.registryDir = regDir
+
+	inst, err := builder.Build(false)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+	if inst.Gateway.CodeModeStatus() != "on" {
+		t.Errorf("expected code mode 'on', got '%s'", inst.Gateway.CodeModeStatus())
+	}
+}
+
+func TestGatewayBuilder_Build_CodeModeFromStack(t *testing.T) {
+	regDir := t.TempDir()
+	cfg := Config{Port: 8180}
+	stack := &config.Stack{
+		Name: "test",
+		Gateway: &config.GatewayConfig{
+			CodeMode:        "on",
+			CodeModeTimeout: 60,
+		},
+	}
+	rt := runtime.NewOrchestrator(nil, nil)
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", rt, &runtime.UpResult{})
+	builder.registryDir = regDir
+
+	inst, err := builder.Build(false)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+	if inst.Gateway.CodeModeStatus() != "on" {
+		t.Errorf("expected code mode 'on', got '%s'", inst.Gateway.CodeModeStatus())
+	}
+}
+
+func TestGatewayBuilder_Build_NoCodeMode(t *testing.T) {
+	regDir := t.TempDir()
+	cfg := Config{Port: 8180}
+	stack := &config.Stack{Name: "test"}
+	rt := runtime.NewOrchestrator(nil, nil)
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", rt, &runtime.UpResult{})
+	builder.registryDir = regDir
+
+	inst, err := builder.Build(false)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+	if inst.Gateway.CodeModeStatus() != "off" {
+		t.Errorf("expected code mode 'off', got '%s'", inst.Gateway.CodeModeStatus())
+	}
+}
+
+func TestGatewayBuilder_Build_WithAllowedOrigins(t *testing.T) {
+	regDir := t.TempDir()
+	cfg := Config{Port: 8180}
+	stack := &config.Stack{
+		Name: "test",
+		Gateway: &config.GatewayConfig{
+			AllowedOrigins: []string{"https://example.com"},
+		},
+	}
+	rt := runtime.NewOrchestrator(nil, nil)
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", rt, &runtime.UpResult{})
+	builder.registryDir = regDir
+
+	inst, err := builder.Build(false)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+	if inst.APIServer == nil {
+		t.Fatal("expected non-nil APIServer")
+	}
+}
+
+func TestGatewayBuilder_Build_WithAuth(t *testing.T) {
+	regDir := t.TempDir()
+	cfg := Config{Port: 8180}
+	stack := &config.Stack{
+		Name: "test",
+		Gateway: &config.GatewayConfig{
+			Auth: &config.AuthConfig{
+				Type:  "bearer",
+				Token: "secret",
+			},
+		},
+	}
+	rt := runtime.NewOrchestrator(nil, nil)
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", rt, &runtime.UpResult{})
+	builder.registryDir = regDir
+
+	inst, err := builder.Build(false)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+	if inst.APIServer == nil {
+		t.Fatal("expected non-nil APIServer")
+	}
+}
+
+func TestGatewayBuilder_Build_HTTPServer(t *testing.T) {
+	regDir := t.TempDir()
+	cfg := Config{Port: 9999}
+	stack := &config.Stack{Name: "test"}
+	rt := runtime.NewOrchestrator(nil, nil)
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", rt, &runtime.UpResult{})
+	builder.registryDir = regDir
+
+	inst, err := builder.Build(false)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+	if inst.HTTPServer == nil {
+		t.Fatal("expected non-nil HTTPServer")
+	}
+	// Loopback by default: an unconfigured bind must not listen on every
+	// interface. This assertion previously expected ":9999", which is the
+	// bug — an address with no host part binds 0.0.0.0.
+	if inst.HTTPServer.Addr != "127.0.0.1:9999" {
+		t.Errorf("expected addr '127.0.0.1:9999', got '%s'", inst.HTTPServer.Addr)
+	}
+}
+
+func TestGatewayBuilder_Build_BindResolution(t *testing.T) {
+	tests := []struct {
+		name      string
+		cfgBind   string
+		stackBind string
+		want      string
+	}{
+		{"defaults to loopback", "", "", "127.0.0.1:9999"},
+		{"flag widens", "0.0.0.0", "", "0.0.0.0:9999"},
+		{"stack field widens", "", "0.0.0.0", "0.0.0.0:9999"},
+		{"flag beats stack field", "127.0.0.1", "0.0.0.0", "127.0.0.1:9999"},
+		{"ipv6 is bracketed", "::1", "", "[::1]:9999"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stack := &config.Stack{Name: "test"}
+			if tt.stackBind != "" {
+				stack.Gateway = &config.GatewayConfig{Bind: tt.stackBind}
+			}
+			// This test is about address resolution, not the auth gate; a
+			// widened bind with no auth otherwise refuses to start.
+			builder := NewGatewayBuilder(
+				Config{Port: 9999, Bind: tt.cfgBind, AllowUnauthenticated: true}, stack, "/path/stack.yaml",
+				runtime.NewOrchestrator(nil, nil), &runtime.UpResult{})
+			builder.registryDir = t.TempDir()
+
+			inst, err := builder.Build(false)
+			if err != nil {
+				t.Fatalf("Build() returned error: %v", err)
+			}
+			if inst.HTTPServer.Addr != tt.want {
+				t.Errorf("expected addr %q, got %q", tt.want, inst.HTTPServer.Addr)
+			}
+		})
+	}
+}
+
+func TestConfig_BindIsLoopback(t *testing.T) {
+	tests := []struct {
+		bind string
+		want bool
+	}{
+		{"", true}, // unset resolves to the loopback default
+		{"127.0.0.1", true},
+		{"127.0.0.53", true}, // all of 127.0.0.0/8
+		{"::1", true},
+		{"localhost", true},
+		{"0.0.0.0", false},
+		{"10.0.0.5", false},
+		{"not-an-address", false}, // unvettable, so warn rather than stay silent
+	}
+	for _, tt := range tests {
+		t.Run(tt.bind, func(t *testing.T) {
+			if got := (Config{Bind: tt.bind}).BindIsLoopback(); got != tt.want {
+				t.Errorf("BindIsLoopback(%q) = %v, want %v", tt.bind, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGatewayBuilder_Build_WithVault(t *testing.T) {
+	regDir := t.TempDir()
+	cfg := Config{Port: 8180}
+	stack := &config.Stack{Name: "test"}
+	rt := runtime.NewOrchestrator(nil, nil)
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", rt, &runtime.UpResult{})
+	builder.registryDir = regDir
+	builder.SetVaultStore(vault.NewStore(t.TempDir()))
+
+	inst, err := builder.Build(false)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+	if inst.APIServer == nil {
+		t.Fatal("expected non-nil APIServer")
+	}
+}
+
+func TestGatewayBuilder_Build_WebFSError_Verbose(t *testing.T) {
+	regDir := t.TempDir()
+	cfg := Config{Port: 8180}
+	stack := &config.Stack{Name: "test"}
+	rt := runtime.NewOrchestrator(nil, nil)
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", rt, &runtime.UpResult{})
+	builder.registryDir = regDir
+	builder.SetWebFS(func() (fs.FS, error) {
+		return nil, fmt.Errorf("no embedded web UI")
+	})
+
+	// Build with verbose=true to trigger the warning branch
+	inst, err := builder.Build(true)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+	if inst.Gateway == nil {
+		t.Fatal("expected non-nil Gateway")
+	}
+}
+
+func TestGatewayBuilder_Build_WebFSSuccess(t *testing.T) {
+	regDir := t.TempDir()
+	cfg := Config{Port: 8180}
+	stack := &config.Stack{Name: "test"}
+	rt := runtime.NewOrchestrator(nil, nil)
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", rt, &runtime.UpResult{})
+	builder.registryDir = regDir
+	builder.SetWebFS(func() (fs.FS, error) {
+		return os.DirFS(t.TempDir()), nil
+	})
+
+	inst, err := builder.Build(false)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+	if inst.APIServer == nil {
+		t.Fatal("expected non-nil APIServer")
+	}
+}
+
+// TestGatewayBuilder_PersistedLogsArriveOnDisk drives a record through the
+// canonical pkg/mcp/gateway pattern (clientLogger := g.logger.With("server", name))
+// and asserts the per-server logs.jsonl receives the entry. Locks in the
+// router-side fix that recognizes "server" as a routing key.
+func TestGatewayBuilder_PersistedLogsArriveOnDisk(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	regDir := t.TempDir()
+	stack := &config.Stack{
+		Name: "teststack",
+		Telemetry: &config.TelemetryConfig{
+			Persist: config.TelemetryPersistence{Logs: true},
+		},
+		MCPServers: []config.MCPServer{
+			{Name: "github"},
+		},
+	}
+	cfg := Config{Port: 8181}
+	rt := runtime.NewOrchestrator(nil, nil)
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", rt, &runtime.UpResult{})
+	builder.registryDir = regDir
+
+	inst, err := builder.Build(false)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+
+	// Mirror gateway.go:900: clientLogger := logger.With("server", name).
+	clientLogger := slog.New(inst.Handler).With("server", "github")
+	clientLogger.Info("server registered", "transport", "stdio")
+
+	// Lumberjack writes through synchronously inside slog handler, so the
+	// file should be non-empty by the time Handle returns. Read it and
+	// verify the message round-trips through JSON.
+	path, perr := state.TelemetryServerPath(stack.Name, "github", "logs")
+	if perr != nil {
+		t.Fatalf("path: %v", perr)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	var entries []map[string]any
+	for scanner.Scan() {
+		var rec map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
+			t.Fatalf("malformed json line %q: %v", scanner.Text(), err)
+		}
+		entries = append(entries, rec)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatalf("logs.jsonl is empty — record was not routed to disk via server attr")
+	}
+	if got := entries[0]["msg"]; got != "server registered" {
+		t.Errorf("msg = %v, want %q", got, "server registered")
+	}
+	if got := entries[0]["server"]; got != "github" {
+		t.Errorf("server attr lost on disk: %v", entries[0])
+	}
+}
+
+func TestNewGatewayBuilder_Fields(t *testing.T) {
+	cfg := Config{Port: 8080, NoExpand: true}
+	stack := &config.Stack{Name: "mystack"}
+	rt := runtime.NewOrchestrator(nil, nil)
+	result := &runtime.UpResult{}
+
+	b := NewGatewayBuilder(cfg, stack, "/path/to/stack.yaml", rt, result)
+	if b.config.Port != 8080 {
+		t.Errorf("expected port 8080, got %d", b.config.Port)
+	}
+	if b.stackPath != "/path/to/stack.yaml" {
+		t.Errorf("expected stackPath '/path/to/stack.yaml', got '%s'", b.stackPath)
+	}
+	if b.stack.Name != "mystack" {
+		t.Errorf("expected stack name 'mystack', got '%s'", b.stack.Name)
+	}
+}
+
+func TestGatewayBuilder_PrintEndpoints(t *testing.T) {
+	regDir := t.TempDir()
+	cfg := Config{Port: 8888}
+	stack := &config.Stack{Name: "test"}
+	rt := runtime.NewOrchestrator(nil, nil)
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", rt, &runtime.UpResult{})
+	builder.registryDir = regDir
+
+	inst, err := builder.Build(false)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+
+	// Should not panic
+	builder.printEndpoints(inst)
+}
+
+func TestGatewayBuilder_SetupHotReload_NoWatch(t *testing.T) {
+	regDir := t.TempDir()
+	cfg := Config{Port: 8180, Watch: false}
+	stack := &config.Stack{Name: "test"}
+	rt := runtime.NewOrchestrator(nil, nil)
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", rt, &runtime.UpResult{})
+	builder.registryDir = regDir
+	builder.homeDir = t.TempDir()
+
+	inst, err := builder.Build(false)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+
+	handler := logging.NewRedactingHandler(logging.NewBufferHandler(logging.NewLogBuffer(100), nil))
+	registrar := NewServerRegistrar(inst.Gateway, false)
+
+	// The registry dir watcher starts regardless of Watch; the context
+	// must be canceled or its goroutine outlives the test and fires on
+	// t.TempDir cleanup.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Should set up reload handler but not start the stack watcher
+	builder.setupHotReload(ctx, inst, registrar, handler, false)
+}
+
+func TestGatewayBuilder_SetupHotReload_NoWatch_Verbose(t *testing.T) {
+	regDir := t.TempDir()
+	cfg := Config{Port: 8180, Watch: false, NoExpand: true}
+	stack := &config.Stack{Name: "test"}
+	rt := runtime.NewOrchestrator(nil, nil)
+	builder := NewGatewayBuilder(cfg, stack, "/path/stack.yaml", rt, &runtime.UpResult{})
+	builder.registryDir = regDir
+	builder.homeDir = t.TempDir()
+
+	inst, err := builder.Build(false)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+
+	handler := logging.NewRedactingHandler(logging.NewBufferHandler(logging.NewLogBuffer(100), nil))
+	registrar := NewServerRegistrar(inst.Gateway, false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Setup with verbose=true for additional print coverage
+	builder.setupHotReload(ctx, inst, registrar, handler, true)
+}
+
+// TestReconcileSkillProjections_EmptyStoreLeavesHomeUntouched
+// reproduces the incident where a registry refresh against an empty
+// test store deleted real skill projections: with the home injected at
+// the controller boundary and the skillsync empty-store guard in
+// place, a recorded projection and its lockfile must survive a
+// reconcile against a store with no skills.
+func TestReconcileSkillProjections_EmptyStoreLeavesHomeUntouched(t *testing.T) {
+	home := t.TempDir()
+
+	// Seed a recorded projection in the sandbox home: a symlink target
+	// plus the lockfile entry that owns it.
+	src := filepath.Join(home, ".gridctl", "registry", "skills", "alpha")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, ".claude", "skills", "alpha")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(src, target); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(home, ".gridctl", "skillsync.lock.yaml")
+	lock := "version: 1\nprojections:\n  alpha:\n    claude-code:\n      channel: symlink\n      target: " + target + "\n      created_by_gridctl: true\n      synced_at: 2026-07-31T00:00:00Z\n"
+	if err := os.WriteFile(lockPath, []byte(lock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Build against an empty registry store, exactly what the leaked
+	// watcher once reconciled against.
+	builder := NewGatewayBuilder(Config{Port: 8180}, &config.Stack{Name: "test"}, "/path/stack.yaml", runtime.NewOrchestrator(nil, nil), &runtime.UpResult{})
+	builder.registryDir = t.TempDir()
+	builder.homeDir = home
+
+	inst, err := builder.Build(false)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+
+	handler := logging.NewRedactingHandler(logging.NewBufferHandler(logging.NewLogBuffer(100), nil))
+	reconcileSkillProjections(context.Background(), inst, home, slog.New(handler))
+
+	if _, err := os.Lstat(target); err != nil {
+		t.Fatalf("projection symlink must survive reconcile against an empty store: %v", err)
+	}
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("lockfile must survive reconcile against an empty store: %v", err)
+	}
+	if !strings.Contains(string(data), "alpha") {
+		t.Errorf("lockfile lost its projection entry:\n%s", data)
+	}
+}
+
+func TestGatewayBuilder_SetupHotReload_WithWatch(t *testing.T) {
+	regDir := t.TempDir()
+	// Create a temporary stack file for the watcher
+	stackFile := filepath.Join(regDir, "stack.yaml")
+	if err := os.WriteFile(stackFile, []byte("name: test\n"), 0644); err != nil {
+		t.Fatalf("writing stack file: %v", err)
+	}
+
+	cfg := Config{Port: 8180, Watch: true}
+	stack := &config.Stack{Name: "test"}
+	rt := runtime.NewOrchestrator(nil, nil)
+	builder := NewGatewayBuilder(cfg, stack, stackFile, rt, &runtime.UpResult{})
+	builder.registryDir = regDir
+	builder.homeDir = t.TempDir()
+
+	inst, err := builder.Build(false)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+
+	handler := logging.NewRedactingHandler(logging.NewBufferHandler(logging.NewLogBuffer(100), nil))
+	registrar := NewServerRegistrar(inst.Gateway, false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // Stop the watchers even on early failure
+	// Should set up reload handler and start watcher
+	builder.setupHotReload(ctx, inst, registrar, handler, true)
+}
+
+// TestGatewayBuilder_RefusesUnauthenticatedExposure is the regression case:
+// before this, a widened bind with no auth started and served the API to the
+// network with only a log warning.
+func TestGatewayBuilder_RefusesUnauthenticatedExposure(t *testing.T) {
+	withAuth := func() *config.Stack {
+		return &config.Stack{Name: "test", Gateway: &config.GatewayConfig{
+			Auth: &config.AuthConfig{Type: "bearer", Token: "secret"},
+		}}
+	}
+	tests := []struct {
+		name      string
+		bind      string
+		allowFlag bool
+		stack     func() *config.Stack
+		wantErr   bool
+	}{
+		{"widened bind with no auth refuses", "0.0.0.0", false, func() *config.Stack {
+			return &config.Stack{Name: "test"}
+		}, true},
+		{"widened bind with auth starts", "0.0.0.0", false, withAuth, false},
+		{"loopback with no auth starts", "127.0.0.1", false, func() *config.Stack {
+			return &config.Stack{Name: "test"}
+		}, false},
+		{"default bind with no auth starts", "", false, func() *config.Stack {
+			return &config.Stack{Name: "test"}
+		}, false},
+		{"escape hatch flag permits it", "0.0.0.0", true, func() *config.Stack {
+			return &config.Stack{Name: "test"}
+		}, false},
+		{"escape hatch config field permits it", "0.0.0.0", false, func() *config.Stack {
+			return &config.Stack{Name: "test", Gateway: &config.GatewayConfig{
+				InsecureAllowUnauthenticated: true,
+			}}
+		}, false},
+		{"empty auth token does not count as configured", "0.0.0.0", false, func() *config.Stack {
+			return &config.Stack{Name: "test", Gateway: &config.GatewayConfig{
+				Auth: &config.AuthConfig{Type: "bearer", Token: ""},
+			}}
+		}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			builder := NewGatewayBuilder(
+				Config{Port: 9999, Bind: tt.bind, AllowUnauthenticated: tt.allowFlag},
+				tt.stack(), "/path/stack.yaml",
+				runtime.NewOrchestrator(nil, nil), &runtime.UpResult{})
+			builder.registryDir = t.TempDir()
+
+			_, err := builder.Build(false)
+			if tt.wantErr {
+				if !errors.Is(err, ErrUnauthenticatedExposure) {
+					t.Fatalf("expected ErrUnauthenticatedExposure, got %v", err)
+				}
+				// The message is the deliverable: a bare refusal reads as
+				// gridctl being broken, so every remedy must be named.
+				for _, want := range []string{"gateway.auth", "loopback", "insecure-allow-unauthenticated"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("refusal message must name %q, got:\n%s", want, err)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected start, got %v", err)
+			}
+		})
+	}
+}

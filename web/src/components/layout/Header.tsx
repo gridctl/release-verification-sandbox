@@ -1,0 +1,199 @@
+import { RefreshCw, RotateCcw, Plus, Command } from 'lucide-react';
+import { useState, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
+import { useNavigate } from 'react-router';
+import { cn } from '../../lib/cn';
+import { IconButton } from '../ui/IconButton';
+import { useStackStore } from '../../stores/useStackStore';
+import { useUIStore } from '../../stores/useUIStore';
+import { triggerReload, fetchStackSpec, validateStackSpec } from '../../lib/api';
+import { SpecDiffModal } from '../spec/SpecDiffModal';
+import { CreationWizard } from '../wizard/CreationWizard';
+import { GlobalContextDialog } from '../context/GlobalContextDialog';
+import { HeaderTelemetryPill } from '../telemetry/HeaderTelemetryPill';
+import { useSpecStore } from '../../stores/useSpecStore';
+import { useWizardStore } from '../../stores/useWizardStore';
+import { LogoWordmark } from './LogoWordmark';
+import { ThemePicker } from '../shell/ThemePicker';
+import { WorkspaceSwitcher } from '../shell/WorkspaceSwitcher';
+
+interface HeaderProps {
+  onRefresh?: () => void;
+  isRefreshing?: boolean;
+}
+
+export function Header({ onRefresh, isRefreshing }: HeaderProps) {
+  const navigate = useNavigate();
+  const connectionStatus = useStackStore((s) => s.connectionStatus);
+
+  const toggleCommandPalette = useUIStore((s) => s.toggleCommandPalette);
+  const [isReloading, setIsReloading] = useState(false);
+  // Global Context dialog, reachable from the creation wizard's tile.
+  const [showGlobalContext, setShowGlobalContext] = useState(false);
+  const [reloadMessage, setReloadMessage] = useState<{ text: string; isError: boolean } | null>(null);
+  const [validationErrors, setValidationErrors] = useState<string[]>([]);
+  const dismissTimer = useRef<ReturnType<typeof setTimeout>>(null);
+
+  const executeReload = useCallback(async () => {
+    setIsReloading(true);
+    setReloadMessage(null);
+    if (dismissTimer.current) clearTimeout(dismissTimer.current);
+
+    try {
+      const result = await triggerReload();
+      setReloadMessage({ text: result.message, isError: !result.success });
+      // On successful reload, promote the pending spec (what the user approved)
+      // to the applied baseline. Fall back to current spec for direct reloads.
+      if (result.success) {
+        const store = useSpecStore.getState();
+        const applied = store.pendingSpec
+          ? { path: store.spec?.path ?? '', content: store.pendingSpec }
+          : store.spec;
+        if (applied) {
+          store.setAppliedSpec(applied);
+        }
+      }
+    } catch (err) {
+      setReloadMessage({
+        text: err instanceof Error ? err.message : 'Reload failed',
+        isError: true,
+      });
+    } finally {
+      setIsReloading(false);
+      dismissTimer.current = setTimeout(() => setReloadMessage(null), 4000);
+    }
+  }, []);
+
+  const handleReload = useCallback(async () => {
+    // Fetch the new spec from disk and diff against the applied baseline
+    try {
+      const newSpec = await fetchStackSpec();
+      const store = useSpecStore.getState();
+
+      // Seed appliedSpec on first use (e.g. user never opened Spec tab)
+      if (!store.appliedSpec) {
+        store.setAppliedSpec(newSpec);
+      }
+
+      const appliedSpec = useSpecStore.getState().appliedSpec;
+
+      // If the disk spec differs from what the gateway last applied, show diff
+      if (appliedSpec && newSpec.content !== appliedSpec.content) {
+        // Validate the new spec
+        const result = await validateStackSpec(newSpec.content);
+        const errors = (result.issues ?? [])
+          .filter((i) => i.severity === 'error')
+          .map((i) => `${i.field}: ${i.message}`);
+        setValidationErrors(errors);
+        useSpecStore.getState().openDiffModal(newSpec.content);
+        return;
+      }
+
+    } catch {
+      // If spec fetch fails, fall through to direct reload
+    }
+
+    executeReload();
+  }, [executeReload]);
+
+  // Connection state and server health are surfaced continuously in the global
+  // StatusBar; the header no longer mirrors them. We keep `isConnected` only to
+  // gate the persistence control, which is meaningless before the gateway is up.
+  const isConnected = connectionStatus === 'connected';
+
+  return (
+    <header className="h-14 bg-surface/80 backdrop-blur-xl border-b border-border/50 flex items-center justify-between px-5 relative z-30">
+      {/* Subtle gradient line at top */}
+      <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-primary/30 to-transparent" />
+
+      {/* Left: Logo + Workspace Switcher. The gateway version is deliberately
+          absent here. It is a property of the gateway reported over
+          /api/status, not of the UI shell, so it belongs with the gateway's
+          other properties on the canvas node and inspector sidebar rather than
+          beside the wordmark. */}
+      <div className="flex items-center gap-4">
+        {/* Brand Logo — inline so "ctl" follows the theme (readable on light) */}
+        <LogoWordmark className="h-10 w-auto block" />
+        <WorkspaceSwitcher />
+      </div>
+
+      {/* Reload notification */}
+      {reloadMessage && (
+        <div className={cn(
+          'absolute top-full left-1/2 -translate-x-1/2 mt-2 z-50',
+          'px-4 py-2 rounded-lg backdrop-blur-xl border shadow-lg',
+          'text-xs font-medium transition-all duration-300 animate-fade-in-scale',
+          reloadMessage.isError
+            ? 'bg-status-error/10 border-status-error/20 text-status-error'
+            : 'bg-status-running/10 border-status-running/20 text-status-running'
+        )}>
+          {reloadMessage.text}
+        </div>
+      )}
+
+      {/* Right: Persistence quick-toggle + Actions. Persistence is the one
+          genuinely actionable control from the old status cluster, so it stays
+          in the header next to the other actions. */}
+      <div className="flex items-center gap-2">
+        {isConnected && <HeaderTelemetryPill />}
+        {isConnected && <div className="w-px h-5 bg-border/50 mx-0.5" />}
+        {/* Appearance (light/dark/system) — prominent in the action cluster */}
+        <ThemePicker variant="header" placement="down" />
+        <div className="w-px h-5 bg-border/50 mx-0.5" />
+        <IconButton
+          icon={Command}
+          onClick={toggleCommandPalette}
+          tooltip="Command Palette (⌘K)"
+          className="hover:text-primary hover:border-primary/30"
+        />
+        <IconButton
+          icon={Plus}
+          onClick={() => useWizardStore.getState().open()}
+          tooltip="Create Resource"
+          className="hover:text-primary hover:border-primary/30"
+        />
+        <IconButton
+          icon={RefreshCw}
+          onClick={onRefresh}
+          disabled={isRefreshing}
+          className={cn(
+            isRefreshing && 'animate-spin',
+            'hover:text-primary hover:border-primary/30'
+          )}
+          tooltip="Refresh (⌘R)"
+        />
+        <IconButton
+          icon={RotateCcw}
+          onClick={handleReload}
+          disabled={isReloading}
+          className={cn(
+            isReloading && 'animate-spin',
+            'hover:text-secondary hover:border-secondary/30'
+          )}
+          tooltip="Reload Config"
+        />
+      </div>
+      <SpecDiffModal
+        onApply={executeReload}
+        validationErrors={validationErrors}
+      />
+      <CreationWizard
+        onOpenVault={() => navigate('/vault')}
+        onOpenGlobalContext={() => setShowGlobalContext(true)}
+        onOpenConnections={() => navigate('/connections?spotlight=unlinked')}
+        onDeploy={onRefresh}
+      />
+      {/* Portaled: the header's backdrop-blur creates a containing block
+          that would trap the dialog's fixed positioning inside the 56px
+          header (same reason CreationWizard portals). */}
+      {showGlobalContext &&
+        createPortal(
+          <GlobalContextDialog
+            isOpen={showGlobalContext}
+            onClose={() => setShowGlobalContext(false)}
+          />,
+          document.body,
+        )}
+    </header>
+  );
+}

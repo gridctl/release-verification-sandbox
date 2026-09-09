@@ -1,0 +1,753 @@
+package mcp
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"os"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/gridctl/gridctl/pkg/logging"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/clientcredentials"
+)
+
+// Default HTTP timeout for OpenAPI requests
+const defaultOpenAPITimeout = 30 * time.Second
+
+// Maximum response body size (10MB) to prevent memory exhaustion
+const maxResponseBodySize = 10 * 1024 * 1024
+
+// OpenAPIClient implements AgentClient by transforming OpenAPI operations to MCP tools.
+// It parses an OpenAPI specification and converts each operation into an MCP tool,
+// proxying tool calls to HTTP requests against the target API.
+type OpenAPIClient struct {
+	ClientBase
+	name       string
+	spec       string
+	baseURL    string
+	authType   string
+	authToken  string
+	authHeader string
+	authValue  string
+	includeOps map[string]bool
+	excludeOps map[string]bool
+	httpClient *http.Client
+	logger     *slog.Logger
+	noExpand   bool // If true, skip environment variable expansion in spec file
+
+	// Query param auth
+	authQueryParam string
+	authQueryValue string
+
+	// Basic auth
+	basicUsername string
+	basicPassword string
+
+	// OAuth2 client credentials — non-nil when authType == "oauth2"
+	tokenSource oauth2.TokenSource
+
+	operations map[string]*OpenAPIOperation // toolName -> operation (protected by ClientBase.mu)
+	cachedDoc  *openapi3.T                  // Cached OpenAPI document (protected by ClientBase.mu)
+
+	pingTimeout time.Duration // 0 = use DefaultPingTimeout
+}
+
+// SetPingTimeout overrides the per-ping deadline used by Ping. Zero restores
+// the default (DefaultPingTimeout).
+func (c *OpenAPIClient) SetPingTimeout(d time.Duration) {
+	c.pingTimeout = d
+}
+
+// OpenAPIOperation holds parsed OpenAPI operation details for execution.
+type OpenAPIOperation struct {
+	Method       string
+	Path         string
+	PathParams   []string // Parameter names in path order (always required)
+	QueryParams  map[string]*openapi3.Parameter
+	HeaderParams map[string]*openapi3.Parameter
+	RequestBody  *openapi3.RequestBodyRef
+}
+
+// NewOpenAPIClient creates an OpenAPI-based MCP client.
+func NewOpenAPIClient(name string, cfg *OpenAPIClientConfig) (*OpenAPIClient, error) {
+	c := &OpenAPIClient{
+		name:           name,
+		spec:           cfg.Spec,
+		baseURL:        cfg.BaseURL,
+		authType:       cfg.AuthType,
+		authToken:      cfg.AuthToken,
+		authHeader:     cfg.AuthHeader,
+		authValue:      cfg.AuthValue,
+		authQueryParam: cfg.AuthQueryParam,
+		authQueryValue: cfg.AuthQueryValue,
+		basicUsername:  cfg.BasicUsername,
+		basicPassword:  cfg.BasicPassword,
+		logger:         logging.NewDiscardLogger(),
+		operations:     make(map[string]*OpenAPIOperation),
+		noExpand:       cfg.NoExpand,
+	}
+
+	if len(cfg.Include) > 0 {
+		c.includeOps = make(map[string]bool)
+		for _, op := range cfg.Include {
+			c.includeOps[op] = true
+		}
+	}
+	if len(cfg.Exclude) > 0 {
+		c.excludeOps = make(map[string]bool)
+		for _, op := range cfg.Exclude {
+			c.excludeOps[op] = true
+		}
+	}
+
+	httpClient, err := NewOpenAPIHTTPClient(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSCAFile, cfg.TLSInsecureSkipVerify)
+	if err != nil {
+		return nil, err
+	}
+	c.httpClient = httpClient
+
+	// Build OAuth2 token source for client credentials flow
+	if cfg.AuthType == "oauth2" {
+		ccCfg := &clientcredentials.Config{
+			ClientID:     cfg.OAuth2ClientID,
+			ClientSecret: cfg.OAuth2ClientSecret,
+			TokenURL:     cfg.OAuth2TokenURL,
+			Scopes:       cfg.OAuth2Scopes,
+		}
+		// Use background context so the token source outlives individual requests
+		c.tokenSource = ccCfg.TokenSource(context.Background())
+	}
+
+	return c, nil
+}
+
+// Name returns the client name.
+func (c *OpenAPIClient) Name() string {
+	return c.name
+}
+
+// SetLogger sets the logger for this client.
+func (c *OpenAPIClient) SetLogger(logger *slog.Logger) {
+	if logger != nil {
+		c.logger = logger
+	}
+}
+
+// Initialize loads and parses the OpenAPI spec.
+func (c *OpenAPIClient) Initialize(ctx context.Context) error {
+	doc, err := c.loadSpec(ctx)
+	if err != nil {
+		return fmt.Errorf("loading OpenAPI spec: %w", err)
+	}
+
+	// Validate the spec — downgrade known OpenAPI 3.1 compat issues to warnings
+	if err := doc.Validate(ctx); err != nil {
+		if isOpenAPI31CompatError(err) {
+			c.logger.Warn("OpenAPI spec validation issue (continuing anyway)", "error", err)
+		} else {
+			return fmt.Errorf("validating OpenAPI spec: %w", err)
+		}
+	}
+
+	// Determine base URL from spec if not overridden
+	if c.baseURL == "" && len(doc.Servers) > 0 {
+		c.baseURL = doc.Servers[0].URL
+	}
+
+	// Validate that we have a base URL
+	if c.baseURL == "" {
+		return fmt.Errorf("no base URL: either configure baseUrl or ensure the OpenAPI spec has a servers entry")
+	}
+
+	c.mu.Lock()
+	c.cachedDoc = doc
+	c.initialized = true
+	c.serverInfo = ServerInfo{
+		Name:    doc.Info.Title,
+		Version: doc.Info.Version,
+	}
+	c.mu.Unlock()
+
+	return nil
+}
+
+// RefreshTools builds MCP tools from OpenAPI operations.
+// OpenAPIClient applies config-time include/exclude filters here. The runtime
+// whitelist is applied at read time by ClientBase.Tools(), so the full
+// post-include/exclude set is cached to let the UI widen the whitelist.
+func (c *OpenAPIClient) RefreshTools(ctx context.Context) error {
+	c.mu.RLock()
+	doc := c.cachedDoc
+	c.mu.RUnlock()
+
+	if doc == nil {
+		var err error
+		doc, err = c.loadSpec(ctx)
+		if err != nil {
+			return err
+		}
+	}
+
+	var tools []Tool
+	operations := make(map[string]*OpenAPIOperation)
+
+	if doc.Paths == nil {
+		c.mu.Lock()
+		c.allTools = tools
+		c.operations = operations
+		c.mu.Unlock()
+		return nil
+	}
+
+	// EnumerateOperations is shared with the wizard preview so both agree on
+	// which operations exist and which are unusable. Skipped entries are the
+	// ones that could never become tools (no operationId, or a sanitized name
+	// that comes out empty); the include/exclude filter is applied here because
+	// it is client state, not a property of the spec.
+	for _, summary := range EnumerateOperations(doc) {
+		if summary.Skipped {
+			continue
+		}
+		if !c.shouldInclude(summary.OperationID) {
+			continue
+		}
+
+		tool, operation := c.operationToTool(summary.Method, summary.Path, summary.op)
+		tools = append(tools, tool)
+		operations[tool.Name] = operation
+	}
+
+	c.mu.Lock()
+	c.allTools = tools
+	c.operations = operations
+	c.mu.Unlock()
+
+	return nil
+}
+
+// CallTool executes an OpenAPI operation.
+func (c *OpenAPIClient) CallTool(ctx context.Context, name string, args map[string]any) (*ToolCallResult, error) {
+	c.logger.Debug("sending request", "method", "tools/call", "tool", name)
+
+	c.mu.RLock()
+	op, ok := c.operations[name]
+	c.mu.RUnlock()
+
+	if !ok {
+		return &ToolCallResult{
+			Content: []Content{NewTextContent(fmt.Sprintf("unknown tool: %s", name))},
+			IsError: true,
+		}, nil
+	}
+
+	// Validate required path parameters are present
+	for _, paramName := range op.PathParams {
+		if _, ok := args[paramName]; !ok {
+			return &ToolCallResult{
+				Content: []Content{NewTextContent(fmt.Sprintf("missing required path parameter: %s", paramName))},
+				IsError: true,
+			}, nil
+		}
+	}
+
+	// Build and execute HTTP request
+	resp, statusCode, err := c.executeOperation(ctx, op, args)
+	if err != nil {
+		c.logger.Debug("request failed", "tool", name, "error", err)
+		return &ToolCallResult{
+			Content: []Content{NewTextContent(fmt.Sprintf("error: %v", err))},
+			IsError: true,
+		}, nil
+	}
+
+	// Check for error status codes
+	if statusCode >= 400 {
+		c.logger.Debug("received error response", "tool", name, "status", statusCode)
+		return &ToolCallResult{
+			Content: []Content{NewTextContent(fmt.Sprintf("HTTP %d: %s", statusCode, resp))},
+			IsError: true,
+		}, nil
+	}
+
+	c.logger.Debug("received response", "tool", name, "status", statusCode)
+	return &ToolCallResult{
+		Content: []Content{NewTextContent(resp)},
+	}, nil
+}
+
+// Ping checks if the OpenAPI backend is reachable by making a HEAD request to the base URL.
+func (c *OpenAPIClient) Ping(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, pingTimeoutOrDefault(c.pingTimeout))
+	defer cancel()
+
+	if c.baseURL == "" {
+		return fmt.Errorf("no base URL configured")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "HEAD", c.baseURL, nil)
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+
+	if err := c.applyAuth(req); err != nil {
+		return err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// loadSpec loads the OpenAPI spec from URL or file.
+func (c *OpenAPIClient) loadSpec(ctx context.Context) (*openapi3.T, error) {
+	return loadSpecFrom(ctx, c.spec, c.httpClient, c.noExpand, true)
+}
+
+// loadSpecFrom loads and parses an OpenAPI document from a URL or file path.
+//
+// Shared by the deployed client and the wizard preview so the fetch cap,
+// content-type rejection, and env expansion cannot drift between them.
+// allowExternalRefs is a parameter rather than a constant because preview
+// deliberately declines to follow refs; see LoadOpenAPISpecForPreview.
+func loadSpecFrom(ctx context.Context, spec string, client *http.Client, noExpand, allowExternalRefs bool) (*openapi3.T, error) {
+	loader := openapi3.NewLoader()
+	loader.IsExternalRefsAllowed = allowExternalRefs
+	loader.Context = ctx // Propagate context for cancellation
+
+	if strings.HasPrefix(spec, "http://") || strings.HasPrefix(spec, "https://") {
+		data, err := fetchSpecFrom(ctx, spec, client)
+		if err != nil {
+			return nil, err
+		}
+		return loader.LoadFromData(data)
+	}
+
+	// Load from file
+	data, err := os.ReadFile(spec)
+	if err != nil {
+		return nil, fmt.Errorf("reading spec file: %w", err)
+	}
+
+	// Apply environment variable expansion for local files (unless disabled)
+	if !noExpand {
+		data = expandEnvVars(data)
+	}
+
+	return loader.LoadFromData(data)
+}
+
+// fetchSpecFrom fetches an OpenAPI spec from a URL with content-type validation.
+// Spec fetching is deliberately unauthenticated: the API credentials configured
+// for a server authenticate calls to the API, not retrieval of its description.
+func fetchSpecFrom(ctx context.Context, spec string, client *http.Client) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", spec, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating spec request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json, application/yaml, application/x-yaml")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetching spec from %s: %w", spec, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return nil, &SpecFetchError{URL: spec, StatusCode: resp.StatusCode}
+	}
+
+	// Reject HTML responses early with a clear error
+	ct := resp.Header.Get("Content-Type")
+	if strings.Contains(ct, "text/html") {
+		return nil, fmt.Errorf("URL returned content type %q instead of JSON or YAML — verify the spec URL points to the actual OpenAPI endpoint", ct)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize))
+	if err != nil {
+		return nil, fmt.Errorf("reading spec response: %w", err)
+	}
+
+	return data, nil
+}
+
+// isOpenAPI31CompatError returns true for validation errors caused by valid
+// OpenAPI 3.1 constructs that kin-openapi doesn't fully support (e.g., type: "null").
+func isOpenAPI31CompatError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, `unsupported 'type' value "null"`)
+}
+
+// shouldInclude checks if an operation should be included based on filters.
+func (c *OpenAPIClient) shouldInclude(operationID string) bool {
+	// If include list is set, operation must be in it
+	if len(c.includeOps) > 0 {
+		return c.includeOps[operationID]
+	}
+	// If exclude list is set, operation must not be in it
+	if len(c.excludeOps) > 0 {
+		return !c.excludeOps[operationID]
+	}
+	// No filters - include all
+	return true
+}
+
+// operationToTool converts an OpenAPI operation to an MCP tool.
+func (c *OpenAPIClient) operationToTool(method, path string, op *openapi3.Operation) (Tool, *OpenAPIOperation) {
+	pathParams := extractPathParams(path)
+	properties, required := c.buildParameterSchema(op, pathParams)
+	operation := c.buildOperation(method, path, pathParams, op)
+
+	// Path parameters are always required in OpenAPI
+	for _, p := range pathParams {
+		if !contains(required, p) {
+			required = append(required, p)
+		}
+	}
+
+	// Build input schema
+	inputSchema := map[string]any{
+		"type":       "object",
+		"properties": properties,
+	}
+	if len(required) > 0 {
+		inputSchema["required"] = required
+	}
+
+	// Marshal is safe here - inputSchema contains only primitives
+	inputSchemaBytes, _ := json.Marshal(inputSchema)
+
+	description := buildDescription(op)
+
+	return Tool{
+		Name:        sanitizeOpenAPIToolName(op.OperationID),
+		Description: description,
+		InputSchema: inputSchemaBytes,
+	}, operation
+}
+
+// extractPathParams extracts parameter names from a URL path template.
+func extractPathParams(path string) []string {
+	pathParamRegex := regexp.MustCompile(`\{([^}]+)\}`)
+	matches := pathParamRegex.FindAllStringSubmatch(path, -1)
+	params := make([]string, 0, len(matches))
+	for _, match := range matches {
+		params = append(params, match[1])
+	}
+	return params
+}
+
+// buildParameterSchema builds the JSON Schema properties and required list from operation parameters.
+func (c *OpenAPIClient) buildParameterSchema(op *openapi3.Operation, pathParams []string) (map[string]any, []string) {
+	properties := make(map[string]any)
+	var required []string
+
+	// Process parameters
+	for _, paramRef := range op.Parameters {
+		if paramRef == nil || paramRef.Value == nil {
+			continue
+		}
+		param := paramRef.Value
+
+		// Convert parameter schema to JSON Schema property
+		prop := c.parameterToProperty(param)
+		properties[param.Name] = prop
+
+		if param.Required {
+			required = append(required, param.Name)
+		}
+	}
+
+	// Process request body
+	if op.RequestBody != nil && op.RequestBody.Value != nil {
+		rb := op.RequestBody.Value
+		// Look for JSON content type
+		if content, ok := rb.Content["application/json"]; ok && content.Schema != nil {
+			bodySchema := c.schemaToJSONSchema(content.Schema)
+			properties["body"] = bodySchema
+
+			if rb.Required {
+				required = append(required, "body")
+			}
+		}
+	}
+
+	return properties, required
+}
+
+// buildOperation creates the operation struct from an OpenAPI operation.
+func (c *OpenAPIClient) buildOperation(method, path string, pathParams []string, op *openapi3.Operation) *OpenAPIOperation {
+	operation := &OpenAPIOperation{
+		Method:       method,
+		Path:         path,
+		PathParams:   pathParams,
+		QueryParams:  make(map[string]*openapi3.Parameter),
+		HeaderParams: make(map[string]*openapi3.Parameter),
+		RequestBody:  op.RequestBody,
+	}
+
+	// Store parameter info for execution
+	for _, paramRef := range op.Parameters {
+		if paramRef == nil || paramRef.Value == nil {
+			continue
+		}
+		param := paramRef.Value
+		switch param.In {
+		case "query":
+			operation.QueryParams[param.Name] = param
+		case "header":
+			operation.HeaderParams[param.Name] = param
+		}
+	}
+
+	return operation
+}
+
+// buildDescription creates a description from operation summary and description.
+func buildDescription(op *openapi3.Operation) string {
+	description := op.Summary
+	if op.Description != "" {
+		if description != "" {
+			description += ": " + op.Description
+		} else {
+			description = op.Description
+		}
+	}
+	return description
+}
+
+// parameterToProperty converts an OpenAPI parameter to a JSON Schema property.
+func (c *OpenAPIClient) parameterToProperty(param *openapi3.Parameter) map[string]any {
+	prop := make(map[string]any)
+
+	if param.Schema != nil && param.Schema.Value != nil {
+		schema := param.Schema.Value
+		if schema.Type != nil && len(*schema.Type) > 0 {
+			prop["type"] = (*schema.Type)[0]
+		}
+		if schema.Description != "" {
+			prop["description"] = schema.Description
+		} else if param.Description != "" {
+			prop["description"] = param.Description
+		}
+		if len(schema.Enum) > 0 {
+			prop["enum"] = schema.Enum
+		}
+		if schema.Default != nil {
+			prop["default"] = schema.Default
+		}
+	} else if param.Description != "" {
+		prop["description"] = param.Description
+		prop["type"] = "string" // Default to string if no schema
+	}
+
+	return prop
+}
+
+// schemaToJSONSchema converts an OpenAPI schema to a JSON Schema object.
+func (c *OpenAPIClient) schemaToJSONSchema(schemaRef *openapi3.SchemaRef) map[string]any {
+	if schemaRef == nil || schemaRef.Value == nil {
+		return map[string]any{"type": "object"}
+	}
+
+	schema := schemaRef.Value
+	result := make(map[string]any)
+
+	// Handle type
+	if schema.Type != nil && len(*schema.Type) > 0 {
+		result["type"] = (*schema.Type)[0]
+	}
+
+	// Handle description
+	if schema.Description != "" {
+		result["description"] = schema.Description
+	}
+
+	// Handle properties for objects
+	if len(schema.Properties) > 0 {
+		props := make(map[string]any)
+		for name, propRef := range schema.Properties {
+			props[name] = c.schemaToJSONSchema(propRef)
+		}
+		result["properties"] = props
+	}
+
+	// Handle required fields
+	if len(schema.Required) > 0 {
+		result["required"] = schema.Required
+	}
+
+	// Handle array items
+	if schema.Items != nil {
+		result["items"] = c.schemaToJSONSchema(schema.Items)
+	}
+
+	// Handle enum
+	if len(schema.Enum) > 0 {
+		result["enum"] = schema.Enum
+	}
+
+	return result
+}
+
+// executeOperation executes an HTTP request for the given operation.
+func (c *OpenAPIClient) executeOperation(ctx context.Context, op *OpenAPIOperation, args map[string]any) (string, int, error) {
+	// Build URL with path parameters substituted
+	path := op.Path
+	for _, paramName := range op.PathParams {
+		if val, ok := args[paramName]; ok {
+			// URL-encode the value to prevent injection
+			encoded := url.PathEscape(fmt.Sprintf("%v", val))
+			path = strings.Replace(path, "{"+paramName+"}", encoded, 1)
+		}
+	}
+
+	// Verify all path parameters were substituted
+	if strings.Contains(path, "{") {
+		return "", 0, fmt.Errorf("unsubstituted path parameters in: %s", path)
+	}
+
+	// Build query string
+	query := url.Values{}
+	for paramName := range op.QueryParams {
+		if val, ok := args[paramName]; ok {
+			query.Set(paramName, fmt.Sprintf("%v", val))
+		}
+	}
+
+	// Construct full URL
+	fullURL := strings.TrimSuffix(c.baseURL, "/") + path
+	if len(query) > 0 {
+		fullURL += "?" + query.Encode()
+	}
+
+	// Build request body
+	var bodyReader io.Reader
+	if body, ok := args["body"]; ok {
+		bodyBytes, err := json.Marshal(body)
+		if err != nil {
+			return "", 0, fmt.Errorf("marshaling request body: %w", err)
+		}
+		bodyReader = bytes.NewReader(bodyBytes)
+	}
+
+	// Create request
+	req, err := http.NewRequestWithContext(ctx, strings.ToUpper(op.Method), fullURL, bodyReader)
+	if err != nil {
+		return "", 0, fmt.Errorf("creating request: %w", err)
+	}
+
+	// Set headers
+	req.Header.Set("Accept", "application/json")
+	if bodyReader != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	// Add header parameters
+	for paramName := range op.HeaderParams {
+		if val, ok := args[paramName]; ok {
+			req.Header.Set(paramName, fmt.Sprintf("%v", val))
+		}
+	}
+
+	// Apply authentication
+	if err := c.applyAuth(req); err != nil {
+		return "", 0, err
+	}
+
+	// Execute request
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", 0, fmt.Errorf("executing request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response body with size limit to prevent memory exhaustion
+	limitedReader := io.LimitReader(resp.Body, maxResponseBodySize)
+	respBody, err := io.ReadAll(limitedReader)
+	if err != nil {
+		return "", resp.StatusCode, fmt.Errorf("reading response: %w", err)
+	}
+
+	return string(respBody), resp.StatusCode, nil
+}
+
+// applyAuth applies authentication to the request.
+func (c *OpenAPIClient) applyAuth(req *http.Request) error {
+	switch c.authType {
+	case "bearer":
+		if c.authToken != "" {
+			req.Header.Set("Authorization", "Bearer "+c.authToken)
+		}
+	case "header":
+		if c.authHeader != "" && c.authValue != "" {
+			req.Header.Set(c.authHeader, c.authValue)
+		}
+	case "query":
+		if c.authQueryParam != "" {
+			q := req.URL.Query()
+			q.Set(c.authQueryParam, c.authQueryValue)
+			req.URL.RawQuery = q.Encode()
+		}
+	case "basic":
+		req.SetBasicAuth(c.basicUsername, c.basicPassword)
+	case "oauth2":
+		tok, err := c.tokenSource.Token()
+		if err != nil {
+			return fmt.Errorf("fetching OAuth2 token: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+	}
+	return nil
+}
+
+// sanitizeOpenAPIToolName ensures the tool name is valid for MCP.
+// MCP tool names should match: ^[a-zA-Z0-9_-]{1,64}$
+func sanitizeOpenAPIToolName(name string) string {
+	// Replace invalid characters with underscores
+	result := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '_' || r == '-' {
+			return r
+		}
+		return '_'
+	}, name)
+
+	// Truncate if too long
+	if len(result) > 64 {
+		result = result[:64]
+	}
+
+	// Handle empty result (operationID was all invalid chars)
+	if result == "" || result == strings.Repeat("_", len(result)) {
+		return ""
+	}
+
+	return result
+}
+
+// contains checks if a slice contains a string.
+func contains(slice []string, s string) bool {
+	for _, v := range slice {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}

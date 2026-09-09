@@ -1,0 +1,458 @@
+import { memo } from 'react';
+import { Handle, Position } from '@xyflow/react';
+import { Terminal, Box, Hash, Globe, Wifi, Server, Cpu, KeyRound, HeartPulse, FileJson, FileOutput, Filter, Lock, ChevronRight, ChevronDown } from 'lucide-react';
+import { cn } from '../../lib/cn';
+import { PinDriftLink } from './PinDriftLink';
+import { Badge } from '../ui/Badge';
+import { StatusDot } from '../ui/StatusDot';
+import { getTransportIcon, getTransportColorClasses } from '../../lib/transport';
+import { useUIStore } from '../../stores/useUIStore';
+import { useStackStore } from '../../stores/useStackStore';
+import { useAccessLensStore } from '../../stores/useAccessLensStore';
+import { useTokenHeat } from '../../hooks/useTokenHeat';
+import { LAYOUT } from '../../lib/constants';
+import { TelemetryNodeDot } from '../telemetry/TelemetryNodeDot';
+import type { MCPServerNodeData, ResourceNodeData } from '../../types';
+
+export type CustomNodeData = MCPServerNodeData | ResourceNodeData;
+
+interface CustomNodeProps {
+  data: CustomNodeData;
+  selected?: boolean;
+}
+
+const CustomNode = memo(({ data, selected }: CustomNodeProps) => {
+  const isCompact = useUIStore((s) => s.compactCards);
+  const isServer = data.type === 'mcp-server';
+  const heatIntensity = useTokenHeat(isServer ? data.name : '');
+
+  // Tool fan-out expand/collapse (servers only). The node id matches the
+  // convention in lib/graph/nodes.ts (`mcp-<name>`).
+  const serverNodeId = `mcp-${data.name}`;
+  const isExpanded = useStackStore((s) => s.expandedServers.has(serverNodeId));
+  const toggleServerExpanded = useStackStore((s) => s.toggleServerExpanded);
+  const serverToolCount = isServer ? (data as MCPServerNodeData).toolCount : 0;
+  const canExpand = isServer && (serverToolCount ?? 0) > 0;
+
+  // Access Lens draft visuals: when the lens targets the currently-selected
+  // client, server nodes become grant/revoke targets. Granted = amber ring +
+  // inner glow; revoked = desaturated + dashed border. Reads the shared draft
+  // store so the canvas and the slide-over stay in sync.
+  const lensEnabled = useAccessLensStore((s) => s.enabled);
+  const lensClientSlug = useAccessLensStore((s) => s.clientSlug);
+  const selectedNodeId = useStackStore((s) => s.selectedNodeId);
+  const lensGranted = useAccessLensStore((s) => s.draft.includes(data.name));
+  const lensActiveForNode =
+    isServer && lensEnabled && lensClientSlug != null && selectedNodeId === `client-${lensClientSlug}`;
+  const isExternal = isServer && (data as MCPServerNodeData).external;
+  const isLocalProcess = isServer && (data as MCPServerNodeData).localProcess;
+  const isSSH = isServer && (data as MCPServerNodeData).ssh;
+  const isOpenAPI = isServer && (data as MCPServerNodeData).openapi;
+
+  // Choose icon - Globe for external, Cpu for local process, KeyRound for SSH, FileJson for OpenAPI, Terminal for container-based
+  const Icon = isServer ? (isExternal ? Globe : isLocalProcess ? Cpu : isSSH ? KeyRound : isOpenAPI ? FileJson : Terminal) : Box;
+
+  // Get transport info for MCP servers
+  const transport = isServer ? (data as MCPServerNodeData).transport : null;
+  const TransportIcon = getTransportIcon(transport);
+  const toolCount = isServer ? (data as MCPServerNodeData).toolCount : null;
+  const replicaCount = isServer ? (data as MCPServerNodeData).replicaCount ?? 1 : 1;
+  const autoscale = isServer ? (data as MCPServerNodeData).autoscale : undefined;
+  // Autoscale badge takes precedence over the static ×N badge.
+  const hasReplicas = isServer && !autoscale && replicaCount > 1;
+
+  // Get endpoint/containerId for MCP servers
+  const endpoint = isServer ? (data as MCPServerNodeData).endpoint : null;
+  const containerId = isServer ? (data as MCPServerNodeData).containerId : null;
+  const hasValidEndpoint = endpoint && endpoint !== 'unknown';
+  const hasValidContainerId = containerId && containerId !== 'unknown';
+
+  // Image for resources
+  const image = !isServer ? (data as ResourceNodeData).image : null;
+  const network = !isServer ? (data as ResourceNodeData).network : null;
+
+  return (
+    <div
+      className={cn(
+        'w-64 rounded-xl relative frost-surface',
+        'backdrop-blur-xl border transition-all duration-200 ease-out',
+        'shadow-bevel',
+        isServer
+          ? 'bg-gradient-to-br from-surface/95 to-violet-500/[0.03] border-border'
+          : 'bg-gradient-to-br from-surface/95 to-secondary/[0.02] border-border',
+        selected && isServer && 'border-violet-500 shadow-[0_0_15px_rgba(139,92,246,0.3)] ring-2 ring-violet-500/30',
+        selected && !isServer && 'border-secondary shadow-glow-secondary ring-2 ring-secondary/30',
+        // Autoscale decision ring: inset so it does not fight selection highlighting.
+        autoscale?.lastDecision === 'up' && 'ring-2 ring-inset ring-primary/40 animate-pulse-glow',
+        autoscale?.lastDecision === 'down' && 'ring-2 ring-inset ring-secondary/40',
+        !selected && 'hover:shadow-node-hover',
+        !selected && isServer && !lensActiveForNode && 'hover:border-violet-400/60',
+        !selected && !isServer && 'hover:border-secondary/70',
+        // Access Lens draft state (overrides the violet server accents).
+        lensActiveForNode && 'cursor-pointer',
+        lensActiveForNode && lensGranted &&
+          'border-white/70 ring-2 ring-white/40 shadow-[inset_0_0_24px_rgba(255,255,255,0.10),0_0_16px_rgba(255,255,255,0.16)]',
+        lensActiveForNode && !lensGranted &&
+          'border-dashed border-border/50 saturate-[0.35]'
+      )}
+      style={{
+        height: isCompact ? LAYOUT.NODE_HEIGHT_COMPACT : undefined,
+        ...(heatIntensity > 0 && !selected ? {
+          borderColor: `rgba(245, 158, 11, ${0.2 + heatIntensity * 0.5})`,
+          boxShadow: `0 0 ${8 + heatIntensity * 16}px rgba(245, 158, 11, ${heatIntensity * 0.3})`,
+        } : {}),
+      }}
+    >
+
+      {/* Header with gradient accent */}
+      <div className={cn(
+        'px-3 py-2.5 flex items-center justify-between relative',
+        !isCompact && 'border-b',
+        isServer
+          ? 'border-violet-500/10 bg-violet-500/[0.03]'
+          : 'border-secondary/10 bg-secondary/[0.03]'
+      )}>
+        {/* Accent line */}
+        <div className={cn(
+          'absolute top-0 left-0 right-0 h-px',
+          isServer
+            ? 'bg-gradient-to-r from-transparent via-violet-500/40 to-transparent'
+            : 'bg-gradient-to-r from-transparent via-secondary/40 to-transparent'
+        )} />
+
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div className={cn(
+            'p-1.5 rounded-lg border',
+            isServer
+              ? 'bg-violet-500/10 border-violet-500/20'
+              : 'bg-secondary/10 border-secondary/20'
+          )}>
+            <Icon
+              size={14}
+              className={cn(
+                isServer ? 'text-violet-400' : 'text-secondary'
+              )}
+            />
+          </div>
+          <span className="font-semibold text-sm text-text-primary truncate tracking-tight">
+            {data.name}
+          </span>
+        </div>
+
+        <div className="flex items-center gap-2 flex-shrink-0">
+          {/* Processing indicator for active playground tool calls */}
+          {isServer && (data as MCPServerNodeData).isProcessing && (
+            <div className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-cyan-400/10 border border-cyan-400/20">
+              <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
+              <span className="text-[9px] text-cyan-400 font-medium">active</span>
+            </div>
+          )}
+          {/* Autoscale live count: current/target. Takes precedence over the
+              static ×N badge so operators see reactive scale at a glance. */}
+          {isServer && autoscale && (
+            <span
+              className="text-[10px] text-violet-300/80 font-mono tracking-tight"
+              title={`Autoscale · current ${autoscale.current} / target ${autoscale.target}`}
+              aria-label={`Autoscale current ${autoscale.current} of target ${autoscale.target}`}
+            >
+              ×{autoscale.current}/{autoscale.target}
+            </span>
+          )}
+          {/* Inline replica count when > 1. Shown in both compact and full modes
+              so horizontal-scale servers are recognisable at a glance. */}
+          {hasReplicas && (
+            <span
+              className="text-[10px] text-violet-300/80 font-mono tracking-tight"
+              title={`${replicaCount} replicas`}
+              aria-label={`${replicaCount} replicas`}
+            >
+              ×{replicaCount}
+            </span>
+          )}
+          {/* Inline tool count in compact mode */}
+          {isCompact && isServer && toolCount !== null && toolCount !== undefined && (
+            <span className="text-[10px] text-text-muted font-mono">
+              {toolCount}t
+            </span>
+          )}
+          {/* Tool fan-out toggle. Stops propagation so it expands tools
+              without also selecting the node / opening the sidebar. */}
+          {canExpand && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                toggleServerExpanded(serverNodeId);
+              }}
+              aria-expanded={isExpanded}
+              aria-label={isExpanded ? `Collapse ${data.name} tools` : `Expand ${data.name} tools`}
+              title={isExpanded ? 'Collapse tools' : 'Expand tools'}
+              className={cn(
+                'flex items-center justify-center w-5 h-5 rounded-md border transition-colors duration-200',
+                isExpanded
+                  ? 'border-violet-500/40 bg-violet-500/15 text-violet-300'
+                  : 'border-border/50 text-text-muted hover:border-violet-400/50 hover:text-violet-300'
+              )}
+            >
+              {isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+            </button>
+          )}
+          <StatusDot status={data.status} pulse={!isCompact} />
+        </div>
+      </div>
+
+      {/* Body - hidden in compact mode */}
+      <div
+        className={cn(
+          'overflow-hidden transition-all duration-200 ease-out',
+          isCompact ? 'max-h-0 opacity-0 pointer-events-none' : 'max-h-96 opacity-100'
+        )}
+      >
+        <div className="p-3 space-y-2.5">
+          {/* Endpoint Row (for HTTP MCP servers) */}
+          {isServer && hasValidEndpoint && (
+            <div className="space-y-1">
+              <div className="flex items-center gap-1.5">
+                <Wifi size={10} className="text-secondary" />
+                <span className="text-[10px] uppercase tracking-widest font-medium text-text-muted">
+                  Endpoint
+                </span>
+              </div>
+              <div className="text-xs text-text-secondary font-mono truncate bg-background/50 px-2 py-1 rounded-md" title={endpoint}>
+                {endpoint}
+              </div>
+            </div>
+          )}
+
+          {/* Container Row (for stdio MCP servers) */}
+          {isServer && !hasValidEndpoint && hasValidContainerId && (
+            <div className="space-y-1">
+              <div className="flex items-center gap-1.5">
+                <Hash size={10} className="text-violet-400" />
+                <span className="text-[10px] uppercase tracking-widest font-medium text-text-muted">
+                  Container
+                </span>
+              </div>
+              <div className="text-xs text-text-secondary font-mono truncate bg-background/50 px-2 py-1 rounded-md" title={containerId}>
+                {containerId.slice(0, 12)}
+              </div>
+            </div>
+          )}
+
+          {/* Image Row (for resources) */}
+          {!isServer && image && (
+            <div className="space-y-1">
+              <span className="text-[10px] uppercase tracking-widest font-medium text-text-muted">
+                Image
+              </span>
+              <div className="text-xs text-text-secondary font-mono truncate bg-background/50 px-2 py-1 rounded-md" title={image}>
+                {image}
+              </div>
+            </div>
+          )}
+
+          {/* Transport + Format + Tool count (for MCP servers) */}
+          {isServer && transport && (
+            <div className="flex items-center justify-between text-xs pt-1">
+              <div className="flex items-center gap-1.5">
+                <div className={cn(
+                  'flex items-center gap-1.5 px-2 py-1 rounded-md',
+                  getTransportColorClasses(transport)
+                )}>
+                  <TransportIcon size={11} />
+                  <span className="uppercase text-[10px] tracking-wider font-medium">
+                    {transport}
+                  </span>
+                </div>
+                {isServer && (data as MCPServerNodeData).outputFormat && (data as MCPServerNodeData).outputFormat !== 'json' && (
+                  <div className="flex items-center gap-1 px-2 py-1 rounded-md bg-secondary/10 text-secondary">
+                    <FileOutput size={10} />
+                    <span className="uppercase text-[10px] tracking-wider font-medium">
+                      {(data as MCPServerNodeData).outputFormat}
+                    </span>
+                  </div>
+                )}
+              </div>
+              <div className="flex items-center gap-1.5">
+                {/* Curated-whitelist badge: present only when the stack YAML
+                    has a non-empty tools: field for this server. Signals that
+                    the operator has narrowed the tool surface from the full
+                    set the server advertised. */}
+                {isServer && ((data as MCPServerNodeData).toolWhitelist?.length ?? 0) > 0 && (
+                  <span
+                    className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-primary/10 text-primary text-[10px] font-mono"
+                    title="Curated tool whitelist"
+                    aria-label={`Curated whitelist: ${(data as MCPServerNodeData).toolWhitelist?.length ?? 0} of ${toolCount ?? 0} tools`}
+                  >
+                    <Filter size={9} />
+                    {(data as MCPServerNodeData).toolWhitelist?.length ?? 0}/{toolCount ?? 0}
+                  </span>
+                )}
+                {toolCount !== null && toolCount !== undefined && (
+                  <span className="text-text-secondary font-mono text-[11px]">
+                    {toolCount} tools
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Network (for resources) */}
+          {!isServer && network && (
+            <div className="flex items-center gap-1.5 text-xs text-secondary bg-secondary/10 px-2 py-1 rounded-md w-fit">
+              <Server size={11} />
+              <span className="font-medium">{network}</span>
+            </div>
+          )}
+
+          {/* Health indicator (MCP servers only). Suppressed while the
+              server needs authorization: the amber needs-auth indicator below
+              is the actionable state, and red must never co-render with it. */}
+          {isServer && (data as MCPServerNodeData).healthy === false &&
+            (data as MCPServerNodeData).authStatus !== 'needs_auth' && (
+            <div className="flex items-center gap-1.5 px-2 py-1.5 rounded-md bg-status-error/5 border border-status-error/15">
+              <HeartPulse size={11} className="text-status-error flex-shrink-0" />
+              <span className="text-xs text-status-error/80 font-mono truncate" title={(data as MCPServerNodeData).healthError}>
+                {(data as MCPServerNodeData).healthError || 'Health check failed'}
+              </span>
+            </div>
+          )}
+          {isServer && (data as MCPServerNodeData).healthy === true && (
+            <div className="flex items-center gap-1.5 text-xs text-text-muted">
+              <HeartPulse size={10} className="text-status-running" />
+              <span>Healthy</span>
+            </div>
+          )}
+
+          {/* Downstream authorization pending: actionable, amber, never an
+              error. Click-through to the node selection opens the Sidebar's
+              Authorization section with the Authorize button. */}
+          {isServer && (data as MCPServerNodeData).authStatus === 'needs_auth' && (
+            <div
+              className="flex items-center gap-1.5 px-2 py-1.5 rounded-md bg-status-pending/5 border border-status-pending/20"
+              role="status"
+              aria-label={`${data.name} needs authorization`}
+            >
+              <KeyRound size={11} className="text-status-pending flex-shrink-0" />
+              <span className="text-xs text-status-pending/90 font-medium truncate" title="Select the server and use Authorize in the sidebar">
+                Needs authorization
+              </span>
+            </div>
+          )}
+
+          {/* Pin drift indicator */}
+          {isServer && !isCompact && (data as MCPServerNodeData).pinStatus === 'drift' && (
+            <PinDriftLink serverName={data.name} />
+          )}
+          {/* Pin blocked indicator */}
+          {isServer && !isCompact && (data as MCPServerNodeData).pinStatus === 'blocked' && (
+            <div className="flex items-center gap-1.5 px-2 py-1.5 rounded-md bg-status-error/5 border border-status-error/15">
+              <Lock size={11} className="text-status-error flex-shrink-0" />
+              <span className="text-xs text-status-error/80 font-mono truncate">
+                Blocked — schema drift
+              </span>
+            </div>
+          )}
+
+          {/* Status Badge + Type indicator */}
+          <div className="pt-1 flex items-center gap-2">
+            {data.status === 'running' ? (
+              <span className="inline-flex items-center gap-1.5 text-[10px] px-1.5 py-0.5 rounded font-medium border bg-status-running/10 border-status-running/25 text-status-running capitalize">
+                <span className="w-1.5 h-1.5 rounded-full bg-status-running" />
+                {data.status}
+              </span>
+            ) : (
+              <Badge status={data.status}>
+                <span className="capitalize">
+                  {data.status === 'needs-auth' ? 'needs auth' : data.status}
+                </span>
+              </Badge>
+            )}
+            {isServer && !isExternal && !isLocalProcess && !isSSH && !isOpenAPI && (
+              <div className={cn(
+                'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border',
+                'text-[10px] font-semibold tracking-wide',
+                'text-text-muted border-border/50'
+              )}>
+                <Terminal size={10} />
+                Container
+              </div>
+            )}
+            {isExternal && (
+              <div className={cn(
+                'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border',
+                'text-[10px] font-semibold tracking-wide',
+                'text-text-muted border-border/50'
+              )}>
+                <Globe size={10} />
+                External
+              </div>
+            )}
+            {isLocalProcess && (
+              <div className={cn(
+                'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border',
+                'text-[10px] font-semibold tracking-wide',
+                'text-text-muted border-border/50'
+              )}>
+                <Cpu size={10} />
+                Local
+              </div>
+            )}
+            {isSSH && (
+              <div className={cn(
+                'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border',
+                'text-[10px] font-semibold tracking-wide',
+                'text-text-muted border-border/50'
+              )}>
+                <KeyRound size={10} />
+                SSH
+              </div>
+            )}
+            {isOpenAPI && (
+              <div className={cn(
+                'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border',
+                'text-[10px] font-semibold tracking-wide',
+                'text-text-muted border-border/50'
+              )}>
+                <FileJson size={10} />
+                OpenAPI
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Telemetry persistence dot indicator (MCP servers only).
+          Anchored to the node body so it tracks the card edge in both
+          compact and full modes. Hidden on resources — they don't have a
+          telemetry config of their own. */}
+      {isServer && <TelemetryNodeDot serverName={(data as MCPServerNodeData).name} />}
+
+      {/* Connection Handles - match node color */}
+      <Handle
+        type="target"
+        position={Position.Left}
+        className={cn(
+          '!w-2.5 !h-2.5 !border-2 !border-background !rounded-full',
+          isServer ? '!bg-violet-500' : '!bg-secondary',
+          'transition-all duration-200 hover:!scale-125'
+        )}
+        id="input"
+      />
+      <Handle
+        type="source"
+        position={Position.Right}
+        className={cn(
+          '!w-2.5 !h-2.5 !border-2 !border-background !rounded-full',
+          isServer ? '!bg-violet-500' : '!bg-secondary',
+          'transition-all duration-200 hover:!scale-125'
+        )}
+        id="output"
+      />
+    </div>
+  );
+});
+
+CustomNode.displayName = 'CustomNode';
+
+export default CustomNode;

@@ -1,0 +1,238 @@
+/**
+ * Node creation functions for the butterfly layout
+ *
+ * Creates React Flow nodes from backend data with proper typing and structure.
+ */
+
+import type { Node } from '@xyflow/react';
+import type { MCPServerStatus, ResourceStatus, ClientStatus, NodeStatus, RegistryStatus, AgentSkill } from '../../types';
+import { NODE_TYPES } from '../constants';
+import { GATEWAY_NODE_ID } from './edges';
+
+/**
+ * Determine MCP server status based on its state and health
+ */
+export function getMCPServerStatus(server: MCPServerStatus): NodeStatus {
+  // Autoscaled server currently at zero replicas: deliberately idle, not
+  // initializing. This check must precede !initialized because scale-to-zero
+  // makes the backend emit initialized=false for these servers.
+  if (server.autoscale && (!server.replicas || server.replicas.length === 0)) {
+    return 'idle';
+  }
+  // Awaiting authorization wins over unhealthy and initializing: a server
+  // pending its OAuth login is actionable (authorize it), not broken, and
+  // must never render as an error.
+  if (server.authStatus === 'needs_auth') {
+    return 'needs-auth';
+  }
+  // Unhealthy wins over initializing: registration failures report both
+  // healthy=false and initialized=false, and must render as errors.
+  if (server.healthy === false) {
+    return 'error';
+  }
+  if (!server.initialized) {
+    return 'initializing';
+  }
+  return 'running';
+}
+
+/**
+ * Create the gateway node
+ *
+ * @param gatewayInfo - Gateway name and version
+ * @param mcpServers - MCP servers for count
+ * @param resources - Resources for count
+ * @param sessions - Active MCP session count
+ */
+export function createGatewayNode(
+  gatewayInfo: { name: string; version: string },
+  mcpServers: MCPServerStatus[],
+  resources: ResourceStatus[],
+  sessions?: number,
+  clientCount?: number,
+  codeMode?: string | null,
+  registryStatus?: RegistryStatus | null
+): Node {
+  const safeServers = mcpServers ?? [];
+  const safeResources = resources ?? [];
+
+  const totalToolCount = safeServers.reduce((sum, s) => sum + s.toolCount, 0);
+
+  return {
+    id: GATEWAY_NODE_ID,
+    type: NODE_TYPES.GATEWAY,
+    position: { x: 0, y: 0 }, // Will be calculated by layout engine
+    data: {
+      type: 'gateway',
+      name: gatewayInfo.name,
+      version: gatewayInfo.version,
+      serverCount: safeServers.length,
+      resourceCount: safeResources.length,
+      clientCount: clientCount ?? 0,
+      totalToolCount,
+      sessions: sessions ?? 0,
+      codeMode: codeMode ?? null,
+      totalSkills: registryStatus?.totalSkills ?? 0,
+      activeSkills: registryStatus?.activeSkills ?? 0,
+    },
+    draggable: true,
+  };
+}
+
+/**
+ * A fleet is generation-mixed when its servers resolve to more than one
+ * MCP protocol generation. Servers without a generation (OpenAPI
+ * adapters, unresolved registrations) do not count toward mixing: the
+ * badge exists to flag bridging, and absence of a generation is not a
+ * generation.
+ */
+export function hasMixedGenerations(servers: MCPServerStatus[]): boolean {
+  const generations = new Set(
+    servers.map((s) => s.protocolGeneration).filter((g): g is string => Boolean(g))
+  );
+  return generations.size > 1;
+}
+
+/**
+ * Create MCP server nodes
+ */
+export function createMCPServerNodes(mcpServers: MCPServerStatus[]): Node[] {
+  return mcpServers.map((server) => ({
+    id: `mcp-${server.name}`,
+    type: NODE_TYPES.MCP_SERVER,
+    position: { x: 0, y: 0 }, // Will be calculated by layout engine
+    data: {
+      type: 'mcp-server',
+      name: server.name,
+      transport: server.transport || 'http',
+      endpoint: server.endpoint,
+      containerId: server.containerId,
+      initialized: server.initialized,
+      toolCount: server.toolCount,
+      tools: server.tools,
+      status: getMCPServerStatus(server),
+      external: server.external,
+      localProcess: server.localProcess,
+      ssh: server.ssh,
+      sshHost: server.sshHost,
+      healthy: server.healthy,
+      lastCheck: server.lastCheck,
+      healthError: server.healthError,
+      protocolVersion: server.protocolVersion,
+      protocolGeneration: server.protocolGeneration,
+      openapi: server.openapi,
+      openapiSpec: server.openapiSpec,
+      outputFormat: server.outputFormat,
+      replicaCount: server.replicas?.length,
+      toolWhitelist: server.toolWhitelist,
+      autoscale: server.autoscale,
+      authStatus: server.authStatus,
+      authIssuer: server.authIssuer,
+      authExpiry: server.authExpiry,
+      kind: server.kind,
+      image: server.image,
+      source: server.source,
+    },
+    draggable: true,
+  }));
+}
+
+/**
+ * Create resource nodes
+ */
+export function createResourceNodes(resources: ResourceStatus[]): Node[] {
+  return resources.map((resource) => ({
+    id: `resource-${resource.name}`,
+    type: NODE_TYPES.RESOURCE,
+    position: { x: 0, y: 0 }, // Will be calculated by layout engine
+    data: {
+      type: 'resource',
+      name: resource.name,
+      image: resource.image,
+      network: resource.network,
+      status: resource.status,
+    },
+    draggable: true,
+  }));
+}
+
+/**
+ * Create client nodes for linked LLM clients
+ */
+export function createClientNodes(clients: ClientStatus[]): Node[] {
+  return clients
+    .filter((c) => c.linked)
+    .map((client) => ({
+      id: `client-${client.slug}`,
+      type: NODE_TYPES.CLIENT,
+      position: { x: 0, y: 0 },
+      data: {
+        type: 'client',
+        name: client.name,
+        slug: client.slug,
+        transport: client.transport,
+        configPath: client.configPath,
+        effectiveScope: client.effectiveScope,
+        status: 'running' as const,
+      },
+      draggable: true,
+    }));
+}
+
+/**
+ * Create skill group nodes — one per top-level directory for active skills
+ */
+export function createSkillGroupNodes(skills: AgentSkill[]): Node[] {
+  const active = skills.filter((s) => s.state === 'active');
+
+  const groups = new Map<string, AgentSkill[]>();
+  for (const skill of active) {
+    const topDir = skill.dir ? skill.dir.split('/')[0] : skill.name;
+    const existing = groups.get(topDir) ?? [];
+    existing.push(skill);
+    groups.set(topDir, existing);
+  }
+
+  const nodes: Node[] = [];
+  for (const [groupName, groupSkills] of groups) {
+    const criteriaCount = groupSkills.reduce((n, s) => n + (s.acceptanceCriteria?.length ?? 0), 0);
+    nodes.push({
+      id: `skill-group-${groupName}`,
+      type: NODE_TYPES.SKILL_GROUP,
+      position: { x: 0, y: 0 }, // Will be calculated by layout engine
+      data: {
+        type: 'skill-group',
+        groupName,
+        totalSkills: groupSkills.length,
+        activeSkills: groupSkills.length,
+        failingSkills: 0,
+        untestedSkills: criteriaCount > 0 ? groupSkills.length : 0,
+      },
+      draggable: true,
+    });
+  }
+  return nodes;
+}
+
+/**
+ * Create all nodes for the graph
+ */
+export function createAllNodes(
+  gatewayInfo: { name: string; version: string },
+  mcpServers: MCPServerStatus[],
+  resources: ResourceStatus[],
+  sessions?: number,
+  clients: ClientStatus[] = [],
+  registryStatus?: RegistryStatus | null,
+  codeMode?: string | null,
+): Node[] {
+  const linkedClients = clients.filter((c) => c.linked);
+  const nodes: Node[] = [
+    createGatewayNode(gatewayInfo, mcpServers, resources, sessions, linkedClients.length, codeMode, registryStatus),
+    ...createClientNodes(clients),
+    ...createMCPServerNodes(mcpServers),
+    ...createResourceNodes(resources),
+  ];
+
+  return nodes;
+}

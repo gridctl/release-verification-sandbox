@@ -1,0 +1,181 @@
+package controller
+
+import (
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gridctl/gridctl/pkg/config"
+	"github.com/gridctl/gridctl/pkg/state"
+)
+
+// appendLogLevelArg forwards a non-default global --log-level to a forked
+// daemon child so its log file honors the requested verbosity.
+func appendLogLevelArg(args []string, lvl slog.Level) []string {
+	if lvl == slog.LevelInfo {
+		return args
+	}
+	return append(args, "--log-level", strings.ToLower(lvl.String()))
+}
+
+// DaemonManager handles daemon lifecycle: forking child processes and
+// waiting for readiness.
+type DaemonManager struct {
+	config Config
+}
+
+// NewDaemonManager creates a DaemonManager.
+func NewDaemonManager(cfg Config) *DaemonManager {
+	return &DaemonManager{config: cfg}
+}
+
+// Fork starts a daemon child process that runs the MCP gateway in the background.
+// Returns the child PID.
+func (d *DaemonManager) Fork(stack *config.Stack) (int, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return 0, fmt.Errorf("getting executable: %w", err)
+	}
+
+	if err := state.EnsureLogDir(); err != nil {
+		return 0, fmt.Errorf("creating log directory: %w", err)
+	}
+
+	logPath, err := state.LogPath(stack.Name)
+	if err != nil {
+		return 0, err
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return 0, fmt.Errorf("opening log file: %w", err)
+	}
+
+	args := []string{"apply", d.config.StackPath,
+		"--daemon-child",
+		"--port", strconv.Itoa(d.config.Port),
+		"--base-port", strconv.Itoa(d.config.BasePort)}
+	if d.config.NoExpand {
+		args = append(args, "--no-expand")
+	}
+	if d.config.Watch {
+		args = append(args, "--watch")
+	}
+	if d.config.LogFile != "" {
+		args = append(args, "--log-file", d.config.LogFile)
+	}
+	args = appendLogLevelArg(args, effectiveLogLevel(d.config))
+	cmd := exec.Command(exe, args...)
+
+	configureDaemonProcess(cmd)
+
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.Stdin = nil
+	cmd.Env = os.Environ()
+
+	if err := cmd.Start(); err != nil {
+		logFile.Close()
+		return 0, fmt.Errorf("starting daemon: %w", err)
+	}
+
+	// Close log file in parent — child has its own file descriptor
+	logFile.Close()
+
+	// Don't wait — let it run in background
+	return cmd.Process.Pid, nil
+}
+
+// ForkStackless starts a stackless daemon child that runs only the HTTP API
+// and web UI (no stack, no containers). Returns the child PID.
+func (d *DaemonManager) ForkStackless() (int, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return 0, fmt.Errorf("getting executable: %w", err)
+	}
+
+	if err := state.EnsureLogDir(); err != nil {
+		return 0, fmt.Errorf("creating log directory: %w", err)
+	}
+
+	logPath, err := state.LogPath("gridctl")
+	if err != nil {
+		return 0, err
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return 0, fmt.Errorf("opening log file: %w", err)
+	}
+
+	args := []string{"serve",
+		"--daemon-child",
+		"--port", strconv.Itoa(d.config.Port),
+	}
+	if d.config.LogFile != "" {
+		args = append(args, "--log-file", d.config.LogFile)
+	}
+	args = appendLogLevelArg(args, effectiveLogLevel(d.config))
+	cmd := exec.Command(exe, args...)
+
+	configureDaemonProcess(cmd)
+
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.Stdin = nil
+	cmd.Env = os.Environ()
+
+	if err := cmd.Start(); err != nil {
+		logFile.Close()
+		return 0, fmt.Errorf("starting daemon: %w", err)
+	}
+
+	logFile.Close()
+	return cmd.Process.Pid, nil
+}
+
+// WaitForReady polls the /ready endpoint until it returns 200 or timeout.
+// The /ready endpoint only succeeds when all MCP servers are initialized,
+// unlike /health which succeeds immediately when the HTTP server starts.
+func (d *DaemonManager) WaitForReady(port int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	url := fmt.Sprintf("http://localhost:%d/ready", port)
+
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url)
+		if err == nil {
+			statusOK := resp.StatusCode == http.StatusOK
+			resp.Body.Close()
+			if statusOK {
+				return nil
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("readiness check timed out after %v", timeout)
+}
+
+// WaitForHealth polls the /health endpoint until it returns 200 or timeout.
+// Used for stackless mode where /ready always returns 503.
+func (d *DaemonManager) WaitForHealth(port int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	url := fmt.Sprintf("http://localhost:%d/health", port)
+
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url)
+		if err == nil {
+			statusOK := resp.StatusCode == http.StatusOK
+			resp.Body.Close()
+			if statusOK {
+				return nil
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("health check timed out after %v", timeout)
+}

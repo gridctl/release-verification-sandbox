@@ -1,0 +1,884 @@
+package skills
+
+import (
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/object"
+
+	"github.com/gridctl/gridctl/pkg/registry"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func setupTestRegistry(t *testing.T) (*registry.Store, string) {
+	dir := t.TempDir()
+	store := registry.NewStore(dir)
+	require.NoError(t, store.Load())
+	return store, dir
+}
+
+func createTestSkill(t *testing.T, store *registry.Store, name string) {
+	sk := &registry.AgentSkill{
+		Name:        name,
+		Description: "Test skill " + name,
+		State:       registry.StateActive,
+	}
+	require.NoError(t, store.SaveSkill(sk))
+}
+
+func TestImporterRemove(t *testing.T) {
+	store, dir := setupTestRegistry(t)
+	lockPath := filepath.Join(dir, "skills.lock.yaml")
+
+	// Create a skill with origin
+	createTestSkill(t, store, "test-skill")
+	skillDir := filepath.Join(dir, "skills", "test-skill")
+	require.NoError(t, WriteOrigin(skillDir, &Origin{
+		Repo:      "https://github.com/org/repo",
+		CommitSHA: "abc123",
+	}))
+
+	// Write lock entry
+	lf := &LockFile{Sources: map[string]LockedSource{
+		"repo": {
+			Skills: map[string]LockedSkill{
+				"test-skill": {ContentHash: "hash"},
+			},
+		},
+	}}
+	require.NoError(t, WriteLockFile(lockPath, lf))
+
+	imp := NewImporter(store, dir, lockPath, slog.Default())
+
+	// Remove
+	require.NoError(t, imp.Remove("test-skill"))
+
+	// Verify skill is gone
+	_, err := store.GetSkill("test-skill")
+	assert.Error(t, err)
+
+	// Verify origin is gone
+	assert.False(t, HasOrigin(skillDir))
+
+	// Verify lock entry is gone
+	lf2, err := ReadLockFile(lockPath)
+	require.NoError(t, err)
+	assert.Empty(t, lf2.Sources)
+}
+
+func TestImporterPin(t *testing.T) {
+	store, dir := setupTestRegistry(t)
+	lockPath := filepath.Join(dir, "skills.lock.yaml")
+
+	createTestSkill(t, store, "pinnable")
+	skillDir := filepath.Join(dir, "skills", "pinnable")
+	require.NoError(t, WriteOrigin(skillDir, &Origin{
+		Repo:      "https://github.com/org/repo",
+		Ref:       "main",
+		CommitSHA: "abc123",
+	}))
+
+	lf := &LockFile{Sources: map[string]LockedSource{
+		"repo": {
+			Ref: "main",
+			Skills: map[string]LockedSkill{
+				"pinnable": {},
+			},
+		},
+	}}
+	require.NoError(t, WriteLockFile(lockPath, lf))
+
+	imp := NewImporter(store, dir, lockPath, slog.Default())
+	require.NoError(t, imp.Pin("pinnable", "v1.0.0"))
+
+	// Check origin was updated
+	origin, err := ReadOrigin(skillDir)
+	require.NoError(t, err)
+	assert.Equal(t, "v1.0.0", origin.Ref)
+}
+
+func TestImporterInfo(t *testing.T) {
+	store, dir := setupTestRegistry(t)
+	lockPath := filepath.Join(dir, "skills.lock.yaml")
+
+	// Local skill
+	createTestSkill(t, store, "local-skill")
+	imp := NewImporter(store, dir, lockPath, slog.Default())
+
+	info, err := imp.Info("local-skill")
+	require.NoError(t, err)
+	assert.False(t, info.IsRemote)
+	assert.Equal(t, "local-skill", info.Name)
+
+	// Remote skill
+	createTestSkill(t, store, "remote-skill")
+	skillDir := filepath.Join(dir, "skills", "remote-skill")
+	require.NoError(t, WriteOrigin(skillDir, &Origin{
+		Repo:      "https://github.com/org/repo",
+		Ref:       "main",
+		CommitSHA: "abc123def456789012345678901234567890abcd",
+	}))
+
+	info, err = imp.Info("remote-skill")
+	require.NoError(t, err)
+	assert.True(t, info.IsRemote)
+	assert.Equal(t, "https://github.com/org/repo", info.Origin.Repo)
+}
+
+func TestImporterInfoNotFound(t *testing.T) {
+	store, dir := setupTestRegistry(t)
+	lockPath := filepath.Join(dir, "skills.lock.yaml")
+
+	imp := NewImporter(store, dir, lockPath, slog.Default())
+	_, err := imp.Info("nonexistent")
+	assert.Error(t, err)
+}
+
+func TestImporterPinNoOrigin(t *testing.T) {
+	store, dir := setupTestRegistry(t)
+	lockPath := filepath.Join(dir, "skills.lock.yaml")
+
+	createTestSkill(t, store, "local-only")
+	imp := NewImporter(store, dir, lockPath, slog.Default())
+
+	err := imp.Pin("local-only", "v1.0.0")
+	assert.Error(t, err)
+}
+
+func TestSafeRepoPath(t *testing.T) {
+	tests := []struct {
+		path    string
+		wantErr bool
+	}{
+		{"skills/deploy", false},
+		{"../../../etc/passwd", true},
+		{"/absolute/path", true},
+		{"valid/nested/path", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			err := SafeRepoPath(tt.path)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// initSkillRepo creates a local git repo with a SKILL.md and returns its path
+// plus the worktree handle so the test can commit further changes.
+func initSkillRepo(t *testing.T, body string) (string, *git.Repository) {
+	t.Helper()
+
+	dir := t.TempDir()
+	repo, err := git.PlainInit(dir, false)
+	require.NoError(t, err)
+
+	skillContent := `---
+name: test-skill
+description: A test skill for state preservation
+state: active
+---
+
+` + body
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(skillContent), 0644))
+
+	wt, err := repo.Worktree()
+	require.NoError(t, err)
+	_, err = wt.Add("SKILL.md")
+	require.NoError(t, err)
+	_, err = wt.Commit("initial", &git.CommitOptions{
+		Author: &object.Signature{Name: "test", Email: "test@test.com"},
+	})
+	require.NoError(t, err)
+
+	return dir, repo
+}
+
+// commitChange writes new SKILL.md content and creates a follow-up commit so
+// that FetchAndCompare reports an available update.
+func commitChange(t *testing.T, repo *git.Repository, dir, body string) {
+	t.Helper()
+
+	skillContent := `---
+name: test-skill
+description: A test skill for state preservation (v2)
+state: active
+---
+
+` + body
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(skillContent), 0644))
+
+	wt, err := repo.Worktree()
+	require.NoError(t, err)
+	_, err = wt.Add("SKILL.md")
+	require.NoError(t, err)
+	_, err = wt.Commit("update", &git.CommitOptions{
+		Author: &object.Signature{Name: "test", Email: "test@test.com"},
+	})
+	require.NoError(t, err)
+}
+
+// TestImporter_Update_PreservesState verifies that re-syncing a source does
+// not silently re-activate a skill the user disabled. Regression test for
+// the bug where Importer.Update called Import(Force: true) which clobbered
+// the user-set State.
+func TestImporter_Update_PreservesState(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	store, regDir := setupTestRegistry(t)
+	lockPath := filepath.Join(regDir, "skills.lock.yaml")
+
+	repoDir, repo := initSkillRepo(t, "# Test\n\nFirst version.\n")
+
+	imp := NewImporter(store, regDir, lockPath, slog.Default())
+
+	// Initial import → skill should be active. Pin to "master" (go-git's
+	// default branch) so FetchAndCompare can resolve via origin/master after
+	// a subsequent fetch.
+	result, err := imp.Import(ImportOptions{Repo: repoDir, Ref: "master", Trust: true})
+	require.NoError(t, err)
+	require.Len(t, result.Imported, 1)
+
+	sk, err := store.GetSkill("test-skill")
+	require.NoError(t, err)
+	assert.Equal(t, registry.StateActive, sk.State)
+
+	// User disables the skill.
+	sk.State = registry.StateDisabled
+	require.NoError(t, store.SaveSkill(sk))
+
+	// Push a new upstream commit so Update will re-import (rather than
+	// short-circuit on "already up to date").
+	commitChange(t, repo, repoDir, "# Test\n\nSecond version.\n")
+
+	// Sync. The bug under test would reset State to active here.
+	updateResult, err := imp.Update("test-skill", false, false, false)
+	require.NoError(t, err)
+	require.Len(t, updateResult.Imported, 1, "expected a re-import after upstream change")
+
+	sk, err = store.GetSkill("test-skill")
+	require.NoError(t, err)
+	assert.Equal(t, registry.StateDisabled, sk.State,
+		"disabled skill should remain disabled after sync")
+	assert.Contains(t, sk.Body, "Second version.",
+		"update must install the new upstream content, not re-render the cached worktree")
+}
+
+// TestImporter_Update_UnpinnedInstallsFresh is the regression test for the
+// stale clone cache bug: an unpinned source (Ref == "", the default `gridctl
+// skill add <repo>` shape) must detect an upstream commit and install its
+// content, not report "already up to date" against the frozen first-import
+// worktree.
+func TestImporter_Update_UnpinnedInstallsFresh(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	store, regDir := setupTestRegistry(t)
+	lockPath := filepath.Join(regDir, "skills.lock.yaml")
+	repoDir, repo := initSkillRepo(t, "# Test\n\nFirst version.\n")
+
+	imp := NewImporter(store, regDir, lockPath, slog.Default())
+	result, err := imp.Import(ImportOptions{Repo: repoDir, Trust: true})
+	require.NoError(t, err)
+	require.Len(t, result.Imported, 1)
+
+	commitChange(t, repo, repoDir, "# Test\n\nSecond version.\n")
+	head, err := repo.Head()
+	require.NoError(t, err)
+
+	updateResult, err := imp.Update("test-skill", false, false, false)
+	require.NoError(t, err)
+	require.Len(t, updateResult.Imported, 1, "expected a re-import after upstream change, got warnings: %v", updateResult.Warnings)
+
+	data, err := os.ReadFile(filepath.Join(regDir, "skills", "test-skill", "SKILL.md"))
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "Second version.", "on-disk registry copy must carry the new upstream content")
+
+	origin, err := ReadOrigin(filepath.Join(regDir, "skills", "test-skill"))
+	require.NoError(t, err)
+	assert.Equal(t, head.Hash().String(), origin.CommitSHA, "origin must record the new upstream commit")
+
+	// A repeat update is a clean no-op, not a perpetual "update available".
+	repeat, err := imp.Update("test-skill", false, false, false)
+	require.NoError(t, err)
+	assert.Empty(t, repeat.Imported)
+	require.NotEmpty(t, repeat.Warnings)
+	assert.Contains(t, repeat.Warnings[0], "already up to date")
+}
+
+// TestImporter_Update_PinnedBranchInstallsFresh covers the branch-pinned
+// profile of the same bug: update detected the change but re-installed the
+// stale worktree, looping on "update available" forever.
+func TestImporter_Update_PinnedBranchInstallsFresh(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	store, regDir := setupTestRegistry(t)
+	lockPath := filepath.Join(regDir, "skills.lock.yaml")
+	repoDir, repo := initSkillRepo(t, "# Test\n\nFirst version.\n")
+
+	imp := NewImporter(store, regDir, lockPath, slog.Default())
+	result, err := imp.Import(ImportOptions{Repo: repoDir, Ref: "master", Trust: true})
+	require.NoError(t, err)
+	require.Len(t, result.Imported, 1)
+
+	commitChange(t, repo, repoDir, "# Test\n\nSecond version.\n")
+
+	updateResult, err := imp.Update("test-skill", false, false, false)
+	require.NoError(t, err)
+	require.Len(t, updateResult.Imported, 1)
+
+	data, err := os.ReadFile(filepath.Join(regDir, "skills", "test-skill", "SKILL.md"))
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "Second version.")
+
+	repeat, err := imp.Update("test-skill", false, false, false)
+	require.NoError(t, err)
+	assert.Empty(t, repeat.Imported, "second update must not loop on a phantom change")
+	require.NotEmpty(t, repeat.Warnings)
+	assert.Contains(t, repeat.Warnings[0], "already up to date")
+}
+
+// TestImporter_Import_DiscoversNewUpstreamSkill verifies that re-running an
+// import against an already-cached repo sees skills added upstream after the
+// first import.
+func TestImporter_Import_DiscoversNewUpstreamSkill(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	store, regDir := setupTestRegistry(t)
+	lockPath := filepath.Join(regDir, "skills.lock.yaml")
+
+	repoDir := initRepoWithSkillContent(t, map[string]string{
+		"skills/one/SKILL.md": "---\nname: one-skill\ndescription: first\n---\n\nBody.\n",
+	})
+
+	imp := NewImporter(store, regDir, lockPath, slog.Default())
+	result, err := imp.Import(ImportOptions{Repo: repoDir, Path: "skills", Trust: true})
+	require.NoError(t, err)
+	require.Len(t, result.Imported, 1)
+
+	// A second skill lands upstream after the first import.
+	srcRepo, err := git.PlainOpen(repoDir)
+	require.NoError(t, err)
+	newFile := filepath.Join(repoDir, "skills", "two", "SKILL.md")
+	require.NoError(t, os.MkdirAll(filepath.Dir(newFile), 0755))
+	require.NoError(t, os.WriteFile(newFile, []byte("---\nname: two-skill\ndescription: second\n---\n\nBody.\n"), 0644))
+	wt, err := srcRepo.Worktree()
+	require.NoError(t, err)
+	_, err = wt.Add("skills/two/SKILL.md")
+	require.NoError(t, err)
+	_, err = wt.Commit("add second skill", &git.CommitOptions{
+		Author: &object.Signature{Name: "test", Email: "test@test.com"},
+	})
+	require.NoError(t, err)
+
+	result, err = imp.Import(ImportOptions{Repo: repoDir, Path: "skills", Trust: true})
+	require.NoError(t, err)
+
+	names := make([]string, 0, len(result.Imported))
+	for _, s := range result.Imported {
+		names = append(names, s.Name)
+	}
+	assert.Contains(t, names, "two-skill", "re-import must discover skills added upstream, got %v (warnings: %v)", names, result.Warnings)
+}
+
+// TestFetchAndCompare_SemverConstraintDetectsNewTag covers the detection gap
+// for semver-constraint refs: a new matching tag upstream must report as a
+// change even though the constraint itself is not a resolvable git ref.
+func TestFetchAndCompare_SemverConstraintDetectsNewTag(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	store, regDir := setupTestRegistry(t)
+	lockPath := filepath.Join(regDir, "skills.lock.yaml")
+	repoDir, repo := initSkillRepo(t, "# Test\n\nFirst version.\n")
+
+	head, err := repo.Head()
+	require.NoError(t, err)
+	_, err = repo.CreateTag("v1.0.0", head.Hash(), nil)
+	require.NoError(t, err)
+
+	imp := NewImporter(store, regDir, lockPath, slog.Default())
+	result, err := imp.Import(ImportOptions{Repo: repoDir, Ref: "^1.0.0", Trust: true})
+	require.NoError(t, err)
+	require.Len(t, result.Imported, 1)
+
+	origin, err := ReadOrigin(filepath.Join(regDir, "skills", "test-skill"))
+	require.NoError(t, err)
+
+	commitChange(t, repo, repoDir, "# Test\n\nSecond version.\n")
+	head2, err := repo.Head()
+	require.NoError(t, err)
+	_, err = repo.CreateTag("v1.1.0", head2.Hash(), nil)
+	require.NoError(t, err)
+
+	newSHA, changed, err := FetchAndCompare(repoDir, "^1.0.0", origin.CommitSHA, AuthConfig{}, slog.Default())
+	require.NoError(t, err)
+	assert.True(t, changed, "new matching tag must be detected as a change")
+	assert.Equal(t, head2.Hash().String(), newSHA)
+}
+
+// TestCloneAndDiscover_ConcurrentSameRepo exercises the per-repo lock: two
+// concurrent operations against one cached clone must serialize rather than
+// race on the shared worktree. Run with -race to make this meaningful.
+func TestCloneAndDiscover_ConcurrentSameRepo(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	repoDir, repo := initSkillRepo(t, "# Test\n\nFirst version.\n")
+
+	// Seed the cache, then push an upstream change so concurrent calls
+	// exercise the mutation path, not just reads.
+	_, err := CloneAndDiscover(repoDir, "", "", AuthConfig{}, slog.Default())
+	require.NoError(t, err)
+	commitChange(t, repo, repoDir, "# Test\n\nSecond version.\n")
+
+	var wg sync.WaitGroup
+	errs := make([]error, 4)
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = CloneAndDiscover(repoDir, "", "", AuthConfig{}, slog.Default())
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		assert.NoError(t, err, "concurrent CloneAndDiscover #%d", i)
+	}
+}
+
+// TestImporter_Import_NoPreserveStateResetsState confirms that the default
+// Import path (PreserveState=false, used by `gridctl skill add`) still
+// (re)sets state to active. Sanity check that the preservation flag is
+// scoped to Update.
+func TestImporter_Import_NoPreserveStateResetsState(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	store, regDir := setupTestRegistry(t)
+	lockPath := filepath.Join(regDir, "skills.lock.yaml")
+
+	repoDir, _ := initSkillRepo(t, "# Test\n\nBody.\n")
+
+	imp := NewImporter(store, regDir, lockPath, slog.Default())
+
+	// Initial import.
+	_, err := imp.Import(ImportOptions{Repo: repoDir, Trust: true})
+	require.NoError(t, err)
+
+	sk, err := store.GetSkill("test-skill")
+	require.NoError(t, err)
+	sk.State = registry.StateDisabled
+	require.NoError(t, store.SaveSkill(sk))
+
+	// Re-import without PreserveState: state should be reset to active.
+	_, err = imp.Import(ImportOptions{Repo: repoDir, Trust: true, Force: true})
+	require.NoError(t, err)
+
+	sk, err = store.GetSkill("test-skill")
+	require.NoError(t, err)
+	assert.Equal(t, registry.StateActive, sk.State)
+}
+
+// TestImporter_Import_PreserveStateNewSkillDefaultsActive verifies that when
+// PreserveState=true is passed but the skill doesn't yet exist, the default
+// (StateActive / StateDraft) still applies. Preservation only kicks in when
+// there is existing state to preserve.
+func TestImporter_Import_PreserveStateNewSkillDefaultsActive(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	store, regDir := setupTestRegistry(t)
+	lockPath := filepath.Join(regDir, "skills.lock.yaml")
+
+	repoDir, _ := initSkillRepo(t, "# Test\n\nBody.\n")
+
+	imp := NewImporter(store, regDir, lockPath, slog.Default())
+
+	// First-time import with PreserveState. No existing skill to preserve.
+	_, err := imp.Import(ImportOptions{Repo: repoDir, Trust: true, PreserveState: true})
+	require.NoError(t, err)
+
+	sk, err := store.GetSkill("test-skill")
+	require.NoError(t, err)
+	assert.Equal(t, registry.StateActive, sk.State)
+}
+
+// TestImporter_Update_ConcurrentSourcesPreserveLockfile verifies that
+// concurrent Update calls against different sources both land in the lock
+// file. Pre-fix, the read-modify-write window was unguarded and the last
+// writer would silently drop the other source's entries. Run under -race.
+func TestImporter_Update_ConcurrentSourcesPreserveLockfile(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	store, regDir := setupTestRegistry(t)
+	lockPath := filepath.Join(regDir, "skills.lock.yaml")
+
+	// Two independent local repos with distinct skill names so they don't
+	// clobber each other in the registry.
+	repoA := initSkillRepoNamed(t, "skill-a", "# A\n\nv1.\n")
+	repoB := initSkillRepoNamed(t, "skill-b", "# B\n\nv1.\n")
+
+	imp := NewImporter(store, regDir, lockPath, slog.Default())
+
+	// Initial imports so both sources exist in the lock file.
+	_, err := imp.Import(ImportOptions{Repo: repoA.dir, Ref: "master", Trust: true})
+	require.NoError(t, err)
+	_, err = imp.Import(ImportOptions{Repo: repoB.dir, Ref: "master", Trust: true})
+	require.NoError(t, err)
+
+	// Push new commits to both so Update will re-import them.
+	commitChangeNamed(t, repoA, "skill-a", "# A\n\nv2.\n")
+	commitChangeNamed(t, repoB, "skill-b", "# B\n\nv2.\n")
+
+	// Concurrent updates.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = imp.Update("skill-a", false, false, false)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = imp.Update("skill-b", false, false, false)
+	}()
+	wg.Wait()
+
+	lf, err := ReadLockFile(lockPath)
+	require.NoError(t, err)
+	assert.Len(t, lf.Sources, 2, "both sources must survive concurrent Update")
+	for srcName, src := range lf.Sources {
+		assert.NotEmpty(t, src.Skills, "source %q lost its skills under concurrent Update", srcName)
+	}
+}
+
+// initSkillRepoNamed is initSkillRepo with a configurable skill name.
+type testRepo struct {
+	dir  string
+	repo *git.Repository
+}
+
+func initSkillRepoNamed(t *testing.T, skillName, body string) testRepo {
+	t.Helper()
+	dir := t.TempDir()
+	repo, err := git.PlainInit(dir, false)
+	require.NoError(t, err)
+
+	content := "---\nname: " + skillName + "\ndescription: test\nstate: active\n---\n\n" + body
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0644))
+
+	wt, err := repo.Worktree()
+	require.NoError(t, err)
+	_, err = wt.Add("SKILL.md")
+	require.NoError(t, err)
+	_, err = wt.Commit("initial", &git.CommitOptions{
+		Author: &object.Signature{Name: "test", Email: "test@test.com"},
+	})
+	require.NoError(t, err)
+
+	return testRepo{dir: dir, repo: repo}
+}
+
+func commitChangeNamed(t *testing.T, r testRepo, skillName, body string) {
+	t.Helper()
+	content := "---\nname: " + skillName + "\ndescription: test v2\nstate: active\n---\n\n" + body
+	require.NoError(t, os.WriteFile(filepath.Join(r.dir, "SKILL.md"), []byte(content), 0644))
+	wt, err := r.repo.Worktree()
+	require.NoError(t, err)
+	_, err = wt.Add("SKILL.md")
+	require.NoError(t, err)
+	_, err = wt.Commit("update", &git.CommitOptions{
+		Author: &object.Signature{Name: "test", Email: "test@test.com"},
+	})
+	require.NoError(t, err)
+}
+
+func TestContentHashFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.txt")
+	require.NoError(t, os.WriteFile(path, []byte("hello world"), 0644))
+
+	hash1, err := ContentHashFile(path)
+	require.NoError(t, err)
+	assert.NotEmpty(t, hash1)
+
+	// Same content = same hash
+	path2 := filepath.Join(dir, "test2.txt")
+	require.NoError(t, os.WriteFile(path2, []byte("hello world"), 0644))
+	hash2, err := ContentHashFile(path2)
+	require.NoError(t, err)
+	assert.Equal(t, hash1, hash2)
+
+	// Different content = different hash
+	path3 := filepath.Join(dir, "test3.txt")
+	require.NoError(t, os.WriteFile(path3, []byte("different"), 0644))
+	hash3, err := ContentHashFile(path3)
+	require.NoError(t, err)
+	assert.NotEqual(t, hash1, hash3)
+}
+
+// initRepoWithSkillContent creates a local git repo whose SKILL.md has the
+// given raw content (valid or intentionally malformed).
+func initRepoWithSkillContent(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	repo, err := git.PlainInit(dir, false)
+	require.NoError(t, err)
+
+	wt, err := repo.Worktree()
+	require.NoError(t, err)
+	for path, content := range files {
+		full := filepath.Join(dir, path)
+		require.NoError(t, os.MkdirAll(filepath.Dir(full), 0755))
+		require.NoError(t, os.WriteFile(full, []byte(content), 0644))
+		_, err = wt.Add(path)
+		require.NoError(t, err)
+	}
+	_, err = wt.Commit("initial", &git.CommitOptions{
+		Author: &object.Signature{Name: "test", Email: "test@test.com"},
+	})
+	require.NoError(t, err)
+	return dir
+}
+
+// TestImporter_Import_AllMalformedNamesFiles verifies that when every
+// SKILL.md fails to parse, the error names the failing file instead of
+// claiming no SKILL.md files exist.
+func TestImporter_Import_AllMalformedNamesFiles(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	store, regDir := setupTestRegistry(t)
+	lockPath := filepath.Join(regDir, "skills.lock.yaml")
+
+	repoDir := initRepoWithSkillContent(t, map[string]string{
+		"skills/broken/SKILL.md": "---\nname: [unclosed\ndescription: broken\n---\n\nBody.\n",
+	})
+
+	imp := NewImporter(store, regDir, lockPath, slog.Default())
+	_, err := imp.Import(ImportOptions{Repo: repoDir, Trust: true})
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "no SKILL.md files found")
+	assert.Contains(t, err.Error(), "failed to parse")
+	assert.Contains(t, err.Error(), filepath.Join("skills", "broken", "SKILL.md"))
+}
+
+// TestImporter_Import_MixedMalformedWarns verifies that valid skills import
+// while unparseable ones surface as warnings.
+func TestImporter_Import_MixedMalformedWarns(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	store, regDir := setupTestRegistry(t)
+	lockPath := filepath.Join(regDir, "skills.lock.yaml")
+
+	repoDir := initRepoWithSkillContent(t, map[string]string{
+		"skills/good/SKILL.md":   "---\nname: good-skill\ndescription: valid\n---\n\nBody.\n",
+		"skills/broken/SKILL.md": "---\nname: [unclosed\ndescription: broken\n---\n\nBody.\n",
+	})
+
+	imp := NewImporter(store, regDir, lockPath, slog.Default())
+	result, err := imp.Import(ImportOptions{Repo: repoDir, Trust: true})
+	require.NoError(t, err)
+
+	require.Len(t, result.Imported, 1)
+	assert.Equal(t, "good-skill", result.Imported[0].Name)
+
+	found := false
+	for _, w := range result.Warnings {
+		if strings.Contains(w, filepath.Join("skills", "broken", "SKILL.md")) && strings.Contains(w, "failed to parse") {
+			found = true
+		}
+	}
+	assert.True(t, found, "warnings should name the malformed file, got %v", result.Warnings)
+}
+
+// TestImporter_Import_NestedMetadata verifies end-to-end import of a skill
+// whose metadata nests objects (openclaw/ClawHub convention).
+func TestImporter_Import_NestedMetadata(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	store, regDir := setupTestRegistry(t)
+	lockPath := filepath.Join(regDir, "skills.lock.yaml")
+
+	repoDir := initRepoWithSkillContent(t, map[string]string{
+		"skills/nested/SKILL.md": `---
+name: nested-meta
+description: Skill with nested metadata
+metadata:
+  author: samber
+  version: "1.2.2"
+  openclaw:
+    emoji: "X"
+    requires:
+      bins:
+        - go
+---
+
+Body.
+`,
+	})
+
+	imp := NewImporter(store, regDir, lockPath, slog.Default())
+	result, err := imp.Import(ImportOptions{Repo: repoDir, Trust: true})
+	require.NoError(t, err)
+	require.Len(t, result.Imported, 1)
+
+	sk, err := store.GetSkill("nested-meta")
+	require.NoError(t, err)
+	assert.Equal(t, "samber", sk.Metadata["author"])
+	assert.Equal(t, "1.2.2", sk.Metadata["version"])
+	assert.NotEmpty(t, sk.Metadata["openclaw"])
+}
+
+func TestImporter_Import_RecordsSupportingFileInstall(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	store, regDir := setupTestRegistry(t)
+	lockPath := filepath.Join(regDir, "skills.lock.yaml")
+	repoDir := initRepoWithSkillContent(t, map[string]string{
+		"skills/external/SKILL.md": "---\nname: external-assets\ndescription: Uses project assets\n---\n\nRead `assets/config.yml` in the target project.\n",
+	})
+
+	imp := NewImporter(store, regDir, lockPath, slog.Default())
+	result, err := imp.Import(ImportOptions{Repo: repoDir, Path: "skills", Trust: true})
+	require.NoError(t, err)
+	require.Len(t, result.Imported, 1)
+
+	origin, err := ReadOrigin(filepath.Join(regDir, "skills", "external-assets"))
+	require.NoError(t, err)
+	assert.True(t, origin.SupportingFilesInstalled)
+}
+
+func TestImporter_Update_ReinstallsUnchangedLegacySupportingFiles(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	store, regDir := setupTestRegistry(t)
+	lockPath := filepath.Join(regDir, "skills.lock.yaml")
+	repoDir := initRepoWithSkillContent(t, map[string]string{
+		"skills/legacy/SKILL.md":            "---\nname: legacy-skill\ndescription: Legacy package\n---\n\nRead `references/guide.md`.\n",
+		"skills/legacy/references/guide.md": "# Guide\n",
+	})
+
+	imp := NewImporter(store, regDir, lockPath, slog.Default())
+	_, err := imp.Import(ImportOptions{Repo: repoDir, Path: "skills", Trust: true})
+	require.NoError(t, err)
+
+	skillDir := filepath.Join(regDir, "skills", "legacy-skill")
+	origin, err := ReadOrigin(skillDir)
+	require.NoError(t, err)
+	origin.SupportingFilesInstalled = false
+	require.NoError(t, WriteOrigin(skillDir, origin))
+	require.NoError(t, os.RemoveAll(filepath.Join(skillDir, "references")))
+
+	result, err := imp.Update("legacy-skill", false, false, false)
+	require.NoError(t, err)
+	require.Len(t, result.Imported, 1)
+	assert.FileExists(t, filepath.Join(skillDir, "references", "guide.md"))
+
+	origin, err = ReadOrigin(skillDir)
+	require.NoError(t, err)
+	assert.True(t, origin.SupportingFilesInstalled)
+}
+
+func TestImporter_Update_DoesNotOverwriteUnsnapshottedLegacySkill(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	store, regDir := setupTestRegistry(t)
+	lockPath := filepath.Join(regDir, "skills.lock.yaml")
+	repoDir := initRepoWithSkillContent(t, map[string]string{
+		"skills/legacy/SKILL.md": "---\nname: legacy-skill\ndescription: Upstream\n---\n\nUpstream body.\n",
+	})
+
+	imp := NewImporter(store, regDir, lockPath, slog.Default())
+	_, err := imp.Import(ImportOptions{Repo: repoDir, Path: "skills", Trust: true})
+	require.NoError(t, err)
+
+	skillDir := filepath.Join(regDir, "skills", "legacy-skill")
+	skillFile := filepath.Join(skillDir, "SKILL.md")
+	origin, err := ReadOrigin(skillDir)
+	require.NoError(t, err)
+	origin.SupportingFilesInstalled = false
+	origin.InstalledHash = ""
+	require.NoError(t, WriteOrigin(skillDir, origin))
+	locallyEdited := []byte("---\nname: legacy-skill\ndescription: Local edit\nstate: active\n---\n\nKeep this body.\n")
+	require.NoError(t, os.WriteFile(skillFile, locallyEdited, 0o644))
+
+	result, err := imp.Update("legacy-skill", false, false, false)
+	require.NoError(t, err)
+	assert.Empty(t, result.Imported)
+	installed, err := os.ReadFile(skillFile)
+	require.NoError(t, err)
+	assert.Equal(t, locallyEdited, installed)
+}
+
+// TestImporter_Import_UnknownFrontmatterPreserved is the end-to-end
+// regression test for import stripping unmodeled frontmatter keys: the raw
+// bytes written to the registry must still carry the key.
+func TestImporter_Import_UnknownFrontmatterPreserved(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	store, regDir := setupTestRegistry(t)
+	lockPath := filepath.Join(regDir, "skills.lock.yaml")
+
+	repoDir := initRepoWithSkillContent(t, map[string]string{
+		"skills/hinted/SKILL.md": "---\nname: hinted-skill\ndescription: has a hint\nargument-hint: <task description>\n---\n\nBody.\n",
+	})
+
+	imp := NewImporter(store, regDir, lockPath, slog.Default())
+	result, err := imp.Import(ImportOptions{Repo: repoDir, Path: "skills", Trust: true})
+	require.NoError(t, err)
+	require.Len(t, result.Imported, 1)
+
+	data, err := os.ReadFile(filepath.Join(regDir, "skills", "hinted-skill", "SKILL.md"))
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "argument-hint: <task description>",
+		"imported copy must preserve unmodeled frontmatter keys")
+}
+
+// TestImporter_Update_RestoresStrippedKeys validates the recovery story for
+// registries written before the fix: a re-sync restores keys the old import
+// dropped, without manual cache surgery.
+func TestImporter_Update_RestoresStrippedKeys(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	store, regDir := setupTestRegistry(t)
+	lockPath := filepath.Join(regDir, "skills.lock.yaml")
+
+	repoDir := initRepoWithSkillContent(t, map[string]string{
+		"skills/hinted/SKILL.md": "---\nname: hinted-skill\ndescription: has a hint\nargument-hint: <task description>\n---\n\nBody.\n",
+	})
+
+	imp := NewImporter(store, regDir, lockPath, slog.Default())
+	_, err := imp.Import(ImportOptions{Repo: repoDir, Path: "skills", Trust: true})
+	require.NoError(t, err)
+
+	// Simulate a pre-fix install: strip the key from the installed copy and
+	// make the origin metadata consistent with that state (matching
+	// InstalledHash so it does not read as user drift, stale CommitSHA so an
+	// update is detected).
+	skillDir := filepath.Join(regDir, "skills", "hinted-skill")
+	skillFile := filepath.Join(skillDir, "SKILL.md")
+	stripped := "---\nname: hinted-skill\ndescription: has a hint\nstate: active\n---\n\nBody.\n"
+	require.NoError(t, os.WriteFile(skillFile, []byte(stripped), 0644))
+
+	origin, err := ReadOrigin(skillDir)
+	require.NoError(t, err)
+	strippedHash, err := ContentHashFile(skillFile)
+	require.NoError(t, err)
+	origin.InstalledHash = strippedHash
+	origin.CommitSHA = "0123456789abcdef0123456789abcdef01234567"
+	require.NoError(t, WriteOrigin(skillDir, origin))
+
+	updateResult, err := imp.Update("hinted-skill", false, false, false)
+	require.NoError(t, err)
+	require.Len(t, updateResult.Imported, 1, "warnings: %v", updateResult.Warnings)
+
+	data, err := os.ReadFile(skillFile)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "argument-hint: <task description>",
+		"update must restore keys a pre-fix import dropped")
+}

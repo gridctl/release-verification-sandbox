@@ -1,0 +1,81 @@
+# Binary
+/gridctl
+
+# Build artifacts
+cmd/gridctl/web/
+.task/
+
+# Web dependencies and build
+node_modules/
+web/dist/
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+go.work.sum
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Cache
+.cache/
+.npm/
+.eslintcache
+
+# Test coverage
+coverage.out
+coverage.html
+web/coverage/
+
+# Temporary files
+tmp/
+temp/
+
+# Pricing refresh temp file (task pricing:update writes here before atomic mv)
+pkg/pricing/data/.model_prices.*
+
+# Mock server binaries and PID files
+examples/_mock-servers/local-stdio-server/mock-stdio-server
+examples/_mock-servers/mock-mcp-server/mock-mcp-server
+examples/_mock-servers/mock-mcp-server/.pid-*
+
+# New features
+plan/
+proto/
+
+# Release artifacts
+web/.release-version
+
+# Vendor specific assistant files
+.claude/
+.claude-plugin/
+CLAUDE.md
+GEMINI.md
+dist/

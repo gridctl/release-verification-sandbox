@@ -1,12 +1,102 @@
-name: Sandbox handoff smoke
+name: Sandbox release acceptance
 'on':
-  workflow_dispatch: {}
+  workflow_dispatch: null
 permissions: {}
 jobs:
-  handoff-smoke:
-    name: handoff-smoke
+  release-acceptance:
+    name: release-acceptance
     runs-on: ubuntu-24.04
-    permissions: {}
+    timeout-minutes: 75
+    permissions:
+      contents: write
+      actions: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
     steps:
-    - run: printf "sandbox-handoff-smoke\n"
-run-name: sandbox-verification-20260908T234533Z-8d7f4b2416394578962e9d9fc10153bd
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      with:
+        persist-credentials: false
+    - name: Run the actual tag-bound release workflow
+      id: release
+      run: python3 scripts/release-acceptance.py dispatch
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  verify-linux:
+    name: verify-linux
+    needs: release-acceptance
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_REF: refs/tags/${{ needs.release-acceptance.outputs.tag }}
+      RELEASE_PUBLIC: 'true'
+    steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - uses: ./.github/actions/release-tools
+    - run: python3 scripts/release.py download
+    - run: python3 scripts/release.py verify
+  verify-macos:
+    name: verify-macos
+    needs: release-acceptance
+    runs-on: macos-15
+    permissions:
+      contents: read
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_REF: refs/tags/${{ needs.release-acceptance.outputs.tag }}
+      RELEASE_PUBLIC: 'true'
+    steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - uses: ./.github/actions/release-tools
+    - run: python3 scripts/release.py download
+    - run: python3 scripts/release.py verify
+  negative-gates:
+    name: negative-gates
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_*.py'
+        -v
+  publication-order:
+    name: publication-order
+    needs: release-acceptance
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_REF: refs/tags/${{ needs.release-acceptance.outputs.tag }}
+    steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - run: python3 scripts/release-acceptance.py order
+  inventory:
+    name: inventory
+    needs: release-acceptance
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_REF: refs/tags/${{ needs.release-acceptance.outputs.tag }}
+      RELEASE_PUBLIC: 'true'
+      SPDX_SCHEMA: ${{ runner.temp }}/release-tools/spdx-schema.json
+    steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - uses: ./.github/actions/release-tools
+    - run: python3 scripts/release.py download
+    - run: python3 scripts/release.py verify
+    - run: python3 scripts/release-acceptance.py inventory
+  immutable-mode:
+    name: immutable-mode
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - name: Assert missing, malformed, disabled, and enabled prerequisites
+      run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_release.py
+        -v
+run-name: sandbox-verification-20260909T002419Z-bfe0f32181b1496a95427bf888931e45

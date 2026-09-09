@@ -1,0 +1,29 @@
+# Vault Secrets Example (deprecated syntax — kept as regression test)
+#
+# The ${vault:KEY} syntax used here is deprecated; prefer var-basic.yaml
+# with the canonical ${var:KEY} form. Both resolve through the same store
+# through the beta cycle; ${vault:KEY} support is removed at v1.0.
+#
+# Prerequisites:
+#   gridctl var set GITHUB_TOKEN
+#   gridctl var set OPENAI_API_KEY
+#
+# Usage:
+#   gridctl apply examples/secrets-vault/vault-basic.yaml
+
+version: "1"
+name: vault-basic
+
+mcp-servers:
+  - name: github
+    image: ghcr.io/github/github-mcp-server:latest
+    transport: stdio
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "${vault:GITHUB_TOKEN}"
+
+  - name: ai-service
+    image: ghcr.io/org/ai-mcp-server:latest
+    port: 3000
+    env:
+      OPENAI_API_KEY: "${vault:OPENAI_API_KEY}"
+      LOG_LEVEL: "info"                # Non-secret values work as usual

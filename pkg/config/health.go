@@ -1,0 +1,333 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/gridctl/gridctl/pkg/flags"
+	"github.com/gridctl/gridctl/pkg/registry"
+)
+
+// IssueSeverity represents the severity level of a validation issue.
+type IssueSeverity string
+
+const (
+	SeverityError   IssueSeverity = "error"
+	SeverityWarning IssueSeverity = "warning"
+	SeverityInfo    IssueSeverity = "info"
+)
+
+// ValidationIssue is a validation finding with severity level.
+type ValidationIssue struct {
+	Field    string        `json:"field"`
+	Message  string        `json:"message"`
+	Severity IssueSeverity `json:"severity"`
+}
+
+// ValidationResult holds the complete output of spec validation.
+type ValidationResult struct {
+	Valid        bool              `json:"valid"`
+	ErrorCount   int               `json:"errorCount"`
+	WarningCount int               `json:"warningCount"`
+	Issues       []ValidationIssue `json:"issues"`
+}
+
+// SpecHealth aggregates validation, drift, and dependency status.
+type SpecHealth struct {
+	Validation   ValidationStatus `json:"validation"`
+	Drift        DriftStatus      `json:"drift"`
+	Dependencies DependencyStatus `json:"dependencies"`
+
+	// Replicas reports live per-replica health for every server that has
+	// more than one replica registered. Servers with replicas <= 1 are
+	// omitted so the shape is backward compatible with single-replica
+	// deployments. Keyed by server name.
+	Replicas map[string][]ReplicaHealth `json:"replicas,omitempty"`
+}
+
+// ReplicaHealth describes the live state of one replica in a server's
+// ReplicaSet. Durations use seconds so the JSON representation does not
+// depend on Go's time formatting.
+type ReplicaHealth struct {
+	ReplicaID        int    `json:"replicaId"`
+	State            string `json:"state"` // "healthy" | "unhealthy" | "restarting"
+	InFlight         int64  `json:"inFlight"`
+	UptimeSeconds    int64  `json:"uptimeSeconds,omitempty"`
+	LastError        string `json:"lastError,omitempty"`
+	NextRetrySeconds int64  `json:"nextRetrySeconds,omitempty"`
+	RestartAttempts  uint32 `json:"restartAttempts,omitempty"`
+	PID              int    `json:"pid,omitempty"`
+	ContainerID      string `json:"containerId,omitempty"`
+}
+
+// ValidationStatus summarizes the spec validation state.
+type ValidationStatus struct {
+	Status       string `json:"status"` // "valid", "warnings", "errors"
+	ErrorCount   int    `json:"errorCount"`
+	WarningCount int    `json:"warningCount"`
+}
+
+// DriftStatus summarizes drift between spec and running state.
+type DriftStatus struct {
+	Status  string   `json:"status"` // "in-sync", "drifted", "unknown"
+	Added   []string `json:"added,omitempty"`
+	Removed []string `json:"removed,omitempty"`
+	Changed []string `json:"changed,omitempty"`
+}
+
+// DependencyStatus summarizes skill dependency resolution.
+type DependencyStatus struct {
+	Status  string   `json:"status"` // "resolved", "missing"
+	Missing []string `json:"missing,omitempty"`
+}
+
+// ValidateWithIssues runs full validation and returns structured issues with severity.
+// This wraps the existing Validate() and adds warning-level checks.
+func ValidateWithIssues(s *Stack) *ValidationResult {
+	result := &ValidationResult{Valid: true}
+
+	// Run existing validation to get errors
+	if err := Validate(s); err != nil {
+		result.Valid = false
+		if ve, ok := err.(ValidationErrors); ok {
+			for _, e := range ve {
+				result.Issues = append(result.Issues, ValidationIssue{
+					Field:    e.Field,
+					Message:  e.Message,
+					Severity: SeverityError,
+				})
+				result.ErrorCount++
+			}
+		} else {
+			// Unexpected error type from validation
+			result.Issues = append(result.Issues, ValidationIssue{
+				Field:    "stack",
+				Message:  err.Error(),
+				Severity: SeverityError,
+			})
+			result.ErrorCount++
+		}
+	}
+
+	// Add warning-level checks
+	result.addWarnings(s)
+
+	return result
+}
+
+// addWarnings appends warning-level issues for non-critical findings.
+func (r *ValidationResult) addWarnings(s *Stack) {
+	hasNetworks := len(s.Networks) > 0
+
+	// Warn about network field set on non-container servers in simple mode
+	if !hasNetworks {
+		for i, srv := range s.MCPServers {
+			if srv.Network != "" && !srv.IsContainerBased() {
+				r.Issues = append(r.Issues, ValidationIssue{
+					Field:    fmt.Sprintf("mcp-servers[%d].network", i),
+					Message:  "network field ignored for non-container servers",
+					Severity: SeverityWarning,
+				})
+				r.WarningCount++
+			}
+		}
+	}
+
+	// Warn about TLS cert/key/ca files that don't exist yet (may be created before apply)
+	for i, srv := range s.MCPServers {
+		if srv.OpenAPI == nil || srv.OpenAPI.TLS == nil {
+			continue
+		}
+		tlsPrefix := fmt.Sprintf("mcp-servers[%d].openapi.tls", i)
+		tls := srv.OpenAPI.TLS
+		for _, f := range []struct{ field, path string }{
+			{tlsPrefix + ".certFile", tls.CertFile},
+			{tlsPrefix + ".keyFile", tls.KeyFile},
+			{tlsPrefix + ".caFile", tls.CaFile},
+		} {
+			if f.path == "" {
+				continue
+			}
+			if _, err := os.Stat(f.path); err != nil {
+				r.Issues = append(r.Issues, ValidationIssue{
+					Field:    f.field,
+					Message:  fmt.Sprintf("file not found or not readable: %s", f.path),
+					Severity: SeverityWarning,
+				})
+				r.WarningCount++
+			}
+		}
+	}
+
+	// Warn about gateway without auth
+	if s.Gateway != nil && s.Gateway.Auth == nil {
+		r.Issues = append(r.Issues, ValidationIssue{
+			Field:    "gateway.auth",
+			Message:  "no authentication configured — gateway is publicly accessible",
+			Severity: SeverityWarning,
+		})
+		r.WarningCount++
+	}
+
+	r.addExperimentalIssues(flags.Default(), s)
+	r.addSkillsPolicyIssues(s)
+	r.addModelPreferencesIssues(s)
+}
+
+// addModelPreferencesIssues reports on the `model_preferences:` block.
+// All findings are advisory (warnings and info; the block can never
+// fail validation): model alias vocabularies churn on client-release
+// timescales, and an unknown override name may simply arrive later via
+// pack. The value check is `model-preference-unknown-alias`; content
+// checks that need the registry (unhonored targets, portability) join
+// at the cmd layer like the skills-policy apply warnings.
+func (r *ValidationResult) addModelPreferencesIssues(s *Stack) {
+	if s.ModelPreferences == nil {
+		return
+	}
+	checkScope := func(name string, scope *ModelPreferenceScope) {
+		if scope == nil {
+			return
+		}
+		warnValue := func(field, value string) {
+			if value == "" || registry.IsKnownModelValue(value) {
+				return
+			}
+			r.Issues = append(r.Issues, ValidationIssue{
+				Field:    field,
+				Message:  fmt.Sprintf("model-preference-unknown-alias: %q is neither a documented alias (%s) nor shaped like a full model ID; clients fall back to their own default for values they cannot resolve", value, strings.Join(registry.KnownModelAliases(), ", ")),
+				Severity: SeverityWarning,
+			})
+			r.WarningCount++
+		}
+		warnValue("model_preferences."+name+".default", scope.Default)
+		keys := make([]string, 0, len(scope.Overrides))
+		for k := range scope.Overrides {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			warnValue("model_preferences."+name+".overrides."+k, scope.Overrides[k])
+		}
+		if scope.Rewrite {
+			detail := fmt.Sprintf("%d override(s)", len(scope.Overrides))
+			if scope.Default != "" {
+				detail += fmt.Sprintf(", default %q applies to every projected %s with no declared preference (affected projections are forced to copy channel)", scope.Default, strings.TrimSuffix(name, "s"))
+			}
+			r.Issues = append(r.Issues, ValidationIssue{
+				Field:    "model_preferences." + name,
+				Message:  "projection rewrite enabled for " + name + ": " + detail,
+				Severity: SeverityInfo,
+			})
+		}
+	}
+	checkScope("skills", s.ModelPreferences.Skills)
+	checkScope("agents", s.ModelPreferences.Agents)
+}
+
+// addSkillsPolicyIssues reports on the `skills:` exposure block. Validate has
+// no registry access, so which skills a rule actually hides is an apply-time
+// warning; here the checks are shape-level: a default-deny block with no
+// allow list hides every skill (legal, but worth a deliberate look), and a
+// present block surfaces as an info line so `gridctl validate` shows that a
+// skill exposure policy is in force.
+func (r *ValidationResult) addSkillsPolicyIssues(s *Stack) {
+	if s.Skills == nil {
+		return
+	}
+	if s.Skills.Default == "deny" && len(s.Skills.Allow) == 0 {
+		r.Issues = append(r.Issues, ValidationIssue{
+			Field:    "skills.default",
+			Message:  "default: deny with no allow list hides every registry skill from clients and projection",
+			Severity: SeverityWarning,
+		})
+		r.WarningCount++
+	}
+	r.Issues = append(r.Issues, ValidationIssue{
+		Field:    "skills",
+		Message:  fmt.Sprintf("skill exposure policy in force (%d allow, %d deny pattern(s)); denied active skills are named at apply time", len(s.Skills.Allow), len(s.Skills.Deny)),
+		Severity: SeverityInfo,
+	})
+}
+
+// addExperimentalIssues reports on the `experimental:` map: unknown flag
+// names and concluded (graduated/removed) names surface as warnings with the
+// registry's migration text, and each enabled valid flag surfaces as an
+// info-level line so `gridctl validate` and the UI panel show active
+// experiments. Warnings only — an unrecognized name never blocks a deploy
+// (Article IX: a stack written against a newer gridctl must still start).
+func (r *ValidationResult) addExperimentalIssues(reg *flags.Registry, s *Stack) {
+	for _, w := range flags.CheckNames(reg, s.Experimental) {
+		r.Issues = append(r.Issues, ValidationIssue{
+			Field:    "experimental." + w.Name,
+			Message:  w.Message,
+			Severity: SeverityWarning,
+		})
+		r.WarningCount++
+	}
+	names := make([]string, 0, len(s.Experimental))
+	for name, on := range s.Experimental {
+		if !on {
+			continue
+		}
+		if f, ok := reg.Lookup(name); ok && f.Stage == flags.StageExperimental {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		r.Issues = append(r.Issues, ValidationIssue{
+			Field:    "experimental." + name,
+			Message:  "experimental flag enabled",
+			Severity: SeverityInfo,
+		})
+	}
+}
+
+// ExpandStackVarsWithEnv expands environment variable references in stack fields.
+func ExpandStackVarsWithEnv(s *Stack) {
+	_ = ExpandStackVarsWithEnvChecked(s)
+}
+
+// ExpandStackVarsWithEnvChecked expands environment references and returns a
+// typed error when a reserved internal credential is referenced.
+func ExpandStackVarsWithEnvChecked(s *Stack) error {
+	_, _, problems := expandStackVarsResolved(s, newReferenceResolver(nil))
+	if len(problems) > 0 {
+		return problems[0]
+	}
+	return nil
+}
+
+// ValidateStackFile loads a stack file and validates it without deploying.
+// Returns the parsed stack (for further use) and the validation result.
+func ValidateStackFile(path string) (*Stack, *ValidationResult, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading stack file: %w", err)
+	}
+
+	var stack Stack
+	if err := yaml.Unmarshal(data, &stack); err != nil {
+		return nil, nil, fmt.Errorf("parsing stack YAML: %w", err)
+	}
+
+	// Expand environment variables without allowing bootstrap credentials to
+	// cross into the parsed stack used by validation and export callers.
+	_, _, resolutionProblems := expandStackVarsResolved(&stack, newReferenceResolver(nil))
+	if len(resolutionProblems) > 0 {
+		return nil, nil, fmt.Errorf("resolving stack variable: %w", resolutionProblems[0])
+	}
+
+	// Apply defaults
+	stack.SetDefaults()
+
+	// Validate with severity
+	result := ValidateWithIssues(&stack)
+
+	return &stack, result, nil
+}

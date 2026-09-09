@@ -1,0 +1,202 @@
+// Package project is the generic projection engine behind pkg/skillsync,
+// pkg/contexts, pkg/agentsync, and pkg/wiring: "project canonical content
+// into per-client locations with lockfile-tracked ownership." The engine
+// owns the unified lockfile (schema, two-tier versioning, migration from
+// the legacy lockfiles, cross-process locking) and the shared vocabulary
+// (states, dry-run actions, hash-scheme prefix, atomic writes, backup
+// pruning).
+//
+// A kind yields a set of (source, target) projection keys: the contexts
+// adapter records one source ("global") fanned to N clients (plus one
+// source per fragment in fragments mode); the skills adapter records one
+// source per projected skill. Everything the kinds do differently on
+// purpose stays in the kind packages:
+// target tables, channel/strategy resolution, hashing (tree vs content),
+// backup placement, status enumeration mode, rendering, and remediation
+// text. The engine deliberately does not force a uniform Target or a
+// shared sync loop; the frozen CLI contracts are per-kind and the
+// characterization tests in cmd/gridctl arbitrate.
+package project
+
+import (
+	"errors"
+	"sort"
+	"time"
+)
+
+// Kind identifies a projection tenant.
+type Kind string
+
+const (
+	// KindSkill projects registry skill directories into client skill
+	// dirs (pkg/skillsync).
+	KindSkill Kind = "skill"
+	// KindContext projects the canonical global context file into client
+	// context locations (pkg/contexts).
+	KindContext Kind = "context"
+	// KindAgent projects imported agent definitions into client agent
+	// directories as single files (pkg/agentsync).
+	KindAgent Kind = "agent"
+	// KindWiring records ownership of gateway entries merged into client
+	// MCP configs (pkg/wiring): key-level ownership inside files gridctl
+	// does not otherwise own, per Article XVI.
+	KindWiring Kind = "wiring"
+	// KindContextFragment projects one context rule fragment as its own
+	// file into a client rules directory (pkg/contexts fragments mode).
+	// A separate kind from KindContext on purpose: contexts flushes its
+	// per-client entries with ReplaceKind, and an older gridctl that only
+	// knows KindContext must never be able to drop or clobber fragment
+	// records it cannot represent.
+	KindContextFragment Kind = "context-fragment"
+	// KindModels projects the model routing policy into a LiteLLM router
+	// fragment, the include: line referencing it in the parent LiteLLM
+	// config, and client provider config (pkg/modelsync). Its own kind
+	// for the same reason as KindContextFragment: an older gridctl that
+	// cannot represent these records must never drop them via
+	// ReplaceKind.
+	KindModels Kind = "models"
+)
+
+// Projection states shared by every kind. Kinds may extend the
+// vocabulary (contexts adds "unsupported" and "never-synced").
+const (
+	StateInSync        = "in-sync"
+	StateStale         = "stale"
+	StateDrifted       = "drifted"
+	StateTargetMissing = "target-missing"
+)
+
+// Actions shared by every kind's sync results. Kind-specific actions
+// (linked, copied, created, ...) stay in the kind packages.
+const (
+	ActionUpdated            = "updated"
+	ActionUnchanged          = "unchanged"
+	ActionError              = "error"
+	ActionSkippedDrift       = "skipped-drift"
+	ActionSkippedUnavailable = "skipped-unavailable"
+	ActionWouldUpdate        = "would-update"
+)
+
+// ChannelReasonModelPolicy is the Entry.ChannelReason value marking a
+// projection whose installed bytes carry a stack model preference
+// rewrite. Defined once in the engine so the skill and agent kinds can
+// never drift apart on the string.
+const ChannelReasonModelPolicy = "model-policy"
+
+// HashScheme prefixes every stored hash so a future scheme change never
+// presents as false drift (the pkg/pins lesson).
+const HashScheme = "sha256:"
+
+// ErrNewerLockVersion signals a lockfile written by a newer gridctl.
+// Callers must never paper over it: acting on state a newer version
+// wrote risks silent data loss.
+var ErrNewerLockVersion = errors.New("project lockfile was written by a newer gridctl version")
+
+// ErrPathConflict signals two projections claiming the same destination
+// path. The unified lockfile exists to enforce the opposite invariant:
+// one destination has exactly one owner.
+var ErrPathConflict = errors.New("destination path is already owned by another projection")
+
+// Entry is one recorded (kind, source, client) projection. The primary
+// key is (client, path): one destination path has exactly one owner.
+// The kind-specific attribute fields form a union across the two kinds;
+// the engine stores them but never interprets them, and each kind's
+// adapter reads only its own. Extra preserves fields this binary does
+// not understand, so a revision bump by a newer gridctl survives a
+// rewrite by this one (Article XVII).
+type Entry struct {
+	Kind   Kind   `yaml:"kind"`
+	Client string `yaml:"client"`
+	// Source names what is projected: the skill name for KindSkill, the
+	// scope ("global") for KindContext.
+	Source string `yaml:"source"`
+	// Path is the absolute destination path gridctl wrote or created.
+	Path string `yaml:"path"`
+
+	// KindSkill attributes.
+	Channel          string `yaml:"channel,omitempty"`
+	CreatedByGridctl bool   `yaml:"created_by_gridctl,omitempty"`
+	TreeHash         string `yaml:"tree_hash,omitempty"`
+	// ChannelReason records why the CHANNEL diverges from what the user
+	// or target table chose: ChannelReasonModelPolicy marks a skill
+	// projection forced off symlink because its bytes carry a policy
+	// rewrite. Empty when the channel is the user's own choice (a --copy
+	// the policy merely rewrote keeps its empty reason, so the copy
+	// stays sticky when the policy goes away). Absent in pre-existing
+	// lockfiles, which migrate-on-read as empty.
+	ChannelReason string `yaml:"channel_reason,omitempty"`
+	// ModelValue records the model preference a policy rewrite wrote
+	// into the projected bytes; non-empty is the "bytes are rewritten"
+	// marker the preserve rule and adopt key on, and the value itself
+	// lets adopt distinguish the policy's write from a deliberate user
+	// edit of the same key. Empty for pass-through projections. Skill
+	// and agent kinds both use it.
+	ModelValue string `yaml:"model_value,omitempty"`
+
+	// KindContext attributes.
+	Strategy      string `yaml:"strategy,omitempty"`
+	InstalledHash string `yaml:"installed_hash,omitempty"`
+	CanonicalHash string `yaml:"canonical_hash,omitempty"`
+	CreatedFile   bool   `yaml:"created_file,omitempty"`
+	// InputHashes records, for a compiled context target, each input
+	// fragment's canonical hash at sync time (fragment name -> hash), so
+	// staleness can name which fragment moved instead of only "the
+	// composite changed". Absent outside fragments mode.
+	InputHashes map[string]string `yaml:"input_hashes,omitempty"`
+
+	// KindWiring attributes. Path is the composite "<config path>#<entry
+	// name>" (one config file legitimately holds several owned entries, and
+	// the one-owner invariant keys on the full Path); ConfigPath is the real
+	// file path so no consumer parses the composite. Hashes is the short
+	// history of canonical value hashes gridctl wrote, newest last, so a
+	// shape change by a newer gridctl never reads as user drift.
+	ConfigPath string   `yaml:"config_path,omitempty"`
+	Group      string   `yaml:"group,omitempty"`
+	ClientID   string   `yaml:"client_id,omitempty"`
+	Hashes     []string `yaml:"hashes,omitempty"`
+
+	// KindModels attributes. AckedHash is the restart latch on the
+	// rendered LiteLLM fragment: sync moves only InstalledHash, and the
+	// target reports restart-pending until `gridctl models ack-restart`
+	// copies InstalledHash here; sync never clears the latch itself.
+	// IncludeRef is the include path written into the parent LiteLLM
+	// config (relative to the parent's directory when possible);
+	// IncludeMode records how the include: key was mutated (created |
+	// appended | promoted | flow) so unsync restores the prior shape,
+	// with IncludeOriginal holding the scalar a promotion replaced.
+	AckedHash       string `yaml:"acked_hash,omitempty"`
+	IncludeRef      string `yaml:"include_ref,omitempty"`
+	IncludeMode     string `yaml:"include_mode,omitempty"`
+	IncludeOriginal string `yaml:"include_original,omitempty"`
+
+	// Pack tags the projection with the pack that applied it (empty =
+	// not pack-managed). Any kind may carry it; `gridctl pack` uses it
+	// for scoped status and cascade removal.
+	Pack string `yaml:"pack,omitempty"`
+
+	SyncedAt time.Time `yaml:"synced_at"`
+
+	Extra map[string]any `yaml:",inline"`
+}
+
+// key identifies one projection for lookups.
+type key struct {
+	kind   Kind
+	client string
+	source string
+}
+
+// sortEntries orders entries deterministically (kind, source, client)
+// so the lockfile is stable across rewrites.
+func sortEntries(entries []*Entry) {
+	sort.Slice(entries, func(i, j int) bool {
+		a, b := entries[i], entries[j]
+		if a.Kind != b.Kind {
+			return a.Kind < b.Kind
+		}
+		if a.Source != b.Source {
+			return a.Source < b.Source
+		}
+		return a.Client < b.Client
+	})
+}

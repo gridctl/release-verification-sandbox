@@ -1,0 +1,49 @@
+name: NPM Audit Fix
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  audit-fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v5
+    - name: Set up Node.js
+      uses: actions/setup-node@v5
+      with:
+        node-version: '22'
+    - name: Capture current advisories
+      working-directory: web
+      run: "npm audit --json > /tmp/audit-before.json || true\njq -r '\n  [.vulnerabilities[]?.via[]?\
+        \ | objects\n   | {id: (.url // \"\" | split(\"/\") | last), title, severity}]\n\
+        \  | unique_by(.id)\n  | map(\"| \\(.id) | \\(.severity) | \\(.title) |\"\
+        )\n  | join(\"\\n\")\n' /tmp/audit-before.json > /tmp/advisories.md\necho\
+        \ \"TOTAL=$(jq '.metadata.vulnerabilities.total // 0' /tmp/audit-before.json)\"\
+        \ >> \"$GITHUB_ENV\"\n"
+    - name: Apply compatible fixes
+      working-directory: web
+      run: npm audit fix
+    - name: Compose pull request body
+      run: "{\n  echo \"Automated \\`npm audit fix\\` for \\`web/\\`.\"\n  echo\n\
+        \  echo \"Advisories reported before fixing (${TOTAL} vulnerable paths):\"\
+        \n  echo\n  echo \"| Advisory | Severity | Title |\"\n  echo \"|---|---|---|\"\
+        \n  cat /tmp/advisories.md\n  echo\n  echo \"Only semver-compatible updates\
+        \ are applied (no \\`--force\\`);\"\n  echo \"anything needing a major bump\
+        \ is still listed by the frontend\"\n  echo \"job's audit gate and needs a\
+        \ manual fix. This PR is opened by\"\n  echo \"the scheduled \\`NPM Audit\
+        \ Fix\\` workflow; re-runs update it in\"\n  echo \"place rather than opening\
+        \ duplicates.\"\n} > /tmp/pr-body.md\n"
+    - name: Create or update pull request
+      uses: peter-evans/create-pull-request@v8
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        base: main
+        branch: chore/npm-audit-fix
+        delete-branch: true
+        sign-commits: true
+        commit-message: 'chore: apply npm audit fix in web'
+        title: 'chore: apply npm audit fix in web'
+        labels: chore
+        body-path: /tmp/pr-body.md

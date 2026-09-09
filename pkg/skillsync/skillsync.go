@@ -1,0 +1,160 @@
+// Package skillsync projects active registry skills into native client
+// skill directories (Claude Code's ~/.claude/skills, the vendor-neutral
+// ~/.agents/skills interop dir, Antigravity's ~/.gemini/config/skills) so
+// gridctl-managed skills are usable in clients that never fetch MCP
+// prompts and auto-trigger in clients that read skills from disk. It is
+// the directory-projection sibling of pkg/contexts: a per-client target
+// table, a machine-global lockfile with ownership tracking, and
+// sync/status/unsync operations. Every operation is a pure file
+// operation; no running gateway is required. The MCP prompt channel is
+// untouched: projection and prompts are complementary per-client
+// delivery channels.
+package skillsync
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"sync"
+
+	"github.com/gridctl/gridctl/pkg/project"
+	"github.com/gridctl/gridctl/pkg/registry"
+	"github.com/gridctl/gridctl/pkg/state"
+)
+
+// Sentinel errors callers branch on.
+var (
+	ErrUnknownClient = errors.New("unknown client")
+	ErrNotAvailable  = errors.New("client not initialized on this machine")
+	ErrNotProjected  = errors.New("skill is not projected")
+)
+
+// lockFileName is the unified engine lockfile, shared with context,
+// agent, and wiring projections (the legacy skillsync.lock.yaml
+// migrates into it).
+const lockFileName = "project.lock.yaml"
+
+// SkillSource is the slice of the registry store projection reads. The
+// concrete *registry.Store satisfies it; tests can substitute a fake.
+type SkillSource interface {
+	// GetSkill returns a skill by name (a copy).
+	GetSkill(name string) (*registry.AgentSkill, error)
+	// ActiveSkills returns skills with state "active" (copies).
+	ActiveSkills() []*registry.AgentSkill
+	// Dir returns the registry base directory (skills live under
+	// Dir()/skills).
+	Dir() string
+}
+
+// Manager owns skill projections and every write into client skill
+// directories. All target paths resolve against home, so tests point it
+// at a temp dir. Mutating operations serialize on mu in-process and on
+// the engine's cross-process lock (the CLI and the daemon reconcile can
+// race).
+type Manager struct {
+	home   string
+	source SkillSource
+	store  *project.Store
+	mu     sync.Mutex
+
+	// policy is the optional skill exposure check (the stack.yaml `skills:`
+	// block, compiled by the controller). It reports whether a skill may be
+	// projected and, on denial, the rule responsible. nil allows everything —
+	// CLI call sites without stack context keep full authority, matching the
+	// wiring kind's "daemon enforces, human overrides" posture. A plain func
+	// keeps skillsync decoupled from the policy's home package.
+	policy func(name string) (allowed bool, rule string)
+
+	// modelPolicy is the optional compiled `model_preferences.skills`
+	// scope, installed by the controller (daemon) or a --stack-carrying
+	// CLI invocation. nil means no stack context: pass-through for new
+	// projections, preserve for projections a policy previously rewrote
+	// (model policy is stateful on disk, so a policy-less sync must not
+	// undo the daemon's work).
+	modelPolicy *registry.ModelPolicy
+}
+
+// SetModelPolicy installs the compiled model preference policy for the
+// skills scope. Passing nil removes it (pass-through plus preserve).
+func (m *Manager) SetModelPolicy(p *registry.ModelPolicy) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.modelPolicy = p
+}
+
+// currentModelPolicy reads the installed policy under the manager
+// mutex, for lock-free read paths (Statuses) racing SetModelPolicy.
+func (m *Manager) currentModelPolicy() *registry.ModelPolicy {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.modelPolicy
+}
+
+// SetPolicy installs the skill exposure check. Passing nil removes it.
+func (m *Manager) SetPolicy(policy func(name string) (allowed bool, rule string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.policy = policy
+}
+
+// policyDenied reports whether the policy denies a skill, with the rule.
+// Caller must hold m.mu.
+func (m *Manager) policyDenied(name string) (bool, string) {
+	if m.policy == nil {
+		return false, ""
+	}
+	allowed, rule := m.policy(name)
+	return !allowed, rule
+}
+
+// NewManager builds a Manager rooted at the user's home directory. It
+// is for end-of-the-line CLI call sites only: any caller in pkg/ or
+// internal/ that tests can reach must use NewManagerWithHome so an
+// injected home keeps the suite away from real client skill
+// directories.
+func NewManager(store SkillSource) (*Manager, error) {
+	home, err := state.Home()
+	if err != nil {
+		return nil, fmt.Errorf("resolving home directory: %w", err)
+	}
+	return NewManagerWithHome(home, store), nil
+}
+
+// NewManagerWithHome builds a Manager rooted at an explicit home
+// directory. Tests use this to stay isolated from $HOME.
+func NewManagerWithHome(home string, store SkillSource) *Manager {
+	return &Manager{home: home, source: store, store: project.NewStore(home)}
+}
+
+// LockPath returns the projection lockfile path
+// (<home>/.gridctl/project.lock.yaml, a sibling of the registry).
+func (m *Manager) LockPath() string {
+	return filepath.Join(m.home, ".gridctl", lockFileName)
+}
+
+// HasProjections reports whether any skill is currently projected. The
+// daemon reconcile uses it as a cheap no-op guard (through the
+// context-aware form; this signature stays context-free for existing
+// callers).
+func (m *Manager) HasProjections() (bool, error) {
+	return m.hasProjections(context.Background())
+}
+
+// hasProjections is HasProjections honoring the caller's context.
+func (m *Manager) hasProjections(ctx context.Context) (bool, error) {
+	lf, err := m.loadView(ctx)
+	if err != nil {
+		return false, err
+	}
+	return len(lf.Projections) > 0, nil
+}
+
+// skillSourceDir returns the registry directory holding one skill.
+func (m *Manager) skillSourceDir(sk *registry.AgentSkill) string {
+	dir := sk.Name
+	if sk.Dir != "" {
+		dir = sk.Dir
+	}
+	return filepath.Join(m.source.Dir(), "skills", dir)
+}

@@ -1,0 +1,1407 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/gridctl/gridctl/internal/openapipreview"
+	"github.com/gridctl/gridctl/internal/probe"
+	"github.com/gridctl/gridctl/pkg/agentsync"
+	"github.com/gridctl/gridctl/pkg/builder"
+	"github.com/gridctl/gridctl/pkg/config"
+	"github.com/gridctl/gridctl/pkg/contexts"
+	"github.com/gridctl/gridctl/pkg/dockerclient"
+	"github.com/gridctl/gridctl/pkg/limits"
+	"github.com/gridctl/gridctl/pkg/logging"
+	"github.com/gridctl/gridctl/pkg/mcp"
+	"github.com/gridctl/gridctl/pkg/mcpauth"
+	"github.com/gridctl/gridctl/pkg/metrics"
+	"github.com/gridctl/gridctl/pkg/modelsync"
+	"github.com/gridctl/gridctl/pkg/packops"
+	"github.com/gridctl/gridctl/pkg/pins"
+	"github.com/gridctl/gridctl/pkg/provisioner"
+	"github.com/gridctl/gridctl/pkg/registry"
+	"github.com/gridctl/gridctl/pkg/reload"
+	"github.com/gridctl/gridctl/pkg/resetops"
+	"github.com/gridctl/gridctl/pkg/runtime/docker"
+	"github.com/gridctl/gridctl/pkg/skillpins"
+	"github.com/gridctl/gridctl/pkg/state"
+	"github.com/gridctl/gridctl/pkg/tracing"
+	"github.com/gridctl/gridctl/pkg/vault"
+	"github.com/gridctl/gridctl/pkg/wiring"
+)
+
+// HTTP status code for locked vault.
+const statusLocked = 423
+
+// Server provides the combined API server for gridctl.
+type Server struct {
+	gateway            *mcp.Gateway
+	streamableServer   *mcp.StreamableHTTPServer
+	sseServer          *mcp.SSEServer
+	staticFS           fs.FS
+	dockerClient       dockerclient.DockerClient
+	stackName          string
+	logBuffer          *logging.LogBuffer
+	reloadHandler      *reload.Handler
+	modelPolicies      func() (skillPolicy, agentPolicy *registry.ModelPolicy)
+	provisioners       *provisioner.Registry
+	linkServerName     string
+	registryServer     *registry.Server
+	pinStore           *pins.PinStore
+	skillPinStore      *skillpins.Store
+	vaultStore         *vault.Store
+	metricsAccumulator *metrics.Accumulator
+	traceBuffer        *tracing.Buffer
+	stackFile          string
+	allowedOrigins     []string
+	allowedHosts       []string
+	authType           string
+	authToken          string
+	authHeader         string
+
+	gatewayAddr   string // e.g. "http://localhost:8180" — used to build MCP config for CLI proxy
+	tokenizerName string // active tokenizer mode: "embedded" or "api"
+
+	// features returns the enabled experimental flags (stack.yaml
+	// `experimental:` plus env overrides), for the /api/status features
+	// payload. Nil means no flag support is wired. Must be safe for
+	// concurrent calls and must reflect hot-reload swaps.
+	features func() []FeatureStatus
+
+	// limitsStatus returns the rate-limits state snapshot for
+	// GET /api/limits. Nil means the builder wired no limits support (the
+	// endpoint then reports configured: false). Must be safe for concurrent
+	// calls and must reflect hot-reload policy swaps.
+	limitsStatus func() limits.StatusReport
+
+	// startWatcher, when set, starts a file watcher on the given stack path.
+	// Injected by GatewayBuilder so POST /api/stack/initialize can activate live reload.
+	startWatcher func(stackPath string)
+
+	// prober enumerates an MCP server's tool list ephemerally (not registered
+	// with the gateway). Nil disables the /api/servers/probe endpoint.
+	prober       *probe.Prober
+	probeLimiter *probeLimiter
+
+	// openapiPreviewer parses an OpenAPI spec so the wizard can list its
+	// operations before deploy. Nil disables /api/openapi/operations.
+	openapiPreviewer      *openapipreview.Previewer
+	openapiPreviewLimiter *probeLimiter
+
+	// oauthBroker handles downstream OAuth for external servers. Nil
+	// disables the /api/servers/{name}/auth/* endpoints and the
+	// /oauth/callback route.
+	oauthBroker *mcpauth.Broker
+
+	// Skill source paths. Empty values fall back to the global defaults
+	// (skills.LockFilePath / skills.SkillsConfigPath / skills.UpdateCachePath)
+	// so production code is unchanged; tests inject temp paths to stay
+	// isolated from $HOME.
+	skillLockPath        string
+	skillsConfigPath     string
+	skillUpdateCachePath string
+
+	// stacksDir overrides the saved-stacks directory. Empty falls back
+	// to state.StacksDir() so production code is unchanged; tests
+	// inject a temp dir to stay isolated from $HOME.
+	stacksDir string
+
+	// Global-context manager (pkg/contexts), lazily built against the
+	// real home directory on first use; tests inject a temp-dir manager
+	// via SetContextsManager. Pure file operations — works stackless.
+	contextsManager *contexts.Manager
+	contextsOnce    sync.Once
+	contextsErr     error
+
+	// Wiring ownership manager (pkg/wiring), lazily built against the
+	// real home directory on first use; tests inject a temp-home manager
+	// via SetWiringManager.
+	wiringManager *wiring.Manager
+	wiringOnce    sync.Once
+	wiringErr     error
+
+	// Agent projection manager (pkg/agentsync), lazily built against the
+	// real home directory and the live registry dir on first use; tests
+	// inject a temp manager via SetAgentsManager.
+	agentsManager *agentsync.Manager
+	agentsOnce    sync.Once
+	agentsErr     error
+
+	// Model routing manager (pkg/modelsync), lazily built against the
+	// real home directory on first use; tests inject a temp-home manager
+	// via SetModelsManager. Shared with the reset engine so in-process
+	// mutations serialize on one mutex.
+	modelsManager *modelsync.Manager
+	modelsOnce    sync.Once
+	modelsErr     error
+
+	// Pack orchestration engine (pkg/packops), lazily built from the
+	// other kind managers on first use; tests inject a temp-home engine
+	// via SetPacksManagers.
+	packsManagers *packops.Managers
+	packsOnce     sync.Once
+	packsErr      error
+
+	// Reset engine (pkg/resetops), lazily built from the same kind
+	// managers; tests inject a temp-home engine via SetResetManagers.
+	// resetTokenStore holds the single-use preview-issued confirm
+	// tokens; resetRunning serializes executions (409 on overlap).
+	resetManagers   *resetops.Managers
+	resetOnce       sync.Once
+	resetErr        error
+	resetRuntime    resetops.Runtime
+	resetTokenStore resetTokens
+	resetRunning    atomic.Bool
+	resetExit       func(int)
+
+	pythonSources pythonSourcePlanner
+}
+
+// SetWiringManager injects the wiring ownership manager. Tests use it
+// to keep link handlers away from the real home directory.
+func (s *Server) SetWiringManager(m *wiring.Manager) {
+	s.wiringOnce.Do(func() {})
+	s.wiringManager = m
+}
+
+// wiringMgr returns the wiring ownership manager, building it against
+// the user's home directory on first use.
+func (s *Server) wiringMgr() (*wiring.Manager, error) {
+	s.wiringOnce.Do(func() {
+		if s.wiringManager != nil {
+			return
+		}
+		s.wiringManager, s.wiringErr = wiring.NewManager()
+	})
+	return s.wiringManager, s.wiringErr
+}
+
+// NewServer creates a new API server.
+func NewServer(gateway *mcp.Gateway, staticFS fs.FS) *Server {
+	return &Server{
+		gateway:          gateway,
+		streamableServer: mcp.NewStreamableHTTPServer(gateway, nil),
+		sseServer:        mcp.NewSSEServer(gateway),
+		staticFS:         staticFS,
+		pythonSources:    builder.New(nil),
+	}
+}
+
+// SetDockerClient sets the Docker client for container operations.
+func (s *Server) SetDockerClient(cli dockerclient.DockerClient) {
+	s.dockerClient = cli
+	s.pythonSources = builder.New(cli)
+}
+
+// SetStackName sets the stack name for container lookups.
+func (s *Server) SetStackName(name string) {
+	s.stackName = name
+}
+
+// SetLogBuffer sets the log buffer for gateway logs.
+func (s *Server) SetLogBuffer(buffer *logging.LogBuffer) {
+	s.logBuffer = buffer
+}
+
+// LogBuffer returns the log buffer for gateway logs.
+func (s *Server) LogBuffer() *logging.LogBuffer {
+	return s.logBuffer
+}
+
+// SetReloadHandler sets the reload handler for hot reload support.
+func (s *Server) SetReloadHandler(h *reload.Handler) {
+	s.reloadHandler = h
+}
+
+// ReloadHandler returns the reload handler.
+func (s *Server) ReloadHandler() *reload.Handler {
+	return s.reloadHandler
+}
+
+// SetAllowedOrigins sets the CORS allowed origins for the server.
+func (s *Server) SetAllowedOrigins(origins []string) {
+	s.allowedOrigins = origins
+	s.streamableServer.SetAllowedOrigins(origins)
+}
+
+// SetAllowedHosts sets extra Host header values accepted across the whole HTTP
+// surface. Loopback hosts are always accepted, so an empty list is the secure
+// default.
+func (s *Server) SetAllowedHosts(hosts []string) {
+	s.allowedHosts = hosts
+	s.streamableServer.SetAllowedHosts(hosts)
+}
+
+// SetAuth configures authentication for the server.
+// When configured, operational routes require a valid token; the UI, probes,
+// terminal CORS preflight, and state-validated OAuth callback remain public.
+func (s *Server) SetAuth(authType, token, header string) {
+	s.authType = authType
+	s.authToken = token
+	s.authHeader = header
+}
+
+// SetOAuthBroker wires the downstream OAuth broker: enables the
+// /api/servers/{name}/auth/* endpoints and mounts the /oauth/callback
+// route (outside the inbound auth middleware).
+func (s *Server) SetOAuthBroker(b *mcpauth.Broker) {
+	s.oauthBroker = b
+}
+
+// SetProvisionerRegistry sets the provisioner registry for client detection.
+func (s *Server) SetProvisionerRegistry(r *provisioner.Registry, serverName string) {
+	s.provisioners = r
+	s.linkServerName = serverName
+}
+
+// SetRegistryServer sets the registry server for skill management.
+func (s *Server) SetRegistryServer(r *registry.Server) {
+	s.registryServer = r
+}
+
+// SetPinStore sets the pin store for schema pin management.
+func (s *Server) SetPinStore(ps *pins.PinStore) {
+	s.pinStore = ps
+}
+
+// PinStore returns the wired pin store, or nil when schema pinning is not
+// configured. Exposed so callers and tests can confirm whether pin management
+// is active.
+func (s *Server) PinStore() *pins.PinStore {
+	return s.pinStore
+}
+
+// SetSkillPinStore sets the skill pin store for skill governance management.
+func (s *Server) SetSkillPinStore(ps *skillpins.Store) {
+	s.skillPinStore = ps
+}
+
+// SkillPinStore returns the wired skill pin store, or nil when skill pinning
+// is not configured.
+func (s *Server) SkillPinStore() *skillpins.Store {
+	return s.skillPinStore
+}
+
+// SetVaultStore sets the vault store for secrets management.
+func (s *Server) SetVaultStore(v *vault.Store) {
+	s.vaultStore = v
+}
+
+// SetStackFile sets the path to the stack YAML file for spec endpoints.
+func (s *Server) SetStackFile(path string) {
+	s.stackFile = path
+}
+
+// SetMetricsAccumulator sets the token metrics accumulator.
+func (s *Server) SetMetricsAccumulator(acc *metrics.Accumulator) {
+	s.metricsAccumulator = acc
+}
+
+// MetricsAccumulator returns the token metrics accumulator.
+func (s *Server) MetricsAccumulator() *metrics.Accumulator {
+	return s.metricsAccumulator
+}
+
+// SetTraceBuffer sets the distributed tracing ring buffer.
+func (s *Server) SetTraceBuffer(buf *tracing.Buffer) {
+	s.traceBuffer = buf
+}
+
+// SetGatewayAddr sets the base URL of this server (e.g. "http://localhost:8180").
+// Used to build the MCP config JSON for CLI proxy sessions so the claude CLI can
+// reach gridctl's MCP gateway at <gatewayAddr>/sse.
+func (s *Server) SetGatewayAddr(addr string) {
+	s.gatewayAddr = addr
+}
+
+// SetTokenizerName sets the active tokenizer mode for display in /api/status.
+func (s *Server) SetTokenizerName(name string) {
+	s.tokenizerName = name
+}
+
+// FeatureStatus is one enabled experimental flag as exposed on /api/status.
+// Read-only display metadata: the UI never toggles flags (they are configured
+// in stack.yaml and cannot be changed from the browser).
+type FeatureStatus struct {
+	Name        string `json:"name"`
+	Stage       string `json:"stage"`
+	Description string `json:"description"`
+}
+
+// SetFeatures sets a getter for the enabled experimental flag list. The
+// getter (rather than a static slice) lets hot reloads of `experimental:`
+// reach /api/status without re-wiring; it must be safe for concurrent calls.
+func (s *Server) SetFeatures(get func() []FeatureStatus) {
+	s.features = get
+}
+
+// featureList returns the enabled experimental flags, or nil when no getter
+// is wired or nothing is enabled.
+func (s *Server) featureList() []FeatureStatus {
+	if s.features == nil {
+		return nil
+	}
+	return s.features()
+}
+
+// SetStartWatcher sets a callback that activates live-reload file watching for
+// the given stack path. Called by POST /api/stack/initialize after cold-loading.
+func (s *Server) SetStartWatcher(fn func(stackPath string)) {
+	s.startWatcher = fn
+}
+
+// SetSkillSourcePaths overrides the skill lock-file and skills.yaml paths used
+// by /api/skills/* handlers. Empty values keep the global defaults.
+func (s *Server) SetSkillSourcePaths(lockPath, configPath string) {
+	s.skillLockPath = lockPath
+	s.skillsConfigPath = configPath
+}
+
+// SetSkillUpdateCachePath overrides the skill update cache path. Empty keeps
+// the global default. Tests use this to isolate from $HOME/.gridctl/cache.
+func (s *Server) SetSkillUpdateCachePath(path string) {
+	s.skillUpdateCachePath = path
+}
+
+// RegistryServer returns the registry server.
+func (s *Server) RegistryServer() *registry.Server {
+	return s.registryServer
+}
+
+// Close performs cleanup of the API server's managed resources.
+func (s *Server) Close() {
+	if s.sseServer != nil {
+		s.sseServer.Close()
+	}
+	if s.streamableServer != nil {
+		s.streamableServer.Close()
+	}
+	if s.gateway != nil {
+		s.gateway.Close()
+	}
+}
+
+// Handler returns the main HTTP handler.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+
+	// MCP endpoints - Streamable HTTP (POST/GET/DELETE) and legacy SSE negotiation
+	mux.Handle("/mcp", s.streamableServer)
+	// Group endpoints: the same streamable transport serving a curated
+	// surface. The wrapper 404s unknown groups BEFORE any MCP handling so a
+	// typo'd link URL never creates a session, and injects the group into
+	// the request context for initialize to bind onto the session.
+	mux.HandleFunc("/groups/{name}/mcp", s.handleGroupMCP)
+	mux.HandleFunc("GET /groups/{name}/sse", s.handleGroupSSE) // Streamable HTTP transport
+	mux.Handle("/sse", s.sseServer)                            // Legacy negotiation redirect
+	mux.HandleFunc("/message", s.sseServer.HandleMessage)      // Legacy endpoint (410 Gone)
+
+	// API endpoints
+	mux.HandleFunc("/api/status", s.handleStatus)
+	mux.HandleFunc("/api/sessions", s.handleSessions)
+
+	mux.HandleFunc("GET /api/mcp-servers/{name}/logs", s.handleMCPServerLogs)
+	mux.HandleFunc("POST /api/mcp-servers/{name}/restart", s.handleMCPServerRestart)
+	mux.HandleFunc("PUT /api/mcp-servers/tools", s.handleSetServerToolsBatch)
+	mux.HandleFunc("PUT /api/mcp-servers/{name}/tools", s.handleSetServerTools)
+	mux.HandleFunc("/api/mcp-servers", s.handleMCPServers)
+	mux.HandleFunc("GET /api/auth/servers", s.handleAuthServers)
+	mux.HandleFunc("POST /api/servers/{name}/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("GET /api/servers/{name}/auth/wait", s.handleAuthWait)
+	mux.HandleFunc("POST /api/servers/{name}/auth/manual", s.handleAuthManual)
+	mux.HandleFunc("POST /api/servers/{name}/auth/logout", s.handleAuthLogout)
+	mux.HandleFunc("POST /api/servers/{name}/auth/reset", s.handleAuthReset)
+	mux.HandleFunc("/api/tools", s.handleTools)
+	mux.HandleFunc("GET /api/tools/catalog", s.handleToolsCatalog)
+	mux.HandleFunc("GET /api/tools/usage", s.handleToolsUsage)
+	mux.HandleFunc("GET /api/skills/usage", s.handleSkillsUsage)
+	mux.HandleFunc("/api/logs", s.handleGatewayLogs)
+	mux.HandleFunc("/api/metrics/tokens", s.handleMetricsTokens)
+	mux.HandleFunc("GET /api/optimize", s.handleOptimize)
+	mux.HandleFunc("GET /api/traces", s.handleTraces)
+	mux.HandleFunc("GET /api/traces/{traceId}", s.handleTraces)
+	mux.HandleFunc("GET /api/traces/{traceId}/otlp", s.handleTraceOTLP)
+	mux.HandleFunc("POST /api/clients/{slug}/scope/preview", s.handleClientScopePreview)
+	mux.HandleFunc("PUT /api/clients/{slug}/scope", s.handleSetClientScope)
+	mux.HandleFunc("POST /api/clients/{slug}/link", s.handleLinkClient)
+	mux.HandleFunc("DELETE /api/clients/{slug}/link", s.handleUnlinkClient)
+	mux.HandleFunc("POST /api/clients/{slug}/link/preview", s.handleLinkPreview)
+	mux.HandleFunc("/api/clients", s.handleClients)
+	mux.HandleFunc("/api/reload", s.handleReload)
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/ready", s.handleReady)
+
+	// Pins endpoints
+	mux.HandleFunc("GET /api/pins", s.handleListPins)
+	mux.HandleFunc("GET /api/pins/{server}", s.handleGetServerPins)
+	mux.HandleFunc("GET /api/pins/{server}/diff", s.handlePinsDiff)
+	mux.HandleFunc("POST /api/pins/{server}/approve", s.handleApprovePins)
+	mux.HandleFunc("DELETE /api/pins/{server}", s.handleResetPins)
+
+	// Skill pin endpoints (skill-document governance; distinct route space
+	// from /api/pins because skills and servers share no name namespace)
+	mux.HandleFunc("GET /api/skill-pins", s.handleListSkillPins)
+	mux.HandleFunc("GET /api/skill-pins/{name}", s.handleGetSkillPin)
+	mux.HandleFunc("GET /api/skill-pins/{name}/diff", s.handleSkillPinDiff)
+	mux.HandleFunc("POST /api/skill-pins/{name}/approve", s.handleApproveSkillPin)
+	mux.HandleFunc("DELETE /api/skill-pins/{name}", s.handleResetSkillPin)
+
+	// Global context (pkg/contexts) — pure file operations, stackless-safe.
+	mux.HandleFunc("GET /api/context", s.handleContextGet)
+	mux.HandleFunc("PUT /api/context", s.handleContextPut)
+	mux.HandleFunc("GET /api/context/scan", s.handleContextScan)
+	mux.HandleFunc("POST /api/context/init", s.handleContextInit)
+	mux.HandleFunc("POST /api/context/sync", s.handleContextSync)
+	mux.HandleFunc("POST /api/context/adopt/{slug}", s.handleContextAdopt)
+	mux.HandleFunc("POST /api/context/unsync/{slug}", s.handleContextUnsync)
+	mux.HandleFunc("GET /api/context/diff/{slug}", s.handleContextDiff)
+	mux.HandleFunc("GET /api/context/fragments", s.handleContextFragmentsList)
+	mux.HandleFunc("PUT /api/context/fragments/{name}", s.handleContextFragmentPut)
+	mux.HandleFunc("DELETE /api/context/fragments/{name}", s.handleContextFragmentDelete)
+
+	// Variable store endpoints — canonical /api/var/* surface plus a
+	// deprecated /api/vault/* alias that wears Deprecation/Sunset headers.
+	// Both register the same handler functions so behaviour is identical;
+	// only the response headers differ on the deprecated path.
+	registerVarRoutes := func(prefix string, deprecated bool) {
+		wrap := func(canonical string, h http.HandlerFunc) http.HandlerFunc {
+			if !deprecated {
+				return h
+			}
+			return deprecatedVaultHandler(canonical, h)
+		}
+		mux.HandleFunc("GET "+prefix, wrap("/api/var", s.handleVaultList))
+		mux.HandleFunc("POST "+prefix, wrap("/api/var", s.handleVaultCreate))
+		mux.HandleFunc("POST "+prefix+"/import", wrap("/api/var/import", s.handleVaultImport))
+		mux.HandleFunc("GET "+prefix+"/status", wrap("/api/var/status", s.handleVaultStatus))
+		mux.HandleFunc("GET "+prefix+"/usage", wrap("/api/var/usage", s.handleVariableUsage))
+		mux.HandleFunc("POST "+prefix+"/unlock", wrap("/api/var/unlock", s.handleVaultUnlock))
+		mux.HandleFunc("POST "+prefix+"/lock", wrap("/api/var/lock", s.handleVaultLock))
+		mux.HandleFunc("GET "+prefix+"/sets", wrap("/api/var/sets", s.handleVaultSetsList))
+		mux.HandleFunc("POST "+prefix+"/sets", wrap("/api/var/sets", s.handleVaultSetsCreate))
+		mux.HandleFunc("DELETE "+prefix+"/sets/{name}", wrap("/api/var/sets/{name}", s.handleVaultSetsDelete))
+		mux.HandleFunc("GET "+prefix+"/{key}", wrap("/api/var/{key}", s.handleVaultKeyGet))
+		mux.HandleFunc("PUT "+prefix+"/{key}", wrap("/api/var/{key}", s.handleVaultKeyPut))
+		mux.HandleFunc("DELETE "+prefix+"/{key}", wrap("/api/var/{key}", s.handleVaultKeyDelete))
+		mux.HandleFunc("PUT "+prefix+"/{key}/set", wrap("/api/var/{key}/set", s.handleVaultAssignSet))
+	}
+	registerVarRoutes("/api/var", false)
+	registerVarRoutes("/api/vault", true)
+	// Canonical-only: new endpoints are not mirrored onto the deprecated
+	// /api/vault surface, which is frozen until its v1.0 removal. The literal
+	// pattern outranks GET /api/var/{key}, so "drift" is never read as a key.
+	mux.HandleFunc("GET /api/var/drift", s.handleVariableDrift)
+
+	// Stack spec endpoints
+	mux.HandleFunc("POST /api/stack/validate", s.handleStackValidate)
+	mux.HandleFunc("POST /api/stack/resource/validate", s.handleStackResourceValidate)
+	mux.HandleFunc("GET /api/stack/plan", s.handleStackPlan)
+	mux.HandleFunc("GET /api/stack/health", s.handleStackHealth)
+	mux.HandleFunc("GET /api/stack/spec", s.handleStackSpec)
+	mux.HandleFunc("GET /api/stack/export", s.handleStackExport)
+	mux.HandleFunc("GET /api/stack/recipes", s.handleStackRecipes)
+	mux.HandleFunc("GET /api/catalog", s.handleCatalog)
+	mux.HandleFunc("GET /api/limits", s.handleLimits)
+	mux.HandleFunc("GET /api/groups", s.handleGroups)
+	mux.HandleFunc("POST /api/stack/append", s.handleStackAppend)
+	mux.HandleFunc("POST /api/stack/initialize", s.handleStackInitialize)
+	mux.HandleFunc("GET /api/python/packages/{package}/versions", s.handlePythonPackageVersions)
+	mux.HandleFunc("POST /api/python/resolve", s.handlePythonSourceResolve)
+	mux.HandleFunc("POST /api/python/generated-file", s.handlePythonGeneratedFile)
+	mux.HandleFunc("PATCH /api/stack/telemetry", s.handlePatchStackTelemetry)
+
+	// Telemetry persistence endpoints — opt-in disk persistence inventory
+	// and wipe; the per-server PATCH lives under /api/mcp-servers/{name}/.
+	mux.HandleFunc("PATCH /api/mcp-servers/{name}/telemetry", s.handlePatchServerTelemetry)
+	mux.HandleFunc("GET /api/telemetry/inventory", s.handleGetTelemetryInventory)
+	mux.HandleFunc("DELETE /api/telemetry", s.handleDeleteTelemetry)
+
+	// Stack library endpoints
+	mux.HandleFunc("GET /api/stacks", s.handleStacksList)
+	mux.HandleFunc("POST /api/stacks", s.handleStacksSave)
+
+	// Skills endpoints (remote skill import)
+	mux.HandleFunc("GET /api/skills/sources", s.handleSkillSourcesList)
+	mux.HandleFunc("POST /api/skills/sources", s.handleSkillSourceAdd)
+	mux.HandleFunc("POST /api/skills/sources/update", s.handleSkillSourcesSyncAll)
+	mux.HandleFunc("GET /api/skills/updates", s.handleSkillUpdates)
+	mux.HandleFunc("DELETE /api/skills/sources/{name}", s.handleSkillSourceRemove)
+	mux.HandleFunc("POST /api/skills/sources/{name}/check", s.handleSkillSourceCheck)
+	mux.HandleFunc("POST /api/skills/sources/{name}/update", s.handleSkillSourceUpdate)
+	// Preview accepts either GET (query params, no auth) or POST (JSON body,
+	// with optional auth) so the wizard can pass credentials without
+	// leaking them into query strings or browser history.
+	mux.HandleFunc("GET /api/skills/sources/{name}/preview", s.handleSkillSourcePreview)
+	mux.HandleFunc("POST /api/skills/sources/{name}/preview", s.handleSkillSourcePreview)
+	// Per-skill reconciliation: compare with upstream, detach to local-only, or
+	// reset (force-overwrite with backup) a single tracked skill.
+	mux.HandleFunc("GET /api/skills/sources/{name}/skills/{skill}/diff", s.handleSkillDiff)
+	mux.HandleFunc("POST /api/skills/sources/{name}/skills/{skill}/detach", s.handleSkillDetach)
+	mux.HandleFunc("POST /api/skills/sources/{name}/skills/{skill}/reset", s.handleSkillReset)
+
+	// Wizard endpoints
+	mux.HandleFunc("GET /api/wizard/drafts", s.handleWizardDraftsList)
+	mux.HandleFunc("POST /api/wizard/drafts", s.handleWizardDraftCreate)
+	mux.HandleFunc("DELETE /api/wizard/drafts/{id}", s.handleWizardDraftDelete)
+
+	// Server probe — ephemeral tool enumeration used by the wizard's
+	// "Discover tools" flow for servers not yet loaded in the stack.
+	mux.HandleFunc("POST /api/servers/probe", s.handleProbe)
+
+	// OpenAPI spec preview — lists a spec's operations so the wizard can
+	// curate them before deploy. Sibling of the probe, not part of it: the
+	// probe speaks MCP and returns tools, which discard method, path, and tags.
+	mux.HandleFunc("POST /api/openapi/operations", s.handleOpenAPIPreview)
+
+	// Registry endpoints
+	mux.HandleFunc("GET /api/registry/status", s.handleRegistryStatus)
+	mux.HandleFunc("GET /api/registry/skills", s.handleRegistrySkillsList)
+	mux.HandleFunc("POST /api/registry/skills", s.handleRegistrySkillCreate)
+	mux.HandleFunc("POST /api/registry/skills/validate", s.handleRegistryValidate)
+	mux.HandleFunc("PUT /api/registry/skills/batch", s.handleRegistrySkillsBatch)
+	mux.HandleFunc("GET /api/registry/skills/{name}", s.handleRegistrySkillGet)
+	mux.HandleFunc("PUT /api/registry/skills/{name}", s.handleRegistrySkillPut)
+	mux.HandleFunc("DELETE /api/registry/skills/{name}", s.handleRegistrySkillDelete)
+	mux.HandleFunc("POST /api/registry/skills/{name}/activate", s.handleRegistrySkillActivate)
+	mux.HandleFunc("POST /api/registry/skills/{name}/disable", s.handleRegistrySkillDisable)
+	mux.HandleFunc("GET /api/registry/skills/{name}/files", s.handleRegistrySkillFileList)
+	mux.HandleFunc("GET /api/registry/skills/{name}/files/{path...}", s.handleRegistrySkillFileGet)
+	mux.HandleFunc("PUT /api/registry/skills/{name}/files/{path...}", s.handleRegistrySkillFilePut)
+	mux.HandleFunc("DELETE /api/registry/skills/{name}/files/{path...}", s.handleRegistrySkillFileDelete)
+
+	// Agent registry endpoints. Agents are single-file definitions
+	// projected to clients, not gateway-routed MCP content, so mutations
+	// here never refresh the registry router.
+	mux.HandleFunc("GET /api/registry/agents", s.handleRegistryAgentsList)
+	mux.HandleFunc("GET /api/registry/agents/{name}", s.handleRegistryAgentGet)
+	mux.HandleFunc("PUT /api/registry/agents/{name}", s.handleRegistryAgentPut)
+	mux.HandleFunc("DELETE /api/registry/agents/{name}", s.handleRegistryAgentDelete)
+
+	// Agent projection endpoints (pkg/agentsync): per-client status and
+	// the sync / unsync / adopt operations the CLI exposes as
+	// `gridctl skill project ... --kind agent`.
+	mux.HandleFunc("GET /api/project/agents/status", s.handleProjectAgentsStatus)
+	mux.HandleFunc("POST /api/project/agents/sync", s.handleProjectAgentsSync)
+	mux.HandleFunc("POST /api/project/agents/unsync", s.handleProjectAgentsUnsync)
+	mux.HandleFunc("POST /api/project/agents/adopt", s.handleProjectAgentsAdopt)
+
+	// Wiring ownership endpoints (pkg/wiring): the REST face of
+	// `gridctl project status|adopt --kind wiring`.
+	mux.HandleFunc("GET /api/project/wiring/status", s.handleProjectWiringStatus)
+	mux.HandleFunc("POST /api/project/wiring/adopt", s.handleProjectWiringAdopt)
+
+	// Model routing endpoints (pkg/modelsync): the REST face of
+	// `gridctl models status|sync|adopt|ack-restart|validate`. Read and
+	// reconcile only: the policy document is edited via the CLI.
+	mux.HandleFunc("GET /api/project/models/status", s.handleProjectModelsStatus)
+	mux.HandleFunc("GET /api/project/models/validate", s.handleProjectModelsValidate)
+	mux.HandleFunc("POST /api/project/models/sync", s.handleProjectModelsSync)
+	mux.HandleFunc("POST /api/project/models/adopt", s.handleProjectModelsAdopt)
+	mux.HandleFunc("POST /api/project/models/ack-restart", s.handleProjectModelsAckRestart)
+
+	// Reset endpoints (pkg/resetops): the REST face of `gridctl reset`.
+	// Both are loopback-gated and token-guarded (see guardResetRequest).
+	mux.HandleFunc("POST /api/reset/preview", s.handleResetPreview)
+	mux.HandleFunc("POST /api/reset", s.handleResetExecute)
+
+	// Pack endpoints (pkg/packops): the REST face of `gridctl pack
+	// add|apply|status|remove`, plus the wizard's read-only preview.
+	mux.HandleFunc("GET /api/packs", s.handlePacksList)
+	mux.HandleFunc("POST /api/packs", s.handlePackAdd)
+	mux.HandleFunc("POST /api/packs/preview", s.handlePackPreview)
+	mux.HandleFunc("GET /api/packs/{name}", s.handlePackGet)
+	mux.HandleFunc("POST /api/packs/{name}/apply", s.handlePackApply)
+	mux.HandleFunc("DELETE /api/packs/{name}", s.handlePackRemove)
+
+	// Static files (UI) - served at root
+	if s.staticFS != nil {
+		fileServer := http.FileServer(http.FS(s.staticFS))
+		mux.Handle("/", spaHandler(fileServer, s.staticFS))
+	}
+
+	handler := authMiddleware(s.authType, s.authToken, s.authHeader, mux)
+
+	// The OAuth authorization callback mounts OUTSIDE the inbound auth
+	// middleware: the browser performing the redirect carries no gateway
+	// bearer token, and the route authenticates via its single-use state
+	// parameter instead. Nothing else escapes the middleware.
+	if s.oauthBroker != nil {
+		inner := handler
+		outer := http.NewServeMux()
+		outer.Handle("GET "+mcpauth.CallbackPath, s.oauthBroker.CallbackHandler())
+		outer.Handle("/", inner)
+		handler = outer
+	}
+
+	// DNS rebinding protection for the whole surface, not just /mcp. Sits
+	// inside corsMiddleware so preflight still gets its headers, and outside
+	// the OAuth callback mount so that route is covered too — its redirect
+	// URI is loopback, so it satisfies the check without an exemption.
+	handler = s.hostMiddleware(handler)
+
+	var extraHeaders []string
+	if s.authHeader != "" && s.authHeader != "Authorization" {
+		extraHeaders = append(extraHeaders, s.authHeader)
+	}
+	handler = corsMiddleware(s.allowedOrigins, extraHeaders, handler)
+	return handler
+}
+
+// hostExemptPath reports paths that must answer regardless of Host. The
+// liveness probes are polled by the daemon parent before anything else is
+// known to work, and static UI files are served to a browser that may address
+// the machine however the user typed it.
+func hostExemptPath(path string) bool {
+	return path == "/health" || path == "/ready"
+}
+
+// hostMiddleware rejects requests carrying an attacker-controlled Host header,
+// delegating to the same check the MCP transport uses so the two surfaces
+// cannot drift apart.
+func (s *Server) hostMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hostExemptPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if err := mcp.ValidateRequestHost(r, s.allowedHosts); err != nil {
+			http.Error(w, "Forbidden: "+err.Error(), http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// handleStatus returns the overall gateway status.
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	status := struct {
+		Gateway    ServerInfo               `json:"gateway"`
+		MCPServers []MCPServerStatus        `json:"mcp-servers"`
+		Resources  []ResourceStatus         `json:"resources"`
+		Sessions   int                      `json:"sessions"`
+		Registry   *registry.RegistryStatus `json:"registry,omitempty"`
+		CodeMode   string                   `json:"code_mode,omitempty"`
+		TokenUsage *metrics.TokenUsage      `json:"token_usage,omitempty"`
+		StackName  string                   `json:"stack_name,omitempty"`
+		// Home is the resolved home directory this daemon runs under, so
+		// CLI subcommands can detect a GRIDCTL_HOME mismatch (add-only).
+		Home string `json:"home,omitempty"`
+		// Features maps each ENABLED experimental flag name to true —
+		// the capability-bit view for UI gating. Omitted when nothing is
+		// enabled so the no-flags payload is byte-identical to before.
+		Features map[string]bool `json:"features,omitempty"`
+		// FeatureDetails carries the display metadata (stage, description)
+		// for the same enabled flags, for the read-only spec panel rows.
+		FeatureDetails []FeatureStatus `json:"feature_details,omitempty"`
+	}{
+		Gateway: ServerInfo{
+			Name:      s.gateway.ServerInfo().Name,
+			Version:   s.gateway.ServerInfo().Version,
+			Tokenizer: s.tokenizerName,
+		},
+		MCPServers: s.getMCPServerStatuses(r.Context()),
+		Resources:  s.getResourceStatuses(r.Context()),
+		Sessions:   s.gateway.SessionCount(),
+	}
+	// Only expose stack_name when a user-defined stack is loaded.
+	// The embedded gateway uses "gridctl" as its default name even in stackless
+	// mode, so stackFile is the authoritative indicator.
+	if s.stackFile != "" {
+		status.StackName = s.stackName
+	}
+	if home, err := state.Home(); err == nil {
+		status.Home = home
+	}
+	if cm := s.gateway.CodeModeStatus(); cm != "off" {
+		status.CodeMode = cm
+	}
+	if s.registryServer != nil && s.registryServer.HasContent() {
+		regStatus := s.registryServer.Store().Status()
+		status.Registry = &regStatus
+	}
+	if s.metricsAccumulator != nil {
+		snap := s.metricsAccumulator.Snapshot()
+		status.TokenUsage = &snap
+	}
+	if features := s.featureList(); len(features) > 0 {
+		status.FeatureDetails = features
+		status.Features = make(map[string]bool, len(features))
+		for _, f := range features {
+			status.Features[f.Name] = true
+		}
+	}
+
+	writeJSON(w, status)
+}
+
+// handleSessions returns active MCP session count and IDs.
+// GET /api/sessions
+func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	entries := s.streamableServer.SessionEntries()
+	ids := make([]string, len(entries))
+	for i, e := range entries {
+		ids[i] = e.ID
+	}
+	response := struct {
+		Count int `json:"count"`
+		// Sessions is the legacy bare ID list, kept for existing
+		// consumers; Entries carries the per-session generation tag.
+		Sessions []string           `json:"sessions"`
+		Entries  []mcp.SessionEntry `json:"entries"`
+	}{
+		Count:    len(entries),
+		Sessions: ids,
+		Entries:  entries,
+	}
+	writeJSON(w, response)
+}
+
+// handleMCPServers returns information about registered MCP servers.
+func (s *Server) handleMCPServers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	writeJSON(w, s.getMCPServerStatuses(r.Context()))
+}
+
+// handleTools returns all aggregated tools.
+func (s *Server) handleTools(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	result, _ := s.gateway.HandleToolsListUnscoped()
+	// Always serialize an empty inventory as [], never null: web consumers
+	// index into the list (e.g. fuzzy search) where a null would throw.
+	if result != nil && result.Tools == nil {
+		result.Tools = []mcp.Tool{}
+	}
+	writeJSON(w, result)
+}
+
+// handleToolsCatalog returns the full downstream tool inventory (each tool's
+// raw description + input schema) for the web console, regardless of code
+// mode. Read-only and informational: it does not change what MCP clients see
+// from tools/list. `?include=all` bypasses the whitelist filter so the UI can
+// show detail (and annotations) for tools an operator has disabled; the
+// parameterless response is unchanged.
+func (s *Server) handleToolsCatalog(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var result *mcp.ToolsListResult
+	if r.URL.Query().Get("include") == "all" {
+		result, _ = s.gateway.HandleToolsCatalogAll()
+	} else {
+		result, _ = s.gateway.HandleToolsCatalog()
+	}
+	// Always serialize an empty catalog as [], never null (see handleTools).
+	if result != nil && result.Tools == nil {
+		result.Tools = []mcp.Tool{}
+	}
+	writeJSON(w, result)
+}
+
+// ServerInfo mirrors the mcp.ServerInfo type for API responses.
+type ServerInfo struct {
+	Name      string `json:"name"`
+	Version   string `json:"version"`
+	Tokenizer string `json:"tokenizer,omitempty"`
+}
+
+// MCPServerStatus mirrors the mcp.MCPServerStatus type for API responses.
+type MCPServerStatus struct {
+	Name          string   `json:"name"`
+	Transport     string   `json:"transport"`
+	Endpoint      string   `json:"endpoint"`
+	ContainerID   string   `json:"containerId,omitempty"`
+	Initialized   bool     `json:"initialized"`
+	ToolCount     int      `json:"toolCount"`
+	Tools         []string `json:"tools"`
+	External      bool     `json:"external"`
+	LocalProcess  bool     `json:"localProcess"`
+	SSH           bool     `json:"ssh"`
+	SSHHost       string   `json:"sshHost,omitempty"`
+	OpenAPI       bool     `json:"openapi"`
+	OpenAPISpec   string   `json:"openapiSpec,omitempty"`
+	OutputFormat  string   `json:"outputFormat,omitempty"`
+	Healthy       *bool    `json:"healthy,omitempty"`
+	LastCheck     *string  `json:"lastCheck,omitempty"`
+	HealthError   string   `json:"healthError,omitempty"`
+	ToolWhitelist []string `json:"toolWhitelist,omitempty"`
+	// ProtocolVersion is the MCP protocol version the downstream server
+	// reported at initialize; empty for lax servers and OpenAPI adapters.
+	ProtocolVersion string `json:"protocolVersion,omitempty"`
+	// ProtocolGeneration is the resolved protocol era ("handshake" or
+	// "stateless"); empty for OpenAPI adapters and unresolved servers.
+	ProtocolGeneration string `json:"protocolGeneration,omitempty"`
+	// RegistrationFailed marks a server that never registered with the
+	// gateway; the UI shows it as failed instead of omitting the node.
+	RegistrationFailed bool `json:"registrationFailed,omitempty"`
+
+	Replicas  []mcp.ReplicaStatus  `json:"replicas,omitempty"`
+	Autoscale *mcp.AutoscaleStatus `json:"autoscale,omitempty"`
+
+	// AuthStatus reports downstream authorization state ("authorized" or
+	// "needs_auth"); empty for servers without tracked auth state.
+	AuthStatus string     `json:"authStatus,omitempty"`
+	AuthIssuer string     `json:"authIssuer,omitempty"`
+	AuthExpiry *time.Time `json:"authExpiry,omitempty"`
+
+	Kind   string                 `json:"kind,omitempty"`
+	Image  string                 `json:"image,omitempty"`
+	Source *MCPServerSourceStatus `json:"source,omitempty"`
+}
+
+// MCPServerSourceStatus reports declared source identity plus immutable
+// provenance read from the actual image's labels.
+type MCPServerSourceStatus struct {
+	Type     string `json:"type"`
+	URL      string `json:"url,omitempty"`
+	Ref      string `json:"ref,omitempty"`
+	Package  string `json:"package,omitempty"`
+	Version  string `json:"version,omitempty"`
+	Commit   string `json:"commit,omitempty"`
+	Artifact string `json:"artifact,omitempty"`
+}
+
+func (s *Server) getMCPServerStatuses(ctx context.Context) []MCPServerStatus {
+	mcpStatuses := s.gateway.Status()
+	statuses := make([]MCPServerStatus, len(mcpStatuses))
+	for i, ms := range mcpStatuses {
+		status := MCPServerStatus{
+			Name:               ms.Name,
+			Transport:          string(ms.Transport),
+			Endpoint:           ms.Endpoint,
+			ContainerID:        ms.ContainerID,
+			Initialized:        ms.Initialized,
+			ToolCount:          ms.ToolCount,
+			Tools:              ms.Tools,
+			External:           ms.External,
+			LocalProcess:       ms.LocalProcess,
+			SSH:                ms.SSH,
+			SSHHost:            ms.SSHHost,
+			OpenAPI:            ms.OpenAPI,
+			OpenAPISpec:        ms.OpenAPISpec,
+			OutputFormat:       ms.OutputFormat,
+			Healthy:            ms.Healthy,
+			HealthError:        ms.HealthError,
+			ToolWhitelist:      ms.ToolWhitelist,
+			ProtocolVersion:    ms.ProtocolVersion,
+			ProtocolGeneration: ms.ProtocolGeneration,
+			RegistrationFailed: ms.RegistrationFailed,
+			Replicas:           ms.Replicas,
+			Autoscale:          ms.Autoscale,
+			AuthStatus:         ms.AuthStatus,
+			AuthIssuer:         ms.AuthIssuer,
+			AuthExpiry:         ms.AuthExpiry,
+		}
+		if ms.LastCheck != nil {
+			ts := ms.LastCheck.Format(time.RFC3339)
+			status.LastCheck = &ts
+		}
+		statuses[i] = status
+	}
+	s.enrichMCPServerStatuses(ctx, statuses)
+	return statuses
+}
+
+// writeJSON writes a JSON response.
+func writeJSON(w http.ResponseWriter, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(data)
+}
+
+// writeJSONError writes a JSON error response.
+func writeJSONError(w http.ResponseWriter, message string, statusCode int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
+// corsMiddleware adds CORS headers to responses based on allowed origins.
+// extraHeaders are additional headers to include in Access-Control-Allow-Headers.
+func corsMiddleware(allowedOrigins []string, extraHeaders []string, next http.Handler) http.Handler {
+	originSet := make(map[string]bool, len(allowedOrigins))
+	allowAll := false
+	for _, o := range allowedOrigins {
+		if o == "*" {
+			allowAll = true
+		}
+		originSet[o] = true
+	}
+	allowHeaders := "Content-Type, Authorization"
+	for _, h := range extraHeaders {
+		allowHeaders += ", " + h
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" && (allowAll || originSet[origin]) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", allowHeaders)
+			w.Header().Set("Vary", "Origin")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// spaHandler wraps the file server to handle SPA routing.
+func spaHandler(fileServer http.Handler, staticFS fs.FS) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if path == "/" {
+			path = "index.html"
+		} else if path[0] == '/' {
+			path = path[1:]
+		}
+
+		// Check if file exists
+		if _, err := fs.Stat(staticFS, path); err != nil {
+			// File doesn't exist, serve index.html for SPA routing
+			r.URL.Path = "/"
+		}
+
+		fileServer.ServeHTTP(w, r)
+	})
+}
+
+// ResourceStatus contains status information for a resource container.
+type ResourceStatus struct {
+	Name   string `json:"name"`
+	Image  string `json:"image"`
+	Status string `json:"status"`
+}
+
+// getResourceStatuses returns status of all resource containers. A listing
+// failure is logged and reported as an empty slice so /api/status stays
+// serveable during a runtime outage; the warning distinguishes that outage
+// from a stack with no resources.
+func (s *Server) getResourceStatuses(ctx context.Context) []ResourceStatus {
+	if s.dockerClient == nil || s.stackName == "" {
+		return []ResourceStatus{}
+	}
+
+	containers, err := docker.ListManagedContainers(ctx, s.dockerClient, s.stackName)
+	if err != nil {
+		slog.Warn("status: failed to list resource containers; reporting none",
+			"stack", s.stackName, "error", err)
+		return []ResourceStatus{}
+	}
+
+	var resources []ResourceStatus
+	for _, c := range containers {
+		// Only include resource containers (not MCP servers)
+		if resName, ok := c.Labels[docker.LabelResource]; ok {
+			status := "stopped"
+			if c.State == "running" {
+				status = "running"
+			} else if c.State != "exited" {
+				status = c.State
+			}
+
+			resources = append(resources, ResourceStatus{
+				Name:   resName,
+				Image:  c.Image,
+				Status: status,
+			})
+		}
+	}
+
+	return resources
+}
+
+// handleMCPServerLogs returns structured logs from the global buffer filtered by server name.
+// GET /api/mcp-servers/{name}/logs?lines=100
+func (s *Server) handleMCPServerLogs(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+
+	if s.logBuffer == nil {
+		writeJSON(w, []logging.BufferedEntry{})
+		return
+	}
+
+	// Get number of lines from query param (default 100)
+	lines := 100
+	if linesParam := r.URL.Query().Get("lines"); linesParam != "" {
+		if n, err := strconv.Atoi(linesParam); err == nil && n > 0 {
+			lines = n
+		}
+	}
+
+	// Scan the ring for up to `lines` entries of this server: a fixed
+	// over-fetch would still miss servers with a small share of the buffer.
+	filtered := s.logBuffer.GetRecentMatching(lines, func(entry logging.BufferedEntry) bool {
+		server, _ := entry.Attrs["server"].(string)
+		return server == name
+	})
+	if filtered == nil {
+		filtered = []logging.BufferedEntry{}
+	}
+	writeJSON(w, filtered)
+}
+
+// handleMCPServerRestart restarts an individual MCP server connection.
+func (s *Server) handleMCPServerRestart(w http.ResponseWriter, r *http.Request) {
+	serverName := r.PathValue("name")
+
+	if err := s.gateway.RestartMCPServer(r.Context(), serverName); err != nil {
+		if strings.Contains(err.Error(), "unknown MCP server") {
+			writeJSONError(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		writeJSONError(w, "Restart failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, map[string]string{"status": "restarted", "server": serverName})
+}
+
+// gatewayLogsResponse is the envelope served by GET /api/logs. Total is the
+// number of entries currently in the ring; BufferCapacity is its maximum, so
+// the UI can label the visible window honestly against retention.
+type gatewayLogsResponse struct {
+	Logs           []logging.BufferedEntry `json:"logs"`
+	Total          int                     `json:"total"`
+	BufferCapacity int                     `json:"bufferCapacity"`
+}
+
+// handleGatewayLogs returns structured logs from the gateway log buffer.
+// GET /api/logs?lines=100&level=error,warn,info
+func (s *Server) handleGatewayLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.logBuffer == nil {
+		writeJSON(w, gatewayLogsResponse{Logs: []logging.BufferedEntry{}})
+		return
+	}
+
+	// Get number of lines from query param (default 100)
+	lines := 100
+	if linesParam := r.URL.Query().Get("lines"); linesParam != "" {
+		if n, err := strconv.Atoi(linesParam); err == nil && n > 0 {
+			lines = n
+		}
+	}
+
+	var entries []logging.BufferedEntry
+	if levelParam := r.URL.Query().Get("level"); levelParam != "" {
+		levels := make(map[string]bool)
+		for _, l := range strings.Split(levelParam, ",") {
+			levels[strings.ToUpper(strings.TrimSpace(l))] = true
+		}
+		// Scan the ring for up to `lines` entries of the requested levels:
+		// slicing the last `lines` first would drop sparse severities that
+		// only exist earlier in the buffer.
+		entries = s.logBuffer.GetRecentMatching(lines, func(entry logging.BufferedEntry) bool {
+			return levels[strings.ToUpper(entry.Level)]
+		})
+	} else {
+		entries = s.logBuffer.GetRecent(lines)
+	}
+
+	if entries == nil {
+		entries = []logging.BufferedEntry{}
+	}
+	writeJSON(w, gatewayLogsResponse{
+		Logs:           entries,
+		Total:          s.logBuffer.Count(),
+		BufferCapacity: s.logBuffer.Capacity(),
+	})
+}
+
+// handleMetricsTokens handles token metrics requests.
+// GET /api/metrics/tokens?range=1h — returns historical time-series data
+// DELETE /api/metrics/tokens — clears all token metrics
+func (s *Server) handleMetricsTokens(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.handleGetMetricsTokens(w, r)
+	case http.MethodDelete:
+		s.handleDeleteMetricsTokens(w, r)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleGetMetricsTokens returns historical token metrics.
+// GET /api/metrics/tokens?range=1h
+func (s *Server) handleGetMetricsTokens(w http.ResponseWriter, r *http.Request) {
+	if s.metricsAccumulator == nil {
+		writeJSON(w, metrics.TimeSeriesResponse{
+			Range:     "1h",
+			Interval:  "1m",
+			Points:    []metrics.DataPoint{},
+			PerServer: map[string][]metrics.DataPoint{},
+		})
+		return
+	}
+
+	rangeParam := r.URL.Query().Get("range")
+	duration := parseRange(rangeParam)
+
+	result := s.metricsAccumulator.Query(duration)
+
+	// Ensure non-nil slices for JSON serialization
+	if result.Points == nil {
+		result.Points = []metrics.DataPoint{}
+	}
+	if result.PerServer == nil {
+		result.PerServer = map[string][]metrics.DataPoint{}
+	}
+	for name, points := range result.PerServer {
+		if points == nil {
+			result.PerServer[name] = []metrics.DataPoint{}
+		}
+	}
+
+	writeJSON(w, result)
+}
+
+// handleDeleteMetricsTokens clears all token metrics.
+// DELETE /api/metrics/tokens
+func (s *Server) handleDeleteMetricsTokens(w http.ResponseWriter, _ *http.Request) {
+	if s.metricsAccumulator == nil {
+		writeJSON(w, map[string]string{"status": "ok", "message": "Token metrics cleared"})
+		return
+	}
+
+	s.metricsAccumulator.Clear()
+	writeJSON(w, map[string]string{"status": "ok", "message": "Token metrics cleared"})
+}
+
+// parseRange converts a range query parameter to a duration.
+func parseRange(s string) time.Duration {
+	switch s {
+	case "30m":
+		return 30 * time.Minute
+	case "1h":
+		return time.Hour
+	case "6h":
+		return 6 * time.Hour
+	case "24h":
+		return 24 * time.Hour
+	case "7d":
+		return 7 * 24 * time.Hour
+	default:
+		return time.Hour // Default to 1h
+	}
+}
+
+// handleReload triggers a configuration reload from disk.
+// POST /api/reload
+func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.reloadHandler == nil {
+		writeJSONError(w, "Reload not enabled (start with --watch flag)", http.StatusServiceUnavailable)
+		return
+	}
+
+	result, err := s.reloadHandler.Reload(r.Context())
+	if err != nil {
+		writeJSONError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if !result.Success {
+		w.WriteHeader(http.StatusBadRequest)
+	}
+	writeJSON(w, result)
+}
+
+// handleHealth returns 200 OK when the daemon is alive and serving requests.
+// This is a liveness check - it returns OK immediately without checking MCP server status.
+// Use /ready for a full readiness check that verifies all MCP servers are initialized.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("OK"))
+}
+
+// handleReady returns 200 OK only when a stack is loaded and all MCP servers
+// are connected and initialized. Returns 503 when no stack is loaded (stackless
+// mode) or when any MCP server has not yet initialized.
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Not ready until a stack is loaded
+	if s.stackFile == "" {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("No stack loaded"))
+		return
+	}
+
+	// Check all MCP servers are initialized. Autoscaled servers that have
+	// scaled to zero deliberately have no client and therefore report
+	// Initialized=false; they can cold-start on demand and are not a failed
+	// state, so do not reject them here. Registration failures do not gate
+	// readiness either: before they were surfaced in Status() the daemon
+	// reported ready with those servers silently absent, and a permanently
+	// failed server must not wedge /ready at 503 (apply's readiness wait
+	// would time out even though the gateway serves every healthy server).
+	for _, status := range s.gateway.Status() {
+		if status.Initialized {
+			continue
+		}
+		if status.Autoscale != nil && len(status.Replicas) == 0 {
+			continue
+		}
+		if status.RegistrationFailed {
+			continue
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("MCP server not initialized: " + status.Name))
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("OK"))
+}
+
+// ClientStatus describes an LLM client's detection and link state.
+type ClientStatus struct {
+	Name       string `json:"name"`
+	Slug       string `json:"slug"`
+	Detected   bool   `json:"detected"`
+	Linked     bool   `json:"linked"`
+	Transport  string `json:"transport"`
+	ConfigPath string `json:"configPath,omitempty"`
+	// EffectiveScope is the backend-computed per-client tool access scope when a
+	// `clients:` block is configured: the servers and prefixed tools this client
+	// can reach. nil when no access scoping is in effect, so the frontend can
+	// distinguish "unscoped (legacy)" from "scoped to nothing".
+	EffectiveScope *mcp.ClientScopeResult `json:"effectiveScope,omitempty"`
+	// Declared reports whether the stack's link: block lists this client;
+	// LinkEntry carries the declared options when it does. Desired state,
+	// distinct from Linked (actual config-file state).
+	Declared  bool           `json:"declared,omitempty"`
+	LinkEntry *LinkEntryInfo `json:"linkEntry,omitempty"`
+	// Drifted reports that a recorded gridctl entry in this client's
+	// config was edited since gridctl wrote it (wiring ownership).
+	Drifted bool `json:"drifted,omitempty"`
+	// Notes carries the provisioner's client-specific post-link guidance
+	// (provisioner.PostLinkNoter); absent for clients without caveats.
+	Notes []string `json:"notes,omitempty"`
+}
+
+// LinkEntryInfo is the wire shape of a declared link: entry's options.
+type LinkEntryInfo struct {
+	Group    string `json:"group,omitempty"`
+	ClientID string `json:"clientId,omitempty"`
+	Name     string `json:"name,omitempty"`
+}
+
+// handleClients returns detected LLM clients and their link status.
+// GET /api/clients
+func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.provisioners == nil {
+		writeJSON(w, []ClientStatus{})
+		return
+	}
+
+	serverName := s.linkServerName
+	if serverName == "" {
+		serverName = "gridctl"
+	}
+
+	scopingOn := s.gateway != nil && s.gateway.ClientAccessConfigured()
+
+	declared := make(map[string]LinkEntryInfo)
+	for _, e := range s.declaredLinks() {
+		declared[e.Client] = LinkEntryInfo{Group: e.Group, ClientID: e.ClientID, Name: e.Name}
+	}
+
+	infos := s.provisioners.AllClientInfo(serverName)
+	drifted := map[string]bool{}
+	if mgr, err := s.wiringMgr(); err == nil {
+		if d, derr := mgr.DriftedClients(r.Context(), s.gatewayPortOrDefault()); derr == nil {
+			drifted = d
+		}
+	}
+	statuses := make([]ClientStatus, 0, len(infos))
+	for _, info := range infos {
+		status := ClientStatus{
+			Name:       info.Name,
+			Slug:       info.Slug,
+			Detected:   info.Detected,
+			Linked:     info.Linked,
+			Transport:  info.Transport,
+			ConfigPath: info.ConfigPath,
+			Drifted:    drifted[info.Slug],
+			Notes:      info.Notes,
+		}
+		if entry, ok := declared[info.Slug]; ok {
+			status.Declared = true
+			e := entry
+			status.LinkEntry = &e
+			// A declared group or name override writes a different entry name
+			// than the default this handler polls, so additionally check the
+			// resolved name. OR, not replace: an entry under either name means
+			// the client reaches this gateway, and flipping Linked to false
+			// while a default-name entry exists would lie to every consumer.
+			if resolved := (config.LinkEntry{Client: info.Slug, Group: entry.Group, Name: entry.Name}).EffectiveName(); resolved != serverName && info.Detected && !status.Linked {
+				if prov, ok := s.provisioners.FindBySlug(info.Slug); ok {
+					if linked, err := prov.IsLinked(info.ConfigPath, resolved); err == nil && linked {
+						status.Linked = true
+					}
+				}
+			}
+		}
+		// Surface the backend-computed effective scope keyed on the client's
+		// stable identifier (its slug, which is what `gridctl link` assigns and
+		// what stack.yaml profiles are keyed on).
+		if scopingOn {
+			scope := s.gateway.ClientScope(info.Slug)
+			status.EffectiveScope = &scope
+		}
+		statuses = append(statuses, status)
+	}
+
+	writeJSON(w, statuses)
+}

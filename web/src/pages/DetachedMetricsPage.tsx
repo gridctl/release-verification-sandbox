@@ -1,0 +1,299 @@
+import { useEffect, useState } from 'react';
+import { BarChart3, AlertCircle, Maximize2, Minimize2, Users, Server, Wrench } from 'lucide-react';
+import { IconButton } from '../components/ui/IconButton';
+import { ErrorBoundary } from '../components/ui/ErrorBoundary';
+import { useDetachedWindowSync } from '../hooks/useBroadcastChannel';
+import { fetchStatus } from '../lib/api';
+import { formatCompactNumber } from '../lib/format';
+import { POLLING } from '../lib/constants';
+import { useMetricsSeries, windowLabelFor, type MetricsTimeRange } from '../hooks/useMetricsSeries';
+import { useToolUsage } from '../hooks/useToolUsage';
+import { useLimits } from '../hooks/useLimits';
+import { LimitsPanel } from '../components/metrics/LimitsShared';
+import { deriveLimitsSummary } from '../components/metrics/limitsData';
+import { MetricsControls } from '../components/metrics/MetricsControls';
+import { MetricsKpiRow, TokenChart, PanelHeader, BreakdownTable, ScrollableBreakdown, WindowEmptyNote } from '../components/metrics/metricsShared';
+import {
+  buildTokenChartData,
+  derivePerServerRows,
+  derivePerClientRows,
+  derivePerToolRows,
+  deriveSessionKpis,
+  deriveWindowTotals,
+  hasMetricsData,
+  sortBreakdownRows,
+  type BreakdownSortColumn,
+  type SortDirection,
+} from '../components/metrics/metricsData';
+import type { GatewayStatus, TokenUsage } from '../types';
+
+function DetachedMetricsPageContent() {
+  // Real-time status snapshot — the detached window lives outside the app
+  // shell, so it owns its own status poll (the in-shell surfaces read the app
+  // store instead). The time-series come from the shared useMetricsSeries hook.
+  const [tokenUsage, setTokenUsage] = useState<TokenUsage | null>(null);
+  const [serverNames, setServerNames] = useState<string[]>([]);
+  const [timeRange, setTimeRange] = useState<MetricsTimeRange>('live');
+  const [isPaused, setIsPaused] = useState(false);
+  const [sortColumn, setSortColumn] = useState<BreakdownSortColumn>('total');
+  const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
+  const [clientSortColumn, setClientSortColumn] = useState<BreakdownSortColumn>('total');
+  const [clientSortDirection, setClientSortDirection] = useState<SortDirection>('desc');
+  const [toolSortColumn, setToolSortColumn] = useState<BreakdownSortColumn>('total');
+  const [toolSortDirection, setToolSortDirection] = useState<SortDirection>('desc');
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  useDetachedWindowSync('metrics');
+
+  // Per-tool usage for the Per-Tool panel — the same GET /api/tools/usage
+  // pipeline the Tools workspace and Metrics Tools scope consume.
+  const { usage: toolUsageData, error: toolUsageError } = useToolUsage(true);
+
+  const { metricsData, isLoading, error, reload, clear } = useMetricsSeries({
+    timeRange,
+    paused: isPaused,
+  });
+
+  // Poll status for real-time token usage
+  useEffect(() => {
+    const pollStatus = async () => {
+      try {
+        const status: GatewayStatus = await fetchStatus();
+        setTokenUsage(status.token_usage ?? null);
+        setServerNames((status['mcp-servers'] ?? []).map((s) => s.name));
+      } catch {
+        // Ignore status errors
+      }
+    };
+
+    pollStatus();
+    const interval = window.setInterval(pollStatus, POLLING.STATUS);
+    return () => clearInterval(interval);
+  }, []);
+
+  const handleSort = (column: BreakdownSortColumn) => {
+    if (sortColumn === column) setSortDirection((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else {
+      setSortColumn(column);
+      setSortDirection('desc');
+    }
+  };
+
+  const handleClientSort = (column: BreakdownSortColumn) => {
+    if (clientSortColumn === column) setClientSortDirection((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else {
+      setClientSortColumn(column);
+      setClientSortDirection('desc');
+    }
+  };
+
+  const handleToolSort = (column: BreakdownSortColumn) => {
+    if (toolSortColumn === column) setToolSortDirection((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else {
+      setToolSortColumn(column);
+      setToolSortDirection('desc');
+    }
+  };
+
+  const kpis = deriveSessionKpis(tokenUsage);
+  const sortedServers = sortBreakdownRows(derivePerServerRows(tokenUsage, serverNames), sortColumn, sortDirection);
+  const sortedClients = sortBreakdownRows(derivePerClientRows(tokenUsage), clientSortColumn, clientSortDirection);
+  const sortedTools = sortBreakdownRows(derivePerToolRows(toolUsageData), toolSortColumn, toolSortDirection);
+
+  // Rate-limit overlay — same source and presentation as the in-shell
+  // workspace (parity is the point of the shared core).
+  const { report: limitsReport } = useLimits(true);
+  const limitsSummary = deriveLimitsSummary(limitsReport);
+
+  const chartData = buildTokenChartData(metricsData);
+  const hasData = hasMetricsData(kpis, metricsData);
+  // Same windowed-KPI presentation as the in-shell workspace; the detached
+  // window keeps its range local (solo window, nothing to deep-link).
+  const windowTotals = deriveWindowTotals(metricsData);
+  const windowLabel = windowLabelFor(timeRange);
+
+  const toggleFullscreen = async () => {
+    if (!document.fullscreenElement) {
+      await document.documentElement.requestFullscreen();
+      setIsFullscreen(true);
+    } else {
+      await document.exitFullscreen();
+      setIsFullscreen(false);
+    }
+  };
+
+  useEffect(() => {
+    const handler = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', handler);
+    return () => document.removeEventListener('fullscreenchange', handler);
+  }, []);
+
+  return (
+    <div className="h-screen w-screen bg-background flex flex-col overflow-hidden">
+      {/* Background grain */}
+      <div
+        className="fixed inset-0 pointer-events-none z-0 opacity-[0.015]"
+        style={{
+          backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E")`,
+        }}
+      />
+
+      {/* Header */}
+      <header className="h-12 flex-shrink-0 bg-surface/90 backdrop-blur-xl border-b border-border/50 flex items-center justify-between px-4 z-10 relative">
+        <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-primary/30 to-transparent" />
+
+        <div className="flex items-center gap-3">
+          <div className="p-1.5 rounded-lg border bg-primary/10 border-primary/20">
+            <BarChart3 size={14} className="text-primary" />
+          </div>
+          <span className="text-sm font-semibold text-text-primary">Token Metrics</span>
+        </div>
+
+        <MetricsControls
+          timeRange={timeRange}
+          onTimeRange={(r) => {
+            setTimeRange(r);
+            if (r === 'live') setIsPaused(false);
+          }}
+          isPaused={isPaused}
+          onTogglePause={() => setIsPaused((p) => !p)}
+          onRefresh={reload}
+          onClear={() => void clear()}
+          right={
+            <IconButton
+              icon={isFullscreen ? Minimize2 : Maximize2}
+              onClick={toggleFullscreen}
+              tooltip={isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
+              size="sm"
+              variant="ghost"
+            />
+          }
+        />
+      </header>
+
+      {/* Content */}
+      <main className="flex-1 overflow-auto bg-background scrollbar-dark min-h-0 p-4">
+        {isLoading && !metricsData && (
+          <div className="space-y-4 animate-pulse">
+            <div className="grid grid-cols-4 gap-3">
+              {[1, 2, 3, 4].map((i) => (
+                <div key={i} className="h-16 rounded-lg bg-surface-elevated/60 border border-border/30" />
+              ))}
+            </div>
+            <div className="h-48 rounded-lg bg-surface-elevated/60 border border-border/30" />
+          </div>
+        )}
+
+        {error && !isLoading && (
+          <div className="flex flex-col items-center justify-center h-full gap-3">
+            <AlertCircle size={24} className="text-status-error" />
+            <span className="text-xs text-status-error">{error}</span>
+            <button onClick={reload} className="text-xs text-primary hover:underline">
+              Retry
+            </button>
+          </div>
+        )}
+
+        {!isLoading && !error && !hasData && (
+          <div className="flex flex-col items-center justify-center h-full text-text-muted gap-2">
+            <BarChart3 size={32} className="text-text-muted/30" />
+            <span className="text-sm">No token data yet</span>
+            <span className="text-xs text-text-muted/60">Metrics will appear after tool calls</span>
+          </div>
+        )}
+
+        {!error && hasData && !(isLoading && !metricsData) && (
+          <div className="space-y-4">
+            <MetricsKpiRow kpis={kpis} windowTotals={windowTotals} windowLabel={windowLabel} />
+            <TokenChart data={chartData} metricsData={metricsData} heightClass="h-48" />
+            <WindowEmptyNote windowTotals={windowTotals} sessionTotal={kpis.total} loaded={metricsData !== null} />
+
+
+            <LimitsPanel summary={limitsSummary} />
+
+            {/* Tables are snapshot-fed, hence "session totals" (same labeling
+                as the in-shell workspace). Parity decision: the workspace's
+                findings card and top-5 previews are deliberately absent here —
+                the previews would duplicate the full tables below, and the
+                finding links navigate the /metrics URL scheme, which this solo
+                window does not host. */}
+            {sortedClients.length > 0 && (
+              <PanelHeader icon={Users} label="Top Clients · session totals">
+                <BreakdownTable
+                  rows={sortedClients}
+                  nameLabel="Client"
+                  sortColumn={clientSortColumn}
+                  sortDirection={clientSortDirection}
+                  onSort={handleClientSort}
+                />
+              </PanelHeader>
+            )}
+
+            {sortedServers.length > 0 && (
+              <PanelHeader icon={Server} label="Per-Server · session totals">
+                <BreakdownTable
+                  rows={sortedServers}
+                  nameLabel="Server"
+                  sortColumn={sortColumn}
+                  sortDirection={sortDirection}
+                  onSort={handleSort}
+                />
+              </PanelHeader>
+            )}
+
+            {(sortedTools.length > 0 || toolUsageError) && (
+              <PanelHeader icon={Wrench} label="Per-Tool · session totals">
+                {/* A failed fetch is not "no usage" — say the source is
+                    unavailable instead of silently dropping the panel. A
+                    retained snapshot keeps rendering (stale beats blank). */}
+                {toolUsageError && sortedTools.length === 0 ? (
+                  <p role="alert" className="text-[11px] text-status-error px-1 py-2">
+                    Tool usage unavailable: {toolUsageError}
+                  </p>
+                ) : (
+                  <>
+                    {toolUsageError && (
+                      <p role="alert" className="text-[11px] text-status-error px-1 pb-2">
+                        Usage refresh failed: {toolUsageError} — showing the last loaded
+                        snapshot
+                      </p>
+                    )}
+                    <ScrollableBreakdown>
+                      <BreakdownTable
+                        rows={sortedTools}
+                        nameLabel="Tool"
+                        sortColumn={toolSortColumn}
+                        sortDirection={toolSortDirection}
+                        onSort={handleToolSort}
+                      />
+                    </ScrollableBreakdown>
+                  </>
+                )}
+              </PanelHeader>
+            )}
+          </div>
+        )}
+      </main>
+
+      {/* Footer */}
+      <footer className="h-6 flex-shrink-0 bg-surface/90 backdrop-blur-xl border-t border-border/50 flex items-center justify-between px-4 text-[10px] text-text-muted">
+        <span className="flex items-center gap-2">
+          {kpis.total > 0 ? `Session total: ${formatCompactNumber(kpis.total)} tokens` : 'No data'}
+          {isPaused ? ' (paused)' : ''}
+        </span>
+        <span className="flex items-center gap-1">
+          <span className="w-1.5 h-1.5 rounded-full bg-text-muted animate-pulse motion-reduce:animate-none" />
+          Detached Window
+        </span>
+      </footer>
+    </div>
+  );
+}
+
+export function DetachedMetricsPage() {
+  return (
+    <ErrorBoundary variant="window">
+      <DetachedMetricsPageContent />
+    </ErrorBoundary>
+  );
+}

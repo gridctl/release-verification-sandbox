@@ -1,0 +1,747 @@
+package pins
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gridctl/gridctl/pkg/mcp"
+	"github.com/gridctl/gridctl/pkg/state"
+)
+
+const (
+	lockTimeout = 5 * time.Second
+	fileVersion = "2"
+	filePerm    = os.FileMode(0600)
+)
+
+// schemeV2Prefix marks digests computed under the current hash scheme, which
+// covers name, description, inputSchema, and outputSchema. Unprefixed digests
+// are the legacy scheme (no outputSchema). Verification recomputes under the
+// scheme recorded on each pin so a scheme change never presents as drift;
+// VerifyOrPin rewrites clean legacy pins to the current scheme.
+const schemeV2Prefix = "h2:"
+
+// Sentinel errors reported by Load. A caller that prefers availability over
+// strictness (the daemon) may match ErrCorrupt and continue with the empty
+// store Load leaves behind; ErrNewerVersion must never be papered over, or
+// this binary would re-pin from scratch and overwrite the newer file.
+var (
+	ErrCorrupt      = errors.New("corrupt pin file")
+	ErrNewerVersion = errors.New("pin file written by a newer gridctl")
+)
+
+// PinStore manages TOFU schema pins for a deployed stack.
+// It is safe for concurrent use: in-memory access is guarded by a RWMutex,
+// and disk writes are serialized via state.WithLock.
+type PinStore struct {
+	stackName string
+	path      string
+	mu        sync.RWMutex
+	data      *PinFile
+
+	// scanEnabled controls the poisoning heuristics run at pin and verify
+	// time (default on); scanIgnore drops findings by code (e.g. "P004").
+	// Both are advisory-only knobs: they never affect hashing or drift.
+	scanEnabled bool
+	scanIgnore  []string
+}
+
+// New creates a PinStore for the given stack name.
+// The pin file lives at ~/.gridctl/pins/{stackName}.json.
+// Call Load() before performing verification or pinning operations.
+func New(stackName string) *PinStore {
+	ps := &PinStore{
+		stackName:   stackName,
+		scanEnabled: true,
+	}
+	ps.data = ps.emptyPinFile()
+	return ps
+}
+
+// ensurePath resolves the on-disk location lazily so New stays error-free;
+// resolution fails only when no home directory is available. Callers hold
+// ps.mu.
+func (ps *PinStore) ensurePath() error {
+	if ps.path != "" {
+		return nil
+	}
+	p, err := state.PinsPath(ps.stackName)
+	if err != nil {
+		return fmt.Errorf("pins: resolving pin file path: %w", err)
+	}
+	ps.path = p
+	return nil
+}
+
+// NewWithPath creates a PinStore that stores pins in dir/{stackName}.json.
+// Intended for testing where the real state directory should not be used.
+func NewWithPath(dir, stackName string) *PinStore {
+	ps := &PinStore{
+		stackName:   stackName,
+		path:        filepath.Join(dir, stackName+".json"),
+		scanEnabled: true,
+	}
+	ps.data = ps.emptyPinFile()
+	return ps
+}
+
+// SetScanConfig configures the poisoning scanner: enabled toggles it, ignore
+// suppresses findings by code. Call before the store starts verifying.
+func (ps *PinStore) SetScanConfig(enabled bool, ignore []string) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	ps.scanEnabled = enabled
+	ps.scanIgnore = append([]string(nil), ignore...)
+}
+
+// scanFindings runs the poisoning scan for one tool under the store's scan
+// settings. Caller must hold ps.mu (read or write).
+func (ps *PinStore) scanFindings(t mcp.Tool) []Finding {
+	if !ps.scanEnabled {
+		return nil
+	}
+	return FilterFindings(ScanTool(t), ps.scanIgnore)
+}
+
+// ScanEnabled reports whether the poisoning scanner is on for this store.
+// Callers that compute supplementary findings outside the store (the API
+// layer's cross-server shadowing check) use this to honor the same config.
+func (ps *PinStore) ScanEnabled() bool {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return ps.scanEnabled
+}
+
+// ScanIgnoreCodes returns a copy of the configured ignore list.
+func (ps *PinStore) ScanIgnoreCodes() []string {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return append([]string(nil), ps.scanIgnore...)
+}
+
+// Load reads the pin file from disk into memory.
+// If the file does not exist, the store starts empty (ready for first pin).
+// A file that cannot be parsed returns an error wrapping ErrCorrupt, and a
+// file written by a newer gridctl returns one wrapping ErrNewerVersion; in
+// both cases the in-memory store is reset to empty so a caller that chooses
+// to continue anyway has a usable store.
+func (ps *PinStore) Load() error {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	if err := ps.ensurePath(); err != nil {
+		return err
+	}
+	data, err := os.ReadFile(ps.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			ps.data = ps.emptyPinFile()
+			return nil
+		}
+		return fmt.Errorf("pins: reading pin file: %w", err)
+	}
+
+	var pf PinFile
+	if err := json.Unmarshal(data, &pf); err != nil {
+		ps.data = ps.emptyPinFile()
+		return fmt.Errorf("pins: %w at %s: %v", ErrCorrupt, ps.path, err)
+	}
+	switch pf.Version {
+	case "", "1", fileVersion:
+	default:
+		ps.data = ps.emptyPinFile()
+		return fmt.Errorf("pins: %w: %s has version %q; upgrade gridctl to use it", ErrNewerVersion, ps.path, pf.Version)
+	}
+	if pf.Servers == nil {
+		pf.Servers = make(map[string]*ServerPins)
+	}
+	ps.data = &pf
+	return nil
+}
+
+// GetAll returns a deep-copied snapshot of all server pin records. Callers
+// iterate and marshal the result outside the store's lock while the gateway's
+// verify path mutates records in place (scheme upgrades, re-pins), so shared
+// pointers would be a data race and shared maps a runtime panic.
+func (ps *PinStore) GetAll() map[string]*ServerPins {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	out := make(map[string]*ServerPins, len(ps.data.Servers))
+	for k, v := range ps.data.Servers {
+		out[k] = copyServerPins(v)
+	}
+	return out
+}
+
+// GetServer returns a deep-copied pin record for a single server; see GetAll
+// for why a copy.
+func (ps *PinStore) GetServer(serverName string) (*ServerPins, bool) {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	sp, ok := ps.data.Servers[serverName]
+	if !ok {
+		return nil, false
+	}
+	return copyServerPins(sp), true
+}
+
+// copyServerPins deep-copies a ServerPins for lock-free consumption.
+func copyServerPins(sp *ServerPins) *ServerPins {
+	if sp == nil {
+		return nil
+	}
+	out := *sp
+	out.Tools = make(map[string]*PinRecord, len(sp.Tools))
+	for name, rec := range sp.Tools {
+		recCopy := *rec
+		recCopy.Findings = append([]Finding(nil), rec.Findings...)
+		out.Tools[name] = &recCopy
+	}
+	return &out
+}
+
+// VerifyOrPin is the primary entry point called on RefreshTools.
+// On first use it pins the tools; on subsequent calls it verifies against pins.
+// New tools not in pins are auto-pinned; modified tools trigger VerifyStatusDrift.
+func (ps *PinStore) VerifyOrPin(serverName string, tools []mcp.Tool) (*VerifyResult, error) {
+	return ps.withFileLock(func() (*VerifyResult, error) {
+		ps.mu.Lock()
+		defer ps.mu.Unlock()
+
+		sp := ps.data.Servers[serverName]
+		if sp == nil {
+			// First time — pin everything.
+			result, err := ps.pinServer(serverName, tools)
+			if err != nil {
+				return nil, err
+			}
+			if err := ps.saveLocked(); err != nil {
+				return nil, err
+			}
+			return result, nil
+		}
+
+		return ps.verifyAndUpdate(serverName, sp, tools)
+	})
+}
+
+// Verify checks tools against stored pins without pinning new tools.
+// Unlike VerifyOrPin, new tools are not auto-pinned.
+func (ps *PinStore) Verify(serverName string, tools []mcp.Tool) (*VerifyResult, error) {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	sp := ps.data.Servers[serverName]
+	if sp == nil {
+		return &VerifyResult{ServerName: serverName, Status: VerifyStatusPinned}, nil
+	}
+
+	return ps.buildVerifyResult(serverName, sp, tools)
+}
+
+// Approve re-pins the current tool definitions for a server, clearing drift.
+func (ps *PinStore) Approve(serverName string, tools []mcp.Tool) error {
+	_, err := ps.withFileLock(func() (*VerifyResult, error) {
+		ps.mu.Lock()
+		defer ps.mu.Unlock()
+
+		if _, err := ps.pinServer(serverName, tools); err != nil {
+			return nil, err
+		}
+		return nil, ps.saveLocked()
+	})
+	return err
+}
+
+// Reset deletes the pin record for a server. The next VerifyOrPin call will re-pin.
+func (ps *PinStore) Reset(serverName string) error {
+	_, err := ps.withFileLock(func() (*VerifyResult, error) {
+		ps.mu.Lock()
+		defer ps.mu.Unlock()
+
+		delete(ps.data.Servers, serverName)
+		return nil, ps.saveLocked()
+	})
+	return err
+}
+
+// --- internal helpers ---
+
+// withFileLock runs fn under a file-level lock to serialize writes across processes.
+func (ps *PinStore) withFileLock(fn func() (*VerifyResult, error)) (*VerifyResult, error) {
+	var result *VerifyResult
+	err := state.WithLock("pins-"+ps.stackName, lockTimeout, func() error {
+		var e error
+		result, e = fn()
+		return e
+	})
+	return result, err
+}
+
+// HashTools computes the server-level fingerprint that Approve would store
+// for the given tools. It lets callers bind an approval to a reviewed
+// snapshot: capture the fingerprint when rendering a diff, then compare it
+// against the live one at approve time and reject on mismatch, closing the
+// window where a server swaps in unreviewed definitions between review and
+// approval.
+func HashTools(tools []mcp.Tool) (string, error) {
+	hashes := make([]string, 0, len(tools))
+	for _, t := range sortedTools(tools) {
+		h, err := hashTool(t)
+		if err != nil {
+			return "", fmt.Errorf("pins: hashing tool %q: %w", t.Name, err)
+		}
+		hashes = append(hashes, h)
+	}
+	return hashStrings(hashes), nil
+}
+
+// pinServer hashes all provided tools and stores them as a fresh pin record.
+// Caller must hold ps.mu.Lock().
+func (ps *PinStore) pinServer(serverName string, tools []mcp.Tool) (*VerifyResult, error) {
+	now := time.Now().UTC()
+	toolRecords := make(map[string]*PinRecord, len(tools))
+	hashes := make([]string, 0, len(tools))
+
+	flagged := 0
+	for _, t := range sortedTools(tools) {
+		h, err := hashTool(t)
+		if err != nil {
+			return nil, fmt.Errorf("pins: hashing tool %q: %w", t.Name, err)
+		}
+		input, output, err := canonicalSchemas(t)
+		if err != nil {
+			return nil, err
+		}
+		findings := ps.scanFindings(t)
+		if sev := MaxSeverity(findings); sev == SeverityWarn || sev == SeverityCritical {
+			flagged++
+		}
+		toolRecords[t.Name] = &PinRecord{
+			Hash:         h,
+			Name:         t.Name,
+			Description:  t.Description,
+			PinnedAt:     now,
+			Findings:     findings,
+			InputSchema:  input,
+			OutputSchema: output,
+		}
+		hashes = append(hashes, h)
+	}
+	if flagged > 0 {
+		slog.Warn("pins: poisoning heuristics flagged tools at pin time",
+			"server", serverName,
+			"flagged", flagged,
+			"hint", "review with 'gridctl pins list' or the Pins workspace")
+	}
+
+	// Preserve original PinnedAt when re-pinning (approve flow).
+	pinnedAt := now
+	if existing := ps.data.Servers[serverName]; existing != nil {
+		pinnedAt = existing.PinnedAt
+	}
+
+	ps.data.Servers[serverName] = &ServerPins{
+		ServerHash:     hashStrings(hashes),
+		PinnedAt:       pinnedAt,
+		LastVerifiedAt: now,
+		ToolCount:      len(tools),
+		Status:         StatusPinned,
+		Tools:          toolRecords,
+	}
+
+	slog.Info("pins: pinned server", "server", serverName, "tools", len(tools))
+	return &VerifyResult{ServerName: serverName, Status: VerifyStatusPinned}, nil
+}
+
+// verifyAndUpdate compares current tools against stored pins, updates state, and saves.
+// Caller must hold ps.mu.Lock().
+func (ps *PinStore) verifyAndUpdate(serverName string, sp *ServerPins, tools []mcp.Tool) (*VerifyResult, error) {
+	result, err := ps.buildVerifyResult(serverName, sp, tools)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	sp.LastVerifiedAt = now
+
+	if len(result.ModifiedTools) > 0 {
+		sp.Status = StatusDrift
+		slog.Warn("pins: schema drift detected",
+			"server", serverName,
+			"modified", len(result.ModifiedTools))
+	} else {
+		sp.Status = StatusPinned
+	}
+
+	// Auto-pin new tools (additions are not considered drift).
+	if len(result.NewTools) > 0 {
+		slog.Info("pins: new tools detected, pinning",
+			"server", serverName,
+			"tools", result.NewTools)
+		for _, t := range tools {
+			if sp.Tools[t.Name] != nil {
+				continue
+			}
+			h, err := hashTool(t)
+			if err != nil {
+				return nil, fmt.Errorf("pins: hashing new tool %q: %w", t.Name, err)
+			}
+			input, output, err := canonicalSchemas(t)
+			if err != nil {
+				return nil, err
+			}
+			sp.Tools[t.Name] = &PinRecord{
+				Hash:         h,
+				Name:         t.Name,
+				Description:  t.Description,
+				PinnedAt:     now,
+				Findings:     ps.scanFindings(t),
+				InputSchema:  input,
+				OutputSchema: output,
+			}
+		}
+		sp.ToolCount = len(sp.Tools)
+	}
+
+	if len(result.RemovedTools) > 0 {
+		slog.Warn("pins: tools removed since pinning",
+			"server", serverName,
+			"removed", result.RemovedTools)
+	}
+
+	// Rewrite clean legacy pins under the current digest scheme. Drifted
+	// pins keep their recorded scheme so the diff stays meaningful; they
+	// adopt the current scheme when approved.
+	modified := make(map[string]bool, len(result.ModifiedTools))
+	for _, d := range result.ModifiedTools {
+		modified[d.Name] = true
+	}
+	upgraded := 0
+	for _, t := range tools {
+		pin := sp.Tools[t.Name]
+		if pin == nil || modified[t.Name] {
+			continue
+		}
+		if !strings.HasPrefix(pin.Hash, schemeV2Prefix) {
+			h, err := hashTool(t)
+			if err != nil {
+				return nil, fmt.Errorf("pins: rehashing tool %q: %w", t.Name, err)
+			}
+			pin.Hash = h
+			upgraded++
+		}
+		// Backfill canonical schemas onto clean pins recorded before schema
+		// capture. Safe under h2 (including the upgrade above, which re-hashed
+		// from these live tools): a clean verify proves the live schemas match
+		// the pinned definition. Canonical form is never empty ("{}" minimum),
+		// so empty means unrecorded.
+		if pin.InputSchema == "" && pin.OutputSchema == "" {
+			input, output, err := canonicalSchemas(t)
+			if err != nil {
+				return nil, err
+			}
+			pin.InputSchema = input
+			pin.OutputSchema = output
+		}
+	}
+	if upgraded > 0 {
+		slog.Info("pins: upgraded pin scheme", "server", serverName, "tools", upgraded)
+	}
+
+	sp.ServerHash = serverHashFromPins(sp.Tools)
+
+	if err := ps.saveLocked(); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// buildVerifyResult computes the diff between current tools and stored pins.
+// It does not mutate state. Caller must hold ps.mu (read or write lock).
+func (ps *PinStore) buildVerifyResult(serverName string, sp *ServerPins, tools []mcp.Tool) (*VerifyResult, error) {
+	result := &VerifyResult{ServerName: serverName, Status: VerifyStatusVerified}
+
+	// Index current tools by name.
+	current := make(map[string]mcp.Tool, len(tools))
+	for _, t := range tools {
+		current[t.Name] = t
+	}
+
+	// Check each pinned tool against the current tool list.
+	for name, pin := range sp.Tools {
+		t, present := current[name]
+		if !present {
+			result.RemovedTools = append(result.RemovedTools, name)
+			continue
+		}
+		h, err := hashToolForPin(pin.Hash, t)
+		if err != nil {
+			return nil, fmt.Errorf("pins: hashing tool %q during verify: %w", name, err)
+		}
+		if h != pin.Hash {
+			input, output, err := canonicalSchemas(t)
+			if err != nil {
+				return nil, err
+			}
+			result.ModifiedTools = append(result.ModifiedTools, ToolDiff{
+				Name:            name,
+				OldHash:         pin.Hash,
+				NewHash:         h,
+				OldDescription:  pin.Description,
+				NewDescription:  t.Description,
+				OldInputSchema:  pin.InputSchema,
+				NewInputSchema:  input,
+				OldOutputSchema: pin.OutputSchema,
+				NewOutputSchema: output,
+				ChangeKinds:     changeKinds(pin, t.Description, input, output),
+				Findings:        ps.scanFindings(t),
+			})
+		}
+	}
+
+	// Detect tools present on server but not yet pinned.
+	for name := range current {
+		if sp.Tools[name] == nil {
+			result.NewTools = append(result.NewTools, name)
+		}
+	}
+
+	// Assign summary status (drift takes priority).
+	switch {
+	case len(result.ModifiedTools) > 0:
+		result.Status = VerifyStatusDrift
+	case len(result.NewTools) > 0:
+		result.Status = VerifyStatusNewTools
+	case len(result.RemovedTools) > 0:
+		result.Status = VerifyStatusRemovedTools
+	}
+
+	sort.Strings(result.NewTools)
+	sort.Strings(result.RemovedTools)
+	sort.Slice(result.ModifiedTools, func(i, j int) bool {
+		return result.ModifiedTools[i].Name < result.ModifiedTools[j].Name
+	})
+
+	return result, nil
+}
+
+// saveLocked writes the pin file atomically. Creates the directory on first write.
+// Caller must hold ps.mu.Lock().
+func (ps *PinStore) saveLocked() error {
+	if err := ps.ensurePath(); err != nil {
+		return err
+	}
+	// The directory derives from ps.path, not state.PinsDir(): a store
+	// built via NewWithPath must never create the real pins directory.
+	if err := os.MkdirAll(filepath.Dir(ps.path), 0755); err != nil {
+		return fmt.Errorf("pins: creating pins directory: %w", err)
+	}
+
+	// Any file this binary writes is current-version: both digest schemes
+	// remain readable, so loaded legacy files are upgraded on first save.
+	ps.data.Version = fileVersion
+
+	data, err := json.MarshalIndent(ps.data, "", "  ")
+	if err != nil {
+		return fmt.Errorf("pins: marshaling pin file: %w", err)
+	}
+
+	return atomicWrite(ps.path, data, filePerm)
+}
+
+// atomicWrite writes data to path via a temp file and rename for crash safety.
+func atomicWrite(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, perm); err != nil {
+		return fmt.Errorf("pins: writing temp file: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		if removeErr := os.Remove(tmp); removeErr != nil {
+			slog.Warn("pins: failed to remove temp file after rename error", "path", tmp, "error", removeErr)
+		}
+		return fmt.Errorf("pins: renaming temp file: %w", err)
+	}
+	return nil
+}
+
+// emptyPinFile returns a fresh PinFile for this stack.
+func (ps *PinStore) emptyPinFile() *PinFile {
+	return &PinFile{
+		Version:   fileVersion,
+		Stack:     ps.stackName,
+		CreatedAt: time.Now().UTC(),
+		Servers:   make(map[string]*ServerPins),
+	}
+}
+
+// --- hash functions ---
+
+// hashTool computes a deterministic SHA256 digest of a tool's definition under
+// the current scheme: name, description, inputSchema, and outputSchema. Both
+// schemas are canonically serialized (recursively sorted object keys) before
+// hashing so identical schemas produce identical hashes regardless of key
+// order, and absent/null/empty schemas all normalize to "{}".
+func hashTool(t mcp.Tool) (string, error) {
+	input, err := canonicalSchema(t.InputSchema)
+	if err != nil {
+		return "", fmt.Errorf("pins: canonicalizing inputSchema for %q: %w", t.Name, err)
+	}
+	output, err := canonicalSchema(t.OutputSchema)
+	if err != nil {
+		return "", fmt.Errorf("pins: canonicalizing outputSchema for %q: %w", t.Name, err)
+	}
+	sum := sha256.Sum256([]byte(t.Name + "\n" + t.Description + "\n" + input + "\n" + output))
+	return schemeV2Prefix + hex.EncodeToString(sum[:]), nil
+}
+
+// hashToolLegacy computes the pre-outputSchema digest (unprefixed scheme),
+// kept so pins recorded before outputSchema fingerprinting keep verifying.
+func hashToolLegacy(t mcp.Tool) (string, error) {
+	canonical, err := canonicalSchema(t.InputSchema)
+	if err != nil {
+		return "", fmt.Errorf("pins: canonicalizing schema for %q: %w", t.Name, err)
+	}
+	sum := sha256.Sum256([]byte(t.Name + "\n" + t.Description + "\n" + canonical))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// hashToolForPin recomputes a tool's digest under the scheme recorded in
+// pinnedHash, so a scheme change never presents as drift.
+func hashToolForPin(pinnedHash string, t mcp.Tool) (string, error) {
+	if strings.HasPrefix(pinnedHash, schemeV2Prefix) {
+		return hashTool(t)
+	}
+	return hashToolLegacy(t)
+}
+
+// canonicalSchemas returns the canonical serialization of a tool's input and
+// output schemas, the same values hashTool digests.
+func canonicalSchemas(t mcp.Tool) (input, output string, err error) {
+	input, err = canonicalSchema(t.InputSchema)
+	if err != nil {
+		return "", "", fmt.Errorf("pins: canonicalizing inputSchema for %q: %w", t.Name, err)
+	}
+	output, err = canonicalSchema(t.OutputSchema)
+	if err != nil {
+		return "", "", fmt.Errorf("pins: canonicalizing outputSchema for %q: %w", t.Name, err)
+	}
+	return input, output, nil
+}
+
+// changeKinds names the parts of a tool definition that moved between the pin
+// record and the live values. For pins recorded before schema capture the old
+// schemas are unrecoverable, so any hash move may include a schema change we
+// cannot show: schema_uncaptured is always reported for such pins, alongside
+// description when the prose also moved, so the reviewer is never told "only
+// the description changed" on evidence that cannot support it.
+func changeKinds(pin *PinRecord, newDescription, newInput, newOutput string) []string {
+	var kinds []string
+	if pin.Description != newDescription {
+		kinds = append(kinds, ChangeKindDescription)
+	}
+	if pin.InputSchema == "" && pin.OutputSchema == "" {
+		return append(kinds, ChangeKindSchemaUncaptured)
+	}
+	if pin.InputSchema != newInput {
+		kinds = append(kinds, ChangeKindInputSchema)
+	}
+	if pin.OutputSchema != newOutput {
+		kinds = append(kinds, ChangeKindOutputSchema)
+	}
+	return kinds
+}
+
+// canonicalSchema produces a deterministic JSON string from a json.RawMessage
+// by unmarshaling, recursively sorting all object keys, and re-marshaling.
+// Go's encoding/json guarantees alphabetical key ordering when marshaling map[string]any.
+// Empty, null, and {} inputs all normalize to "{}" to prevent false drifts between
+// servers that omit inputSchema vs. those that send an empty object.
+func canonicalSchema(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 {
+		return "{}", nil
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return "", fmt.Errorf("pins: parsing inputSchema: %w", err)
+	}
+	// Normalize null and empty object to "{}" for consistency.
+	if v == nil {
+		return "{}", nil
+	}
+	if m, ok := v.(map[string]any); ok && len(m) == 0 {
+		return "{}", nil
+	}
+	out, err := json.Marshal(sortKeys(v))
+	if err != nil {
+		return "", fmt.Errorf("pins: marshaling canonical schema: %w", err)
+	}
+	return string(out), nil
+}
+
+// sortKeys recursively rebuilds any map[string]any with recursively sorted values.
+// encoding/json marshals map[string]any with alphabetically sorted keys, so this
+// ensures nested maps also have their values recursively normalized.
+func sortKeys(v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(val))
+		for k, v2 := range val {
+			out[k] = sortKeys(v2)
+		}
+		return out
+	case []any:
+		for i, item := range val {
+			val[i] = sortKeys(item)
+		}
+		return val
+	default:
+		return v
+	}
+}
+
+// hashStrings computes a SHA256 over the concatenation of a sorted slice of hex digests.
+func hashStrings(hashes []string) string {
+	var b strings.Builder
+	for _, h := range hashes {
+		b.WriteString(h)
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+// serverHashFromPins recomputes the server hash from stored pin records (sorted by name).
+func serverHashFromPins(pins map[string]*PinRecord) string {
+	names := make([]string, 0, len(pins))
+	for n := range pins {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+
+	hashes := make([]string, 0, len(names))
+	for _, n := range names {
+		hashes = append(hashes, pins[n].Hash)
+	}
+	return hashStrings(hashes)
+}
+
+// sortedTools returns a copy of tools sorted by name for deterministic hashing order.
+func sortedTools(tools []mcp.Tool) []mcp.Tool {
+	out := make([]mcp.Tool, len(tools))
+	copy(out, tools)
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}

@@ -1,0 +1,656 @@
+import { parse as parseYAML } from 'yaml';
+
+// yaml-builder.ts — Form state to YAML serialization
+// Converts structured wizard form data into valid YAML strings.
+// Never includes raw secrets — only ${var:KEY} references.
+
+export type ResourceType = 'stack' | 'mcp-server' | 'resource' | 'skill' | 'pack' | 'secret' | 'global-context' | 'client-link';
+
+export type ServerType = 'container' | 'source' | 'external' | 'local' | 'ssh' | 'openapi';
+
+export interface MCPServerFormData {
+  name: string;
+  serverType: ServerType;
+  // Container
+  image?: string;
+  port?: number;
+  transport?: string;
+  command?: string[];
+  // Source
+  source?: {
+    type: string;
+    url?: string;
+    ref?: string;
+    path?: string;
+    dockerfile?: string;
+    projectPath?: string;
+    runtime?: 'python';
+    package?: string;
+    python?: string;
+    extras?: string[];
+    with?: string[];
+    packages?: string[];
+    // Optional auth block for private git sources. Only accepts a vault
+    // reference (no raw tokens) since this block is persisted to YAML.
+    auth?: {
+      method?: 'token';
+      credentialRef?: string; // e.g. "${var:GIT_TOKEN}"
+    };
+  };
+  // External
+  url?: string;
+  // Downstream auth for external URL servers. Mirrors config.ServerAuth:
+  // bearer (token), header (header + value), or oauth (all fields optional;
+  // dynamic client registration when clientId is empty). Secret fields
+  // should hold ${var:KEY} references, not literals.
+  auth?: ExternalAuthFormData;
+  // SSH
+  ssh?: {
+    host: string;
+    user: string;
+    port?: number;
+    identityFile?: string;
+    knownHostsFile?: string;
+    jumpHost?: string;
+  };
+  // OpenAPI
+  openapi?: {
+    spec: string;
+    baseUrl?: string;
+    auth?: {
+      type: string;
+      tokenEnv?: string;
+      header?: string;
+      valueEnv?: string;
+      paramName?: string;
+      clientIdEnv?: string;
+      clientSecretEnv?: string;
+      tokenUrl?: string;
+      scopes?: string[];
+      usernameEnv?: string;
+      passwordEnv?: string;
+    };
+    tls?: {
+      certFile?: string;
+      keyFile?: string;
+      caFile?: string;
+      insecureSkipVerify?: boolean;
+    };
+    operations?: {
+      include?: string[];
+      exclude?: string[];
+    };
+  };
+  // Common
+  env?: Record<string, string>;
+  buildArgs?: Record<string, string>;
+  volumes?: string[];
+  tools?: string[];
+  outputFormat?: string;
+  network?: string;
+  pinSchemas?: boolean;
+  // Replicas (mutually exclusive with autoscale)
+  replicas?: number;
+  replicaPolicy?: 'round-robin' | 'least-connections';
+  // Autoscale (mutually exclusive with replicas)
+  autoscale?: AutoscaleFormData;
+}
+
+export interface ExternalAuthFormData {
+  type: 'bearer' | 'header' | 'oauth';
+  token?: string;
+  header?: string;
+  value?: string;
+  scopes?: string[];
+  clientId?: string;
+  clientSecret?: string;
+}
+
+// AutoscaleFormData mirrors pkg/config.AutoscaleConfig. UI labels are
+// vocabulary-swapped (target_in_flight → "Target concurrent requests per
+// replica") but YAML keys match the backend exactly.
+export interface AutoscaleFormData {
+  min: number;
+  max: number;
+  targetInFlight: number;
+  scaleUpAfter?: string;
+  scaleDownAfter?: string;
+  warmPool?: number;
+  idleToZero?: boolean;
+}
+
+export interface ResourceFormData {
+  name: string;
+  image: string;
+  env?: Record<string, string>;
+  ports?: string[];
+  volumes?: string[];
+  network?: string;
+}
+
+export interface StackFormData {
+  name: string;
+  version?: string;
+  gateway?: {
+    allowedOrigins?: string[];
+    auth?: { type: string; token: string; header?: string };
+    codeMode?: string;
+    codeModeTimeout?: number;
+    outputFormat?: string;
+    maxToolResultBytes?: number;
+    tracing?: {
+      enabled?: boolean;
+      sampling?: number;
+      retention?: string;
+      export?: string;
+      endpoint?: string;
+    };
+    security?: {
+      schemaPinning?: {
+        enabled?: boolean;
+        action?: string;
+      };
+    };
+  };
+  network?: { name: string; driver: string };
+  secrets?: { sets: string[] };
+  logging?: {
+    file?: string;
+    maxSizeMB?: number;
+    maxAgeDays?: number;
+    maxBackups?: number;
+  };
+  mcpServers?: MCPServerFormData[];
+  resources?: ResourceFormData[];
+}
+
+export type WizardFormData =
+  | { type: 'stack'; data: StackFormData }
+  | { type: 'mcp-server'; data: MCPServerFormData }
+  | { type: 'resource'; data: ResourceFormData };
+
+// Serialize a value that might need quoting
+function yamlValue(val: string | number | boolean): string {
+  if (typeof val === 'number' || typeof val === 'boolean') return String(val);
+  if (/^\$\{(vault|var):/.test(val)) return `"${val}"`;
+  if (
+    /[:#{}[\],&*?|>!%@`]/.test(val) ||
+    /^(?:null|~|true|false|[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?|[-+]?\.inf|\.nan)$/i.test(val) ||
+    val === ''
+  ) {
+    return `"${val.replace(/"/g, '\\"')}"`;
+  }
+  return val;
+}
+
+// Serialize a map to YAML key-value pairs
+function serializeMap(map: Record<string, string>, indentLevel: number): string {
+  const entries = Object.entries(map).filter(([k]) => k);
+  if (entries.length === 0) return '';
+  return entries.map(([k, v]) => `${' '.repeat(indentLevel)}${k}: ${yamlValue(v)}`).join('\n');
+}
+
+// Serialize a string array
+function serializeArray(arr: string[], indentLevel: number): string {
+  return arr.filter(Boolean).map((v) => `${' '.repeat(indentLevel)}- ${yamlValue(v)}`).join('\n');
+}
+
+function buildMCPServer(data: MCPServerFormData, indentLevel = 2): string {
+  const pad = ' '.repeat(indentLevel);
+  const lines: string[] = [];
+  lines.push(`${pad}- name: ${yamlValue(data.name)}`);
+  const inner = ' '.repeat(indentLevel + 2);
+
+  switch (data.serverType) {
+    case 'container':
+      if (data.image) lines.push(`${inner}image: ${yamlValue(data.image)}`);
+      if (data.port) lines.push(`${inner}port: ${data.port}`);
+      if (data.transport) lines.push(`${inner}transport: ${data.transport}`);
+      if (data.command?.length) {
+        lines.push(`${inner}command:`);
+        data.command.forEach((c) => lines.push(`${inner}  - ${yamlValue(c)}`));
+      }
+      break;
+    case 'source':
+      if (data.source) {
+        lines.push(`${inner}source:`);
+        lines.push(`${inner}  type: ${data.source.type}`);
+        if (data.source.url) lines.push(`${inner}  url: ${yamlValue(data.source.url)}`);
+        if (data.source.ref) lines.push(`${inner}  ref: ${yamlValue(data.source.ref)}`);
+        if (data.source.path) lines.push(`${inner}  path: ${yamlValue(data.source.path)}`);
+        if (data.source.projectPath) lines.push(`${inner}  project_path: ${yamlValue(data.source.projectPath)}`);
+        if (data.source.dockerfile) lines.push(`${inner}  dockerfile: ${yamlValue(data.source.dockerfile)}`);
+        if (data.source.runtime) lines.push(`${inner}  runtime: ${data.source.runtime}`);
+        if (data.source.package) lines.push(`${inner}  package: ${yamlValue(data.source.package)}`);
+        if (data.source.python) lines.push(`${inner}  python: ${yamlValue(data.source.python)}`);
+        for (const [key, values] of [
+          ['extras', data.source.extras],
+          ['with', data.source.with],
+          ['packages', data.source.packages],
+        ] as const) {
+          if (values?.length) {
+            lines.push(`${inner}  ${key}:`);
+            lines.push(serializeArray(values, indentLevel + 6));
+          }
+        }
+        // Auth block: persisted as a vault reference. The resolver runs
+        // server-side at clone time; no raw credentials ever hit YAML.
+        if (data.source.auth?.credentialRef) {
+          lines.push(`${inner}  auth:`);
+          if (data.source.auth.method) {
+            lines.push(`${inner}    method: ${data.source.auth.method}`);
+          }
+          lines.push(
+            `${inner}    credential_ref: ${yamlValue(data.source.auth.credentialRef)}`,
+          );
+        }
+      }
+      if (data.port) lines.push(`${inner}port: ${data.port}`);
+      if (data.transport) lines.push(`${inner}transport: ${data.transport}`);
+      if (data.command?.length) {
+        lines.push(`${inner}command:`);
+        lines.push(serializeArray(data.command, indentLevel + 4));
+      }
+      break;
+    case 'external':
+      if (data.url) lines.push(`${inner}url: ${yamlValue(data.url)}`);
+      if (data.transport) lines.push(`${inner}transport: ${data.transport}`);
+      if (data.auth) {
+        const auth = data.auth;
+        lines.push(`${inner}auth:`);
+        lines.push(`${inner}  type: ${auth.type}`);
+        if (auth.token) lines.push(`${inner}  token: ${yamlValue(auth.token)}`);
+        if (auth.header) lines.push(`${inner}  header: ${yamlValue(auth.header)}`);
+        if (auth.value) lines.push(`${inner}  value: ${yamlValue(auth.value)}`);
+        if (auth.scopes?.length) {
+          lines.push(`${inner}  scopes:`);
+          lines.push(serializeArray(auth.scopes, indentLevel + 6));
+        }
+        if (auth.clientId) lines.push(`${inner}  client_id: ${yamlValue(auth.clientId)}`);
+        if (auth.clientSecret) lines.push(`${inner}  client_secret: ${yamlValue(auth.clientSecret)}`);
+      }
+      break;
+    case 'local':
+      if (data.command?.length) {
+        lines.push(`${inner}command:`);
+        data.command.forEach((c) => lines.push(`${inner}  - ${yamlValue(c)}`));
+      }
+      lines.push(`${inner}transport: stdio`);
+      break;
+    case 'ssh':
+      if (data.ssh) {
+        lines.push(`${inner}ssh:`);
+        lines.push(`${inner}  host: ${data.ssh.host}`);
+        lines.push(`${inner}  user: ${data.ssh.user}`);
+        if (data.ssh.port && data.ssh.port !== 22) lines.push(`${inner}  port: ${data.ssh.port}`);
+        if (data.ssh.identityFile) lines.push(`${inner}  identityFile: ${data.ssh.identityFile}`);
+        if (data.ssh.knownHostsFile) lines.push(`${inner}  knownHostsFile: ${data.ssh.knownHostsFile}`);
+        if (data.ssh.jumpHost) lines.push(`${inner}  jumpHost: ${data.ssh.jumpHost}`);
+      }
+      if (data.command?.length) {
+        lines.push(`${inner}command:`);
+        data.command.forEach((c) => lines.push(`${inner}  - ${yamlValue(c)}`));
+      }
+      break;
+    case 'openapi':
+      if (data.openapi) {
+        lines.push(`${inner}openapi:`);
+        lines.push(`${inner}  spec: ${yamlValue(data.openapi.spec)}`);
+        if (data.openapi.baseUrl) lines.push(`${inner}  baseUrl: ${yamlValue(data.openapi.baseUrl)}`);
+        if (data.openapi.auth) {
+          const auth = data.openapi.auth;
+          lines.push(`${inner}  auth:`);
+          lines.push(`${inner}    type: ${auth.type}`);
+          if (auth.tokenEnv) lines.push(`${inner}    tokenEnv: ${auth.tokenEnv}`);
+          if (auth.header) lines.push(`${inner}    header: ${auth.header}`);
+          if (auth.valueEnv) lines.push(`${inner}    valueEnv: ${auth.valueEnv}`);
+          if (auth.paramName) lines.push(`${inner}    paramName: ${auth.paramName}`);
+          if (auth.clientIdEnv) lines.push(`${inner}    clientIdEnv: ${auth.clientIdEnv}`);
+          if (auth.clientSecretEnv) lines.push(`${inner}    clientSecretEnv: ${auth.clientSecretEnv}`);
+          if (auth.tokenUrl) lines.push(`${inner}    tokenUrl: ${yamlValue(auth.tokenUrl)}`);
+          if (auth.scopes?.length) {
+            lines.push(`${inner}    scopes:`);
+            lines.push(serializeArray(auth.scopes, indentLevel + 6));
+          }
+          if (auth.usernameEnv) lines.push(`${inner}    usernameEnv: ${auth.usernameEnv}`);
+          if (auth.passwordEnv) lines.push(`${inner}    passwordEnv: ${auth.passwordEnv}`);
+        }
+        if (data.openapi.tls) {
+          const tls = data.openapi.tls;
+          if (tls.certFile || tls.keyFile || tls.caFile || tls.insecureSkipVerify) {
+            lines.push(`${inner}  tls:`);
+            if (tls.certFile) lines.push(`${inner}    certFile: ${tls.certFile}`);
+            if (tls.keyFile) lines.push(`${inner}    keyFile: ${tls.keyFile}`);
+            if (tls.caFile) lines.push(`${inner}    caFile: ${tls.caFile}`);
+            if (tls.insecureSkipVerify === true) lines.push(`${inner}    insecureSkipVerify: true`);
+          }
+        }
+        // Generation-time operation filter. Guard on length, not definedness:
+        // the form's mode toggle leaves an empty array behind, and an empty
+        // include list means "include everything" to the backend, so emitting
+        // it would read as a whitelist while acting as a no-op.
+        const ops = data.openapi.operations;
+        if (ops?.include?.length) {
+          lines.push(`${inner}  operations:`);
+          lines.push(`${inner}    include:`);
+          lines.push(serializeArray(ops.include, indentLevel + 8));
+        } else if (ops?.exclude?.length) {
+          lines.push(`${inner}  operations:`);
+          lines.push(`${inner}    exclude:`);
+          lines.push(serializeArray(ops.exclude, indentLevel + 8));
+        }
+      }
+      break;
+  }
+
+  if (data.env && Object.keys(data.env).length > 0) {
+    lines.push(`${inner}env:`);
+    lines.push(serializeMap(data.env, indentLevel + 4));
+  }
+  if (data.buildArgs && Object.keys(data.buildArgs).length > 0) {
+    lines.push(`${inner}build_args:`);
+    lines.push(serializeMap(data.buildArgs, indentLevel + 4));
+  }
+  if (data.volumes?.length) {
+    lines.push(`${inner}volumes:`);
+    lines.push(serializeArray(data.volumes, indentLevel + 4));
+  }
+  if (data.tools?.length) {
+    lines.push(`${inner}tools:`);
+    lines.push(serializeArray(data.tools, indentLevel + 4));
+  }
+  if (data.outputFormat) lines.push(`${inner}output_format: ${data.outputFormat}`);
+  if (data.network) lines.push(`${inner}network: ${data.network}`);
+  if (data.pinSchemas !== undefined) lines.push(`${inner}pin_schemas: ${data.pinSchemas}`);
+
+  // Scaling: autoscale and replicas are mutually exclusive on the backend.
+  // Prefer autoscale if present; otherwise fall through to the static replicas
+  // block, mirroring Go's omitempty semantics (skip replicas:1 and the default
+  // round-robin policy so single-replica specs stay byte-identical).
+  if (data.autoscale) {
+    const a = data.autoscale;
+    lines.push(`${inner}autoscale:`);
+    lines.push(`${inner}  min: ${a.min}`);
+    lines.push(`${inner}  max: ${a.max}`);
+    lines.push(`${inner}  target_in_flight: ${a.targetInFlight}`);
+    if (a.scaleUpAfter) lines.push(`${inner}  scale_up_after: ${a.scaleUpAfter}`);
+    if (a.scaleDownAfter) lines.push(`${inner}  scale_down_after: ${a.scaleDownAfter}`);
+    if (a.warmPool && a.warmPool > 0) lines.push(`${inner}  warm_pool: ${a.warmPool}`);
+    if (a.idleToZero) lines.push(`${inner}  idle_to_zero: true`);
+  } else {
+    if (data.replicas && data.replicas !== 1) {
+      lines.push(`${inner}replicas: ${data.replicas}`);
+    }
+    if (data.replicaPolicy && data.replicaPolicy !== 'round-robin') {
+      lines.push(`${inner}replica_policy: ${data.replicaPolicy}`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function buildResource(data: ResourceFormData, indentLevel = 2): string {
+  const pad = ' '.repeat(indentLevel);
+  const inner = ' '.repeat(indentLevel + 2);
+  const lines: string[] = [];
+  lines.push(`${pad}- name: ${yamlValue(data.name)}`);
+  lines.push(`${inner}image: ${yamlValue(data.image)}`);
+
+  if (data.env && Object.keys(data.env).length > 0) {
+    lines.push(`${inner}env:`);
+    lines.push(serializeMap(data.env, indentLevel + 4));
+  }
+  if (data.ports?.length) {
+    lines.push(`${inner}ports:`);
+    lines.push(serializeArray(data.ports, indentLevel + 4));
+  }
+  if (data.volumes?.length) {
+    lines.push(`${inner}volumes:`);
+    lines.push(serializeArray(data.volumes, indentLevel + 4));
+  }
+  if (data.network) lines.push(`${inner}network: ${data.network}`);
+
+  return lines.join('\n');
+}
+
+// stripListItem removes the leading "- " from a list-item YAML block and dedents
+// all lines by 2 spaces so the result is valid root-level YAML.
+function stripListItem(yaml: string): string {
+  return yaml
+    .replace(/^- /, '')
+    .split('\n')
+    .map((line) => line.replace(/^ {2}/, ''))
+    .join('\n');
+}
+
+export function buildYAML(form: WizardFormData): string {
+  switch (form.type) {
+    case 'mcp-server':
+      return stripListItem(buildMCPServer(form.data, 0));
+    case 'resource':
+      return stripListItem(buildResource(form.data, 0));
+    case 'stack':
+      return buildStack(form.data);
+  }
+}
+
+function buildStack(data: StackFormData): string {
+  const lines: string[] = [];
+  lines.push(`version: "${data.version || '1'}"`);
+  lines.push(`name: ${yamlValue(data.name)}`);
+
+  if (data.gateway) {
+    lines.push('');
+    lines.push('gateway:');
+    if (data.gateway.allowedOrigins?.length) {
+      lines.push('  allowed_origins:');
+      data.gateway.allowedOrigins.forEach((o) => lines.push(`    - ${yamlValue(o)}`));
+    }
+    if (data.gateway.auth) {
+      lines.push('  auth:');
+      lines.push(`    type: ${data.gateway.auth.type}`);
+      lines.push(`    token: ${yamlValue(data.gateway.auth.token)}`);
+      if (data.gateway.auth.header) lines.push(`    header: ${data.gateway.auth.header}`);
+    }
+    if (data.gateway.codeMode) lines.push(`  code_mode: ${data.gateway.codeMode}`);
+    if (data.gateway.codeModeTimeout) lines.push(`  code_mode_timeout: ${data.gateway.codeModeTimeout}`);
+    if (data.gateway.outputFormat) lines.push(`  output_format: ${data.gateway.outputFormat}`);
+    if (data.gateway.maxToolResultBytes) lines.push(`  maxToolResultBytes: ${data.gateway.maxToolResultBytes}`);
+
+    const gw = data.gateway;
+    if (gw.tracing) {
+      const t = gw.tracing;
+      if (t.enabled !== undefined || t.sampling !== undefined || t.retention || t.export || t.endpoint) {
+        lines.push('  tracing:');
+        if (t.enabled !== undefined) lines.push(`    enabled: ${t.enabled}`);
+        if (t.sampling !== undefined && t.sampling !== 1.0) lines.push(`    sampling: ${t.sampling}`);
+        if (t.retention && t.retention !== '24h') lines.push(`    retention: ${t.retention}`);
+        if (t.export) lines.push(`    export: ${t.export}`);
+        if (t.endpoint) lines.push(`    endpoint: ${yamlValue(t.endpoint)}`);
+      }
+    }
+
+    if (gw.security?.schemaPinning?.enabled) {
+      lines.push('  security:');
+      lines.push('    schema_pinning:');
+      lines.push(`      enabled: ${gw.security.schemaPinning.enabled}`);
+      if (gw.security.schemaPinning.action) {
+        lines.push(`      action: ${gw.security.schemaPinning.action}`);
+      }
+    }
+  }
+
+  if (data.secrets?.sets?.length) {
+    lines.push('');
+    lines.push('secrets:');
+    lines.push('  sets:');
+    data.secrets.sets.forEach((s) => lines.push(`    - ${yamlValue(s)}`));
+  }
+
+  if (data.network) {
+    lines.push('');
+    lines.push('network:');
+    lines.push(`  name: ${data.network.name}`);
+    lines.push(`  driver: ${data.network.driver}`);
+  }
+
+  if (data.logging?.file) {
+    lines.push('');
+    lines.push('logging:');
+    lines.push(`  file: ${yamlValue(data.logging.file)}`);
+    if (data.logging.maxSizeMB) lines.push(`  maxSizeMB: ${data.logging.maxSizeMB}`);
+    if (data.logging.maxAgeDays) lines.push(`  maxAgeDays: ${data.logging.maxAgeDays}`);
+    if (data.logging.maxBackups) lines.push(`  maxBackups: ${data.logging.maxBackups}`);
+  }
+
+  if (data.mcpServers?.length) {
+    lines.push('');
+    lines.push('mcp-servers:');
+    data.mcpServers.forEach((s) => lines.push(buildMCPServer(s, 2)));
+  }
+
+  if (data.resources?.length) {
+    lines.push('');
+    lines.push('resources:');
+    data.resources.forEach((r) => lines.push(buildResource(r, 2)));
+  }
+
+  return lines.join('\n') + '\n';
+}
+
+function detectServerType(result: Record<string, unknown>): ServerType {
+  if (result.openapi) return 'openapi';
+  if (result.ssh) return 'ssh';
+  if (result.source) return 'source';
+  if (result.url) return 'external';
+  if (result.command && !result.image) return 'local';
+  return 'container';
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function strings(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.filter((item): item is string => typeof item === 'string');
+}
+
+function stringMap(value: unknown): Record<string, string> | undefined {
+  const entries = Object.entries(asRecord(value)).filter((entry): entry is [string, string] => typeof entry[1] === 'string');
+  return entries.length ? Object.fromEntries(entries) : undefined;
+}
+
+// Parse YAML string back to form data. The YAML AST decoder preserves nested
+// source, auth, command, and list data across expert-mode transitions.
+export function parseYAMLToForm(yaml: string, resourceType: ResourceType): WizardFormData | { error: string } {
+  try {
+    const document = parseYAML(yaml);
+    if (!document || typeof document !== 'object' || Array.isArray(document)) {
+      return { error: 'YAML must contain a mapping' };
+    }
+    const result = asRecord(document);
+
+    // Return minimal parsed data based on type
+    switch (resourceType) {
+      case 'mcp-server': {
+        const autoRaw = result.autoscale ? asRecord(result.autoscale) : undefined;
+        const autoscale: AutoscaleFormData | undefined = autoRaw
+          ? {
+              min: Number(autoRaw.min ?? 1),
+              max: Number(autoRaw.max ?? 5),
+              targetInFlight: Number(autoRaw.target_in_flight ?? 10),
+              scaleUpAfter: typeof autoRaw.scale_up_after === 'string' ? autoRaw.scale_up_after : undefined,
+              scaleDownAfter: typeof autoRaw.scale_down_after === 'string' ? autoRaw.scale_down_after : undefined,
+              warmPool:
+                autoRaw.warm_pool !== undefined && Number(autoRaw.warm_pool) > 0
+                  ? Number(autoRaw.warm_pool)
+                  : undefined,
+              idleToZero: autoRaw.idle_to_zero === true ? true : undefined,
+            }
+          : undefined;
+
+        const parsedReplicas = Number(result.replicas);
+        const rawPolicy = result.replica_policy as string | undefined;
+        const replicaPolicy =
+          rawPolicy === 'least-connections' || rawPolicy === 'round-robin'
+            ? rawPolicy
+            : undefined;
+        const data: MCPServerFormData = {
+          name: (result.name as string) || '',
+          serverType: detectServerType(result),
+          // autoscale and replicas are mutually exclusive at the backend —
+          // don't surface stale replica fields if autoscale is present.
+          replicas: autoscale
+            ? undefined
+            : Number.isFinite(parsedReplicas) && parsedReplicas > 0
+              ? parsedReplicas
+              : undefined,
+          replicaPolicy: autoscale ? undefined : replicaPolicy,
+          autoscale,
+        };
+        if (typeof result.image === 'string') data.image = result.image;
+        if (typeof result.port === 'number') data.port = result.port;
+        if (typeof result.transport === 'string') data.transport = result.transport;
+        if (typeof result.url === 'string') data.url = result.url;
+        data.command = strings(result.command);
+        data.env = stringMap(result.env);
+        data.buildArgs = stringMap(result.build_args);
+        data.volumes = strings(result.volumes);
+        data.tools = strings(result.tools);
+        if (typeof result.output_format === 'string') data.outputFormat = result.output_format;
+        if (typeof result.network === 'string') data.network = result.network;
+        if (typeof result.pin_schemas === 'boolean') data.pinSchemas = result.pin_schemas;
+
+        if (result.source) {
+          const source = asRecord(result.source);
+          const auth = asRecord(source.auth);
+          data.source = {
+            type: typeof source.type === 'string' ? source.type : 'git',
+            url: typeof source.url === 'string' ? source.url : undefined,
+            ref: typeof source.ref === 'string' ? source.ref : undefined,
+            path: typeof source.path === 'string' ? source.path : undefined,
+            projectPath: typeof source.project_path === 'string' ? source.project_path : undefined,
+            dockerfile: typeof source.dockerfile === 'string' ? source.dockerfile : undefined,
+            runtime: source.runtime === 'python' ? 'python' : undefined,
+            package: typeof source.package === 'string' ? source.package : undefined,
+            python: typeof source.python === 'string' ? source.python : undefined,
+            extras: strings(source.extras),
+            with: strings(source.with),
+            packages: strings(source.packages),
+            auth: typeof auth.credential_ref === 'string'
+              ? { method: auth.method === 'token' ? 'token' : undefined, credentialRef: auth.credential_ref }
+              : undefined,
+          };
+        }
+        return { type: 'mcp-server', data };
+      }
+      case 'resource':
+        return {
+          type: 'resource',
+          data: {
+            name: typeof result.name === 'string' ? result.name : '',
+            image: typeof result.image === 'string' ? result.image : '',
+            env: stringMap(result.env),
+            ports: strings(result.ports),
+            volumes: strings(result.volumes),
+            network: typeof result.network === 'string' ? result.network : undefined,
+          },
+        };
+      case 'stack':
+        return {
+          type: 'stack',
+          data: {
+            name: typeof result.name === 'string' ? result.name : '',
+            version: typeof result.version === 'string' || typeof result.version === 'number' ? String(result.version) : '1',
+          },
+        };
+      default:
+        return { error: `Unsupported resource type: ${resourceType}` };
+    }
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : 'Failed to parse YAML' };
+  }
+}

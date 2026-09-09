@@ -1,0 +1,1667 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
+
+	"github.com/gridctl/gridctl/internal/api"
+	"github.com/gridctl/gridctl/internal/openapipreview"
+	"github.com/gridctl/gridctl/internal/probe"
+	"github.com/gridctl/gridctl/pkg/agentsync"
+	"github.com/gridctl/gridctl/pkg/config"
+	"github.com/gridctl/gridctl/pkg/flags"
+	"github.com/gridctl/gridctl/pkg/limits"
+	"github.com/gridctl/gridctl/pkg/logging"
+	"github.com/gridctl/gridctl/pkg/mcp"
+	"github.com/gridctl/gridctl/pkg/mcpauth"
+	"github.com/gridctl/gridctl/pkg/metrics"
+	"github.com/gridctl/gridctl/pkg/pins"
+	"github.com/gridctl/gridctl/pkg/provisioner"
+	"github.com/gridctl/gridctl/pkg/registry"
+	"github.com/gridctl/gridctl/pkg/reload"
+	"github.com/gridctl/gridctl/pkg/runtime"
+	"github.com/gridctl/gridctl/pkg/skillpins"
+	"github.com/gridctl/gridctl/pkg/skills"
+	"github.com/gridctl/gridctl/pkg/skillsync"
+	"github.com/gridctl/gridctl/pkg/state"
+	"github.com/gridctl/gridctl/pkg/telemetry"
+	"github.com/gridctl/gridctl/pkg/token"
+	"github.com/gridctl/gridctl/pkg/tracing"
+	"github.com/gridctl/gridctl/pkg/vault"
+)
+
+// WebFSFunc is a function that returns embedded web UI files.
+// This decouples the controller from the build-tag-conditional embed logic.
+type WebFSFunc func() (fs.FS, error)
+
+// GatewayInstance holds all components of a running gateway.
+type GatewayInstance struct {
+	Gateway        *mcp.Gateway
+	APIServer      *api.Server
+	HTTPServer     *http.Server
+	LogBuffer      *logging.LogBuffer
+	Handler        slog.Handler
+	RegistryServer *registry.Server // Internal registry MCP server (nil if empty)
+	Broker         *mcpauth.Broker  // Downstream OAuth broker (nil when the token store is unavailable)
+	SkillPinStore  *skillpins.Store // TOFU pins for registry skill documents (nil when unavailable)
+
+	// Compiled model_preferences scopes from the live stack, swapped on
+	// config apply (mirroring SetSkillPolicy) and read by the projection
+	// reconcile so a hot-reloaded policy applies on the next pass.
+	modelPolicyMu    sync.Mutex
+	skillModelPolicy *registry.ModelPolicy
+	agentModelPolicy *registry.ModelPolicy
+}
+
+// SetModelPolicies swaps the compiled model preference policies.
+func (inst *GatewayInstance) SetModelPolicies(skills, agents *registry.ModelPolicy) {
+	inst.modelPolicyMu.Lock()
+	defer inst.modelPolicyMu.Unlock()
+	inst.skillModelPolicy, inst.agentModelPolicy = skills, agents
+}
+
+// CurrentModelPolicies reads the compiled model preference policies.
+func (inst *GatewayInstance) CurrentModelPolicies() (skills, agents *registry.ModelPolicy) {
+	inst.modelPolicyMu.Lock()
+	defer inst.modelPolicyMu.Unlock()
+	return inst.skillModelPolicy, inst.agentModelPolicy
+}
+
+// GatewayBuilder constructs and runs the MCP gateway from a stack config.
+type GatewayBuilder struct {
+	config    Config
+	stack     *config.Stack
+	stackPath string
+	rt        *runtime.Orchestrator
+	result    *runtime.UpResult
+	version   string
+	webFS     WebFSFunc
+
+	// Pre-created log infrastructure (for foreground mode where orchestrator
+	// events should also be captured before gateway starts).
+	existingBuffer  *logging.LogBuffer
+	existingHandler slog.Handler
+
+	// registryDir overrides the default registry directory for testing.
+	registryDir string
+
+	// homeDir overrides the home directory used for skill projection
+	// reconciliation. Empty means the real home; tests inject a temp dir
+	// so registry refreshes can never touch real client skill
+	// directories or the real projection lockfile.
+	homeDir string
+
+	// vaultStore for API server injection and log redaction.
+	vaultStore *vault.Store
+
+	// pinStore for API server injection (schema pin management).
+	pinStore *pins.PinStore
+
+	// skillPinStore for API server injection and registry-refresh TOFU
+	// (skill document pin management).
+	skillPinStore *skillpins.Store
+
+	// tracingProvider is retained so Shutdown() can be called on gateway exit.
+	tracingProvider *tracing.Provider
+
+	// telemetry holds the opt-in disk-persistence writers wired at Build
+	// time. Nil when no server in the stack opts in.
+	telemetry *telemetryWiring
+
+	// limitsPolicy is the compiled rate-limits policy (nil when no
+	// limits: block is configured). Guarded by limitsMu: it is swapped by
+	// the hot-reload hook and read by the /api/limits status closure.
+	limitsMu     sync.Mutex
+	limitsPolicy *limits.Policy
+
+	// experimentalFlags holds the resolved experimental flag display list
+	// (enabled flags only, sorted). Stored behind an atomic pointer so the
+	// hot-reload hook can swap it without racing the /api/status features
+	// closure.
+	experimentalFlags atomic.Pointer[experimentalState]
+}
+
+// experimentalState is the resolved experimental flag set derived from a
+// stack's `experimental:` map plus GRIDCTL_EXPERIMENTAL_* env overrides.
+type experimentalState struct {
+	features []api.FeatureStatus
+}
+
+// telemetryWiring bundles the three per-signal writers + the otlptrace
+// exporter that feeds TracesFileClient. Lifecycle is owned by GatewayBuilder
+// (Build/Run/waitForShutdown).
+type telemetryWiring struct {
+	logRouter      *telemetry.LogRouter
+	metricsFlusher *telemetry.MetricsFlusher
+	tracesClient   *telemetry.TracesFileClient
+	tracesExporter *otlptrace.Exporter // started lazily inside Provider.RegisterExporter
+}
+
+// NewGatewayBuilder creates a GatewayBuilder.
+func NewGatewayBuilder(cfg Config, stack *config.Stack, stackPath string, rt *runtime.Orchestrator, result *runtime.UpResult) *GatewayBuilder {
+	return &GatewayBuilder{
+		config:    cfg,
+		stack:     stack,
+		stackPath: stackPath,
+		rt:        rt,
+		result:    result,
+	}
+}
+
+// SetVersion sets the gateway version string.
+func (b *GatewayBuilder) SetVersion(v string) {
+	b.version = v
+}
+
+// SetWebFS sets the function for getting embedded web files.
+func (b *GatewayBuilder) SetWebFS(fn WebFSFunc) {
+	b.webFS = fn
+}
+
+// SetExistingLogInfra allows reusing a log buffer/handler created earlier
+// (e.g., in foreground mode where orchestrator events should also be captured).
+func (b *GatewayBuilder) SetExistingLogInfra(buffer *logging.LogBuffer, handler slog.Handler) {
+	b.existingBuffer = buffer
+	b.existingHandler = handler
+}
+
+// SetVaultStore sets the vault store for API server injection and log redaction.
+func (b *GatewayBuilder) SetVaultStore(v *vault.Store) {
+	b.vaultStore = v
+}
+
+// SetPinStore sets the pin store for API server injection.
+func (b *GatewayBuilder) SetPinStore(ps *pins.PinStore) {
+	b.pinStore = ps
+}
+
+// SetSkillPinStore sets the skill pin store for API server injection and
+// registry-refresh TOFU.
+func (b *GatewayBuilder) SetSkillPinStore(ps *skillpins.Store) {
+	b.skillPinStore = ps
+}
+
+// resolveSchemaPinning returns the effective gateway schema-pinning settings,
+// applying the documented defaults (enabled, "warn", scan on) when the stack
+// omits the security block or individual fields. Enabled and Scan are *bool
+// so omitted fields inherit the default-on behavior rather than YAML's zero
+// value.
+func resolveSchemaPinning(stack *config.Stack) (enabled bool, action string, scan bool, scanIgnore []string) {
+	enabled, action, scan = true, "warn", true
+	if stack == nil || stack.Gateway == nil || stack.Gateway.Security == nil {
+		return enabled, action, scan, nil
+	}
+	sp := stack.Gateway.Security.SchemaPinning
+	if sp == nil {
+		return enabled, action, scan, nil
+	}
+	if sp.Enabled != nil {
+		enabled = *sp.Enabled
+	}
+	if sp.Action == "block" {
+		action = "block"
+	}
+	if sp.Scan != nil {
+		scan = *sp.Scan
+	}
+	return enabled, action, scan, sp.ScanIgnore
+}
+
+// installSchemaPinning shares a single pin store between the API server (for
+// read-only inspection at /api/pins) and the gateway's TOFU verifier (for drift
+// detection and the warn/block policy), so the UI reflects exactly what the
+// gateway enforces. It is a no-op when no store is provided or when pinning is
+// disabled for the stack, leaving both halves unset.
+func installSchemaPinning(gateway *mcp.Gateway, server *api.Server, stack *config.Stack, ps *pins.PinStore) {
+	if ps == nil {
+		return
+	}
+	enabled, action, scan, scanIgnore := resolveSchemaPinning(stack)
+	if !enabled {
+		return
+	}
+	ps.SetScanConfig(scan, scanIgnore)
+	server.SetPinStore(ps)
+	gateway.SetSchemaVerifier(pins.NewGatewayAdapter(ps), action)
+}
+
+// installSkillPinning shares the skill pin store with the API server so
+// /api/skill-pins reflects exactly what the registry refresh path records.
+// Skill pins have no enabled toggle (silent first-pinning is their only
+// observable effect, Article IX), but the advisory scanner honors the same
+// knobs as tool pins so one scan_ignore list governs both finding sets.
+func installSkillPinning(server *api.Server, stack *config.Stack, ps *skillpins.Store) {
+	if ps == nil {
+		return
+	}
+	_, _, scan, scanIgnore := resolveSchemaPinning(stack)
+	ps.SetScanConfig(scan, scanIgnore)
+	server.SetSkillPinStore(ps)
+}
+
+// BuildAndRun constructs the gateway and runs it until shutdown.
+// This is the main blocking call that replaces the old runGateway() function.
+func (b *GatewayBuilder) BuildAndRun(ctx context.Context, verbose bool) error {
+	inst, err := b.Build(verbose)
+	if err != nil {
+		return err
+	}
+	return b.Run(ctx, inst, verbose)
+}
+
+// Build constructs all gateway components without starting the HTTP server.
+func (b *GatewayBuilder) Build(verbose bool) (*GatewayInstance, error) {
+	inst := &GatewayInstance{}
+
+	// Phase 1: Create MCP Gateway
+	inst.Gateway = mcp.NewGateway()
+	inst.Gateway.SetDockerClient(b.rt.DockerClient())
+	inst.Gateway.SetVersion(b.version)
+	if b.stack.Gateway != nil {
+		inst.Gateway.SetName(b.stack.Gateway.Name)
+	}
+
+	// Phase 1a: Enable code mode if configured
+	codeModeEnabled := b.config.CodeMode
+	if !codeModeEnabled && b.stack.Gateway != nil && b.stack.Gateway.CodeMode == "on" {
+		codeModeEnabled = true
+	}
+	if codeModeEnabled {
+		timeout := 30 * time.Second
+		if b.stack.Gateway != nil && b.stack.Gateway.CodeModeTimeout > 0 {
+			timeout = time.Duration(b.stack.Gateway.CodeModeTimeout) * time.Second
+		}
+		inst.Gateway.SetCodeMode(timeout)
+	}
+
+	// Phase 1a2: Set default output format if configured
+	if b.stack.Gateway != nil && b.stack.Gateway.OutputFormat != "" {
+		inst.Gateway.SetDefaultOutputFormat(b.stack.Gateway.OutputFormat)
+	}
+
+	// Phase 1a3: Set max tool result bytes if configured
+	if b.stack.Gateway != nil && b.stack.Gateway.MaxToolResultBytes != 0 {
+		inst.Gateway.SetMaxToolResultBytes(b.stack.Gateway.MaxToolResultBytes)
+	}
+
+	// Phase 1a4: Install the per-client access policy (nil when no clients:
+	// block is configured, preserving legacy "everyone sees everything").
+	inst.Gateway.SetClientAccessPolicy(mcp.NewClientAccessPolicy(clientAccessSpec(b.stack)))
+
+	// Phase 1a5: Install the tool-group policy (nil when no groups: block is
+	// configured; group endpoints then 404).
+	inst.Gateway.SetGroupPolicy(mcp.NewGroupPolicy(groupsSpec(b.stack)))
+
+	// Phase 1a6: Install the skill exposure policy (nil when no skills:
+	// block is configured, preserving "every active skill is exposed").
+	inst.Gateway.SetSkillPolicy(mcp.NewSkillPolicy(skillsPolicySpec(b.stack)))
+
+	// Phase 1b: Create registry server (internal MCP server)
+	regDir := b.registryDir
+	if regDir == "" {
+		base, err := state.BaseDir()
+		if err != nil {
+			return nil, fmt.Errorf("resolving registry directory: %w", err)
+		}
+		regDir = filepath.Join(base, "registry")
+	}
+	registryStore := registry.NewStore(regDir)
+	registryServer := registry.New(registryStore)
+	inst.RegistryServer = registryServer
+
+	// Phase 2: Configure logging
+	var logErr error
+	inst.LogBuffer, inst.Handler, logErr = b.buildLogging(verbose)
+	if logErr != nil {
+		return nil, logErr
+	}
+	inst.Gateway.SetLogger(slog.New(inst.Handler))
+
+	// Seed the in-memory log buffer from any pre-existing per-server
+	// logs.jsonl files BEFORE registry init or any other component starts
+	// emitting records. Otherwise live records can interleave with seeded
+	// history and scramble ring ordering.
+	b.seedLogsFromDisk(inst.LogBuffer, inst.Handler)
+
+	// Initialize registry after logging is configured so warnings are captured
+	if err := registryServer.Initialize(context.Background()); err != nil {
+		slog.New(inst.Handler).Warn("registry initialization failed", "error", err)
+	}
+
+	// TOFU-pin the loaded skills. First sight pins silently; drift persists
+	// until a human approves or resets (never auto-cleared by the daemon).
+	inst.SkillPinStore = b.skillPinStore
+	syncSkillPins(inst, slog.New(inst.Handler))
+
+	// Name policy-denied active skills in the daemon log too: the apply
+	// printer pass is skipped in foreground mode (this log line reaches the
+	// terminal there), and denial must never be silent in any mode.
+	if policy := inst.Gateway.CurrentSkillPolicy(); policy != nil {
+		for _, sk := range registryStore.ActiveSkills() {
+			if allowed, rule := policy.Evaluate(sk.Name); !allowed {
+				slog.New(inst.Handler).Warn("skill denied by skills policy; not exposed or projected",
+					"skill", sk.Name, "rule", rule)
+			}
+		}
+	}
+
+	if registryServer.HasContent() {
+		inst.Gateway.Router().AddClient(registryServer)
+		inst.Gateway.Router().RefreshTools()
+	}
+
+	// Lint active skills against group renames: a skill instructing the
+	// model to call a tool by its original name will miss the renamed
+	// surface. Best-effort warning, never an error.
+	lintGroupRenamesAgainstSkills(inst.Gateway.CurrentGroupPolicy(), registryStore, slog.New(inst.Handler))
+
+	// Phase 4: Get embedded web files
+	var webFS fs.FS
+	if b.webFS != nil {
+		var err error
+		webFS, err = b.webFS()
+		if err != nil && verbose {
+			fmt.Printf("Warning: no embedded web UI: %v\n", err)
+		}
+	}
+
+	// Phase 4c: Downstream OAuth broker. A token-store failure degrades to
+	// no brokering (oauth-type servers land in needs-auth with a clear
+	// error) rather than blocking startup.
+	if store, storeErr := mcpauth.NewTokenStore(""); storeErr != nil {
+		slog.New(inst.Handler).Warn("oauth token store unavailable; downstream OAuth brokering disabled",
+			"error", storeErr)
+	} else {
+		redirect := fmt.Sprintf("http://localhost:%d%s", b.config.Port, mcpauth.CallbackPath)
+		broker := mcpauth.NewBroker(store, redirect, slog.New(inst.Handler))
+		broker.SetStateSink(inst.Gateway)
+		if rh, ok := inst.Handler.(*logging.RedactingHandler); ok {
+			broker.SetRedactor(rh.RegisterRedactValues)
+		}
+		inst.Broker = broker
+	}
+
+	// Phase 5: Create API server
+	var apiErr error
+	inst.APIServer, apiErr = b.buildAPIServer(inst.Gateway, inst.LogBuffer, webFS, inst.RegistryServer, inst.Handler, inst.Broker)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	if inst.Broker != nil {
+		inst.APIServer.SetOAuthBroker(inst.Broker)
+	}
+
+	// Phase 6: Create HTTP server. JoinHostPort rather than string
+	// concatenation so an IPv6 bind address is bracketed correctly.
+	inst.HTTPServer = &http.Server{
+		Addr:              net.JoinHostPort(b.effectiveBind(), strconv.Itoa(b.config.Port)),
+		Handler:           inst.APIServer.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if err := b.checkExposure(slog.New(inst.Handler)); err != nil {
+		return nil, err
+	}
+
+	return inst, nil
+}
+
+// telemetrySeedLimit caps the number of pre-restart entries replayed into a
+// ring buffer at startup. Leaves room for new live entries and bounds
+// startup I/O.
+const telemetrySeedLimit = 500
+
+// seedLogsFromDisk replays any existing per-server logs.jsonl into the
+// shared in-memory log buffer. Called early in Build (before registry init
+// or any other goroutine emits a record) so seeded history precedes live
+// records in the ring.
+func (b *GatewayBuilder) seedLogsFromDisk(buf *logging.LogBuffer, handler slog.Handler) {
+	if b.stack == nil || buf == nil {
+		return
+	}
+	logger := slog.New(handler)
+	for i := range b.stack.MCPServers {
+		srv := &b.stack.MCPServers[i]
+		if srv.Name == "" || !srv.PersistLogs(b.stack) {
+			continue
+		}
+		path, perr := state.TelemetryServerPath(b.stack.Name, srv.Name, "logs")
+		if perr != nil {
+			logger.Warn("telemetry: cannot resolve path", "server", srv.Name, "error", perr)
+			continue
+		}
+		if err := buf.SeedFromFile(path, telemetrySeedLimit); err != nil {
+			logger.Warn("telemetry: seed logs failed", "server", srv.Name, "path", path, "error", err)
+		}
+	}
+}
+
+// seedTracesFromDisk replays any existing per-server traces.jsonl into the
+// shared tracing buffer. Called immediately after tracingProvider.Init —
+// before the trace file exporter is registered and before registry init —
+// so seeded traces don't interleave with live spans.
+func (b *GatewayBuilder) seedTracesFromDisk(handler slog.Handler) {
+	if b.stack == nil || b.tracingProvider == nil || b.tracingProvider.Buffer == nil {
+		return
+	}
+	logger := slog.New(handler)
+	for i := range b.stack.MCPServers {
+		srv := &b.stack.MCPServers[i]
+		if srv.Name == "" || !srv.PersistTraces(b.stack) {
+			continue
+		}
+		path, perr := state.TelemetryServerPath(b.stack.Name, srv.Name, "traces")
+		if perr != nil {
+			logger.Warn("telemetry: cannot resolve path", "server", srv.Name, "error", perr)
+			continue
+		}
+		if err := b.tracingProvider.Buffer.SeedFromFile(path, telemetrySeedLimit); err != nil {
+			logger.Warn("telemetry: seed traces failed", "server", srv.Name, "path", path, "error", err)
+		}
+	}
+}
+
+// seedMetricsFromDisk replays any existing per-server metrics.jsonl into the
+// accumulator's per-server totals AND the flusher's previous-snapshot map.
+// Called from buildAPIServer after the flusher is constructed but before any
+// Build phase can drive live tool calls — so seeded counters precede live
+// observations and the first post-restart flush computes a real diff against
+// the seeded baseline.
+func (b *GatewayBuilder) seedMetricsFromDisk(handler slog.Handler) {
+	if b.stack == nil || b.telemetry == nil || b.telemetry.metricsFlusher == nil {
+		return
+	}
+	logger := slog.New(handler)
+	for i := range b.stack.MCPServers {
+		srv := &b.stack.MCPServers[i]
+		if srv.Name == "" || !srv.PersistMetrics(b.stack) {
+			continue
+		}
+		path, perr := state.TelemetryServerPath(b.stack.Name, srv.Name, "metrics")
+		if perr != nil {
+			logger.Warn("telemetry: cannot resolve path", "server", srv.Name, "error", perr)
+			continue
+		}
+		if err := b.telemetry.metricsFlusher.SeedFromFile(path, telemetrySeedLimit); err != nil {
+			logger.Warn("telemetry: seed metrics failed", "server", srv.Name, "path", path, "error", err)
+		}
+	}
+
+	// Seed global prompt (skill) usage from the reserved namespace, persisted
+	// off the stack-global metrics toggle (the registry is not a stack server).
+	if b.stack.Telemetry != nil && b.stack.Telemetry.Persist.Metrics {
+		ppath, perr := state.TelemetryServerPath(b.stack.Name, telemetry.PromptUsageNamespace, "metrics")
+		if perr != nil {
+			logger.Warn("telemetry: cannot resolve prompt-usage path", "error", perr)
+		} else if err := b.telemetry.metricsFlusher.SeedPromptUsageFromFile(ppath, telemetrySeedLimit); err != nil {
+			logger.Warn("telemetry: seed prompt usage failed", "path", ppath, "error", err)
+		}
+	}
+}
+
+// Run starts the HTTP server, registers MCP servers, and blocks until shutdown.
+func (b *GatewayBuilder) Run(ctx context.Context, inst *GatewayInstance, verbose bool) error {
+	gateway := inst.Gateway
+	bufferHandler := inst.Handler
+
+	// Start periodic session cleanup
+	gateway.StartCleanup(ctx)
+	defer gateway.Close()
+
+	// Start HTTP server
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := inst.HTTPServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErr <- err
+		}
+	}()
+
+	// Give the server a moment to fail if port is in use
+	select {
+	case err := <-serverErr:
+		_ = state.Delete(b.stack.Name)
+		return fmt.Errorf("failed to start server on port %d: %w", b.config.Port, err)
+	case <-time.After(100 * time.Millisecond):
+		// Server started successfully
+	}
+
+	// Register MCP servers (after HTTP server is running for health checks)
+	registrar := NewServerRegistrar(gateway, b.config.NoExpand)
+	registrar.SetLogger(slog.New(bufferHandler))
+	if b.rt != nil {
+		registrar.SetRuntime(b.rt.Runtime())
+	}
+	registrar.SetBasePort(b.config.BasePort)
+	if inst.Broker != nil {
+		registrar.SetAuthBroker(inst.Broker)
+		// After a successful login, re-drive registration for the server so
+		// it comes live without waiting for a restart or reload. Detached
+		// from the login request's context: registration outlives it.
+		inst.Broker.SetOnAuthorized(func(name string) {
+			go func() {
+				for _, srv := range b.stack.MCPServers {
+					if srv.Name != name {
+						continue
+					}
+					if err := registrar.RegisterOne(context.WithoutCancel(ctx), srv, nil, b.stackPath); err != nil {
+						slog.New(bufferHandler).Warn("re-registration after authorization failed",
+							"server", name, "error", err)
+					}
+					return
+				}
+			}()
+		})
+	}
+	registrar.RegisterAll(ctx, b.result, b.stack, b.stackPath)
+
+	// Start periodic health monitoring and autoscaler tick loop.
+	gateway.StartHealthMonitor(ctx, mcp.DefaultHealthCheckInterval)
+	gateway.StartAutoscaler(ctx, mcp.DefaultAutoscalerInterval)
+
+	// Start background skill update check (non-blocking)
+	if base, err := state.BaseDir(); err == nil {
+		skills.CheckUpdatesBackground(
+			filepath.Join(base, "registry"),
+			slog.New(bufferHandler),
+		)
+	}
+
+	// Start the telemetry metrics flusher (no-op when no server opts in).
+	if b.telemetry != nil && b.telemetry.metricsFlusher != nil {
+		b.telemetry.metricsFlusher.Start()
+	}
+
+	// Set up hot reload
+	b.setupHotReload(ctx, inst, registrar, bufferHandler, verbose)
+
+	if verbose {
+		b.printEndpoints(inst)
+	}
+
+	// Foreground readiness callback: listener serving + servers registered,
+	// mirroring what /ready reports to the daemon parent's health-wait.
+	if b.config.OnReady != nil {
+		b.config.OnReady(b.config.Port)
+	}
+
+	// Wait for shutdown signal or server error
+	return b.waitForShutdown(ctx, inst, bufferHandler, serverErr, verbose)
+}
+
+// buildLogging creates or reuses the log buffer and handler.
+// The returned handler chain is: RedactingHandler → BufferHandler → inner (JSON/Text [+ file]).
+func (b *GatewayBuilder) buildLogging(verbose bool) (*logging.LogBuffer, slog.Handler, error) {
+	if b.existingBuffer != nil && b.existingHandler != nil {
+		return b.existingBuffer, b.existingHandler, nil
+	}
+
+	logBuffer := logging.NewLogBuffer(1000)
+
+	logLevel := effectiveLogLevel(b.config)
+
+	var innerHandler slog.Handler
+	if verbose {
+		innerHandler = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
+	} else if b.config.DaemonChild {
+		innerHandler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
+	}
+
+	// Wire file output: CLI flag takes precedence over stack.yaml logging.file.
+	logFilePath := b.config.LogFile
+	if logFilePath == "" && b.stack.Logging != nil {
+		logFilePath = b.stack.Logging.File
+	}
+	if logFilePath != "" {
+		fileOpts := logging.FileOpts{}
+		if b.stack.Logging != nil {
+			fileOpts.MaxSizeMB = b.stack.Logging.MaxSizeMB
+			fileOpts.MaxAgeDays = b.stack.Logging.MaxAgeDays
+			fileOpts.MaxBackups = b.stack.Logging.MaxBackups
+		}
+		fileHandler, err := logging.NewFileHandler(logFilePath, fileOpts)
+		if err != nil {
+			return nil, nil, err
+		}
+		if innerHandler != nil {
+			innerHandler = logging.NewMultiHandler(innerHandler, fileHandler)
+		} else {
+			innerHandler = fileHandler
+		}
+	}
+
+	bufferHandler := logging.NewBufferHandler(logBuffer, innerHandler)
+	redactHandler := logging.NewRedactingHandler(bufferHandler)
+
+	// Register vault values for redaction
+	if b.vaultStore != nil {
+		redactHandler.RegisterRedactValues(b.vaultStore.Values())
+	}
+
+	// Log startup entry when writing to a file
+	if logFilePath != "" {
+		maxSizeMB := 100
+		if b.stack.Logging != nil && b.stack.Logging.MaxSizeMB > 0 {
+			maxSizeMB = b.stack.Logging.MaxSizeMB
+		}
+		slog.New(redactHandler).Info("log file opened",
+			"path", logFilePath,
+			"rotation", fmt.Sprintf("%dMB", maxSizeMB))
+	}
+
+	// Wrap the existing chain with the telemetry log router. The router is
+	// always installed; per-server file fan-out only kicks in when
+	// AddServer is called for a given component. This keeps the install
+	// cost zero for stacks that don't opt in.
+	router := telemetry.NewLogRouter(redactHandler)
+	if b.telemetry == nil {
+		b.telemetry = &telemetryWiring{}
+	}
+	b.telemetry.logRouter = router
+	router.SetSelfLogger(slog.New(redactHandler))
+
+	return logBuffer, router, nil
+}
+
+// effectiveBind resolves the listen address across both sources: the CLI
+// flag wins, then the stack's gateway.bind, then the loopback default.
+func (b *GatewayBuilder) effectiveBind() string {
+	if b.config.Bind != "" {
+		return b.config.Bind
+	}
+	if b.stack != nil && b.stack.Gateway != nil && b.stack.Gateway.Bind != "" {
+		return b.stack.Gateway.Bind
+	}
+	return DefaultBindAddress
+}
+
+// ErrUnauthenticatedExposure is returned when the gateway would listen
+// beyond loopback with no authentication configured.
+var ErrUnauthenticatedExposure = errors.New("refusing to start: unauthenticated gateway on a non-loopback address")
+
+// checkExposure refuses to start a gateway that would be reachable from
+// other hosts with no authentication.
+//
+// Enforcement is keyed to the user's own act of widening the bind, following
+// Elasticsearch's bootstrap checks: a loopback gateway stays permissive and
+// silent, and only deliberately widening it flips the check to a hard
+// failure. That keeps the default path frictionless while making the
+// dangerous configuration impossible to reach by accident.
+//
+// The message enumerates every way forward rather than stating the refusal
+// alone. A bare failure here reads as gridctl being broken, and the user has
+// no way to guess which of three unrelated settings is responsible.
+func (b *GatewayBuilder) checkExposure(log *slog.Logger) error {
+	if bindIsLoopback(b.effectiveBind()) {
+		return nil
+	}
+	authConfigured := b.stack != nil && b.stack.Gateway != nil &&
+		b.stack.Gateway.Auth != nil && b.stack.Gateway.Auth.Token != ""
+	if authConfigured {
+		return nil
+	}
+	if b.allowUnauthenticated() {
+		// The override is deliberately noisy on every start: a one-time
+		// acknowledgement that goes silent is one the operator forgets.
+		log.Warn("gateway is reachable from other hosts with no authentication; continuing because the insecure override is set",
+			"bind", b.effectiveBind(), "port", b.config.Port)
+		return nil
+	}
+	return fmt.Errorf("%w (bind %s, port %d)\n"+
+		"  The API, web UI, and gateway would accept unauthenticated requests from any host that can reach this machine.\n"+
+		"  Choose one:\n"+
+		"    1. Configure authentication: set gateway.auth in stack.yaml (type: bearer, token: \"${YOUR_TOKEN}\")\n"+
+		"    2. Listen on loopback only: drop --bind/--bind-all and gateway.bind\n"+
+		"    3. Accept the risk: pass --insecure-allow-unauthenticated, or set gateway.insecure_allow_unauthenticated: true",
+		ErrUnauthenticatedExposure, b.effectiveBind(), b.config.Port)
+}
+
+// allowUnauthenticated resolves the escape hatch across both sources. The
+// stack field exists alongside the flag on purpose: a flag can be dropped by
+// whatever wraps the process (launchd, a Homebrew service, a Dockerfile CMD
+// whose arguments a user replaces), and losing the override silently turns
+// into a daemon that will not start.
+func (b *GatewayBuilder) allowUnauthenticated() bool {
+	if b.config.AllowUnauthenticated {
+		return true
+	}
+	return b.stack != nil && b.stack.Gateway != nil && b.stack.Gateway.InsecureAllowUnauthenticated
+}
+
+// buildAPIServer creates and configures the API server.
+func (b *GatewayBuilder) buildAPIServer(gateway *mcp.Gateway, logBuffer *logging.LogBuffer, webFS fs.FS, registryServer *registry.Server, handler slog.Handler, broker *mcpauth.Broker) (*api.Server, error) {
+	server := api.NewServer(gateway, webFS)
+	server.SetDockerClient(b.rt.DockerClient())
+	if b.rt != nil {
+		// Container teardown for POST /api/reset; the reset engine's
+		// other managers are lazily built inside the API server.
+		server.SetResetRuntime(b.rt)
+	}
+	server.SetStackName(b.stack.Name)
+	server.SetStackFile(b.config.StackPath)
+	server.SetLogBuffer(logBuffer)
+	server.SetProvisionerRegistry(provisioner.NewRegistry(), "gridctl")
+	server.SetGatewayAddr(fmt.Sprintf("http://localhost:%d", b.config.Port))
+
+	if b.stack.Gateway != nil && len(b.stack.Gateway.AllowedOrigins) > 0 {
+		server.SetAllowedOrigins(b.stack.Gateway.AllowedOrigins)
+	} else {
+		server.SetAllowedOrigins([]string{"*"})
+	}
+
+	// Unset means loopback-only, so an absent Gateway block needs no branch.
+	if b.stack.Gateway != nil {
+		server.SetAllowedHosts(b.stack.Gateway.AllowedHosts)
+	}
+
+	if b.stack.Gateway != nil && b.stack.Gateway.Auth != nil {
+		server.SetAuth(b.stack.Gateway.Auth.Type, b.stack.Gateway.Auth.Token, b.stack.Gateway.Auth.Header)
+	}
+
+	if registryServer != nil {
+		server.SetRegistryServer(registryServer)
+	}
+
+	if b.vaultStore != nil {
+		server.SetVaultStore(b.vaultStore)
+	}
+
+	installSchemaPinning(gateway, server, b.stack, b.pinStore)
+	installSkillPinning(server, b.stack, b.skillPinStore)
+
+	// Wire token usage metrics
+	counter, err := b.buildTokenCounter()
+	if err != nil {
+		return nil, err
+	}
+	accumulator := metrics.NewAccumulator(10000)
+	observer := metrics.NewObserver(counter, accumulator)
+	b.wireExperimentalFlags(server, handler)
+	gateway.SetToolCallObserver(observer)
+	gateway.SetPromptGetObserver(observer)
+	gateway.SetTokenCounter(counter)
+	gateway.SetFormatSavingsRecorder(accumulator)
+	server.SetMetricsAccumulator(accumulator)
+	server.SetTokenizerName(b.tokenizerName())
+
+	// Telemetry persistence: wire the metrics flusher. Adding per-server
+	// outputs happens in wireTelemetryPersistence after the tracing
+	// provider is initialized below — keeps all opt-in writers grouped.
+	if b.telemetry == nil {
+		b.telemetry = &telemetryWiring{}
+	}
+	b.telemetry.metricsFlusher = telemetry.NewMetricsFlusher(accumulator, 0)
+	if handler != nil {
+		b.telemetry.metricsFlusher.SetLogger(slog.New(handler))
+	}
+
+	// Rate limits: compile the limits: block, install the pre-call gates
+	// on the gateway, and expose the state snapshot to GET /api/limits.
+	// The status closure re-reads the live policy so hot-reload swaps are
+	// reflected immediately.
+	limitsLogger := slog.Default()
+	if handler != nil {
+		limitsLogger = slog.New(handler)
+	}
+	b.applyLimitsPolicy(gateway, b.stack, limitsLogger)
+	server.SetLimitsStatusFunc(func() limits.StatusReport {
+		return b.currentLimitsPolicy().Status()
+	})
+
+	// Wire the wizard's "Discover tools" probe. Scope: external URL
+	// servers only — container / stdio / local-process / SSH / OpenAPI are
+	// curated post-deploy from the Stack sidebar.
+	probeCache := probe.NewCache(probe.DefaultTTL)
+	prober := probe.NewProber(probeCache)
+	if handler != nil {
+		prober.SetLogger(slog.New(handler).With("subsystem", "probe"))
+	}
+	if broker != nil {
+		prober.SetOAuthSource(broker.HeaderSourceForResource)
+	}
+	server.SetProber(prober)
+
+	// Wire the wizard's OpenAPI spec preview. Separate from the probe above,
+	// which deliberately refuses OpenAPI: the probe speaks MCP and yields
+	// tools, while curating a spec needs the method, path, and tags that tool
+	// conversion discards.
+	var previewLogger *slog.Logger
+	if handler != nil {
+		previewLogger = slog.New(handler).With("subsystem", "openapi-preview")
+	}
+	server.SetOpenAPIPreviewer(openapipreview.New(
+		openapipreview.NewCache(openapipreview.DefaultTTL), previewLogger))
+
+	// Wire distributed tracing
+	tracingCfg := buildTracingConfig(b.stack.Gateway)
+	tracingProvider := tracing.NewProvider(tracingCfg)
+	if handler != nil {
+		tracingProvider.SetLogger(slog.New(handler))
+	}
+	if err := tracingProvider.Init(context.Background()); err != nil {
+		slog.New(handler).Warn("tracing init failed", "error", err)
+	}
+	b.tracingProvider = tracingProvider
+	server.SetTraceBuffer(tracingProvider.Buffer)
+
+	// Seed the trace buffer from disk before live spans land in it. Done
+	// here (not later in Build) because registry init and other Build
+	// stages can begin emitting spans the moment the provider is live.
+	b.seedTracesFromDisk(handler)
+
+	// Telemetry persistence: register the trace file client as an extra
+	// span exporter alongside the in-memory buffer and the optional OTLP
+	// exporter. The exporter is started during otlptrace.NewUnstarted ->
+	// exporter.Start; failure is logged and the in-memory tracing path
+	// continues unaffected.
+	if tracingCfg.Enabled && b.telemetry != nil {
+		client := telemetry.NewTracesFileClient()
+		if handler != nil {
+			client.SetLogger(slog.New(handler))
+		}
+		exporter, err := otlptrace.New(context.Background(), client)
+		if err != nil {
+			slog.New(handler).Warn("telemetry trace exporter init failed; per-server traces.jsonl disabled",
+				"error", err)
+		} else {
+			b.telemetry.tracesClient = client
+			b.telemetry.tracesExporter = exporter
+			tracingProvider.RegisterExporter(exporter)
+		}
+	}
+
+	// Apply the current stack's per-server persistence settings.
+	b.applyTelemetryConfig(server, handler)
+
+	// Seed the metrics accumulator from disk after writers are registered
+	// (so per-server directories exist) and before the flusher goroutine
+	// starts in Run. The seed updates both the accumulator's per-server
+	// totals and the flusher's prev map atomically — so the first post-
+	// restart flush emits a real diff against the seeded baseline rather
+	// than a fresh reset.
+	b.seedMetricsFromDisk(handler)
+
+	return server, nil
+}
+
+// clientAccessSpec translates the stack's optional `clients:` block into the
+// config-agnostic spec the gateway consumes. Returns nil when no block is
+// configured, which the gateway treats as "every client sees every tool".
+func clientAccessSpec(stack *config.Stack) *mcp.ClientAccessSpec {
+	if stack == nil || stack.Clients == nil {
+		return nil
+	}
+	spec := &mcp.ClientAccessSpec{
+		Default:  stack.Clients.Default,
+		Profiles: make(map[string]mcp.ClientProfileSpec, len(stack.Clients.Profiles)),
+	}
+	for name, profile := range stack.Clients.Profiles {
+		spec.Profiles[name] = mcp.ClientProfileSpec{
+			Aliases: profile.Aliases,
+			Servers: profile.Servers,
+			Tools:   profile.Tools,
+		}
+	}
+	return spec
+}
+
+// skillsPolicySpec translates the stack's optional `skills:` block into the
+// config-agnostic spec the gateway consumes. Returns nil when no block is
+// configured, which the gateway treats as "every active skill is exposed".
+func skillsPolicySpec(stack *config.Stack) *mcp.SkillPolicySpec {
+	if stack == nil || stack.Skills == nil {
+		return nil
+	}
+	return &mcp.SkillPolicySpec{
+		Default: stack.Skills.Default,
+		Allow:   stack.Skills.Allow,
+		Deny:    stack.Skills.Deny,
+	}
+}
+
+// groupsSpec translates the stack's optional `groups:` block into the
+// config-agnostic spec the gateway consumes. Returns nil when no block is
+// configured, which compiles to a nil policy (no group endpoints).
+func groupsSpec(stack *config.Stack) mcp.GroupsSpec {
+	if stack == nil || len(stack.Groups) == 0 {
+		return nil
+	}
+	spec := make(mcp.GroupsSpec, len(stack.Groups))
+	for name, g := range stack.Groups {
+		overrides := make(map[string]mcp.GroupOverrideSpec, len(g.Overrides))
+		for canonical, ov := range g.Overrides {
+			overrides[canonical] = mcp.GroupOverrideSpec{
+				Name:            ov.Name,
+				Description:     ov.Description,
+				ReadOnlyHint:    ov.ReadOnlyHint,
+				DestructiveHint: ov.DestructiveHint,
+				IdempotentHint:  ov.IdempotentHint,
+				OpenWorldHint:   ov.OpenWorldHint,
+			}
+		}
+		spec[name] = mcp.GroupSpec{
+			Description: g.Description,
+			Servers:     g.Servers,
+			Tools:       g.Tools,
+			Exclude:     g.Exclude,
+			Overrides:   overrides,
+		}
+	}
+	return spec
+}
+
+// lintGroupRenamesAgainstSkills warns when an active skill's SKILL.md still
+// references the ORIGINAL unprefixed name of a tool a group renames: agents
+// following the skill would call a name the group no longer exposes. A
+// best-effort substring scan; renames stay valid regardless.
+func lintGroupRenamesAgainstSkills(policy *mcp.GroupPolicy, store *registry.Store, logger *slog.Logger) {
+	renames := policy.RenamedOriginals()
+	if len(renames) == 0 || store == nil {
+		return
+	}
+	for _, skill := range store.ActiveSkills() {
+		for group, byCanonical := range renames {
+			for canonical, exposed := range byCanonical {
+				_, original, err := mcp.ParsePrefixedTool(canonical)
+				if err != nil || original == exposed {
+					continue
+				}
+				if skillMentionsTool(skill.Body, original) {
+					logger.Warn("active skill references a tool renamed by a group",
+						"skill", skill.Name, "group", group,
+						"original", original, "renamed_to", exposed,
+						"hint", "clients linked to the group see only the renamed tool")
+				}
+			}
+		}
+	}
+}
+
+// skillMentionsTool reports whether body references toolName as a whole
+// word. Word-boundary matching keeps short tool names ("get", "run") from
+// flagging nearly every skill the way a bare substring scan would.
+func skillMentionsTool(body, toolName string) bool {
+	re, err := regexp.Compile(`(^|[^a-zA-Z0-9_-])` + regexp.QuoteMeta(toolName) + `($|[^a-zA-Z0-9_-])`)
+	if err != nil {
+		return strings.Contains(body, toolName)
+	}
+	return re.MatchString(body)
+}
+
+// applyLimitsPolicy compiles the stack's limits: block and installs it on
+// the gateway, replacing any previous policy. CarryOver adopts live rate
+// buckets so enforcement survives hot reloads (an unrelated stack edit must
+// not refill a drained bucket). A stack without a limits block installs nil
+// gates, which is the zero-cost legacy path.
+func (b *GatewayBuilder) applyLimitsPolicy(gateway *mcp.Gateway, stack *config.Stack, logger *slog.Logger) {
+	b.limitsMu.Lock()
+	old := b.limitsPolicy
+	b.limitsMu.Unlock()
+
+	newPol := limits.NewPolicy(stack.Limits, logger)
+	newPol.CarryOver(old)
+	if newPol != nil {
+		gateway.SetCallGates(newPol.Gates())
+	} else {
+		gateway.SetCallGates(nil)
+	}
+
+	b.limitsMu.Lock()
+	b.limitsPolicy = newPol
+	b.limitsMu.Unlock()
+}
+
+// currentLimitsPolicy returns the live policy under the swap lock.
+func (b *GatewayBuilder) currentLimitsPolicy() *limits.Policy {
+	b.limitsMu.Lock()
+	defer b.limitsMu.Unlock()
+	return b.limitsPolicy
+}
+
+// applyTelemetryConfig walks the stack's MCP servers and registers per-
+// server file writers for every signal a server opts into. Idempotent:
+// re-running with a changed stack adds new writers and removes ones that
+// flipped to off. Used both at initial Build time and from the hot-reload
+// callback so a YAML change takes effect without restarting the daemon.
+func (b *GatewayBuilder) applyTelemetryConfig(apiServer *api.Server, handler slog.Handler) {
+	_ = apiServer // reserved for Phase 3 (inventory hookup); keeps callers stable
+	if b.telemetry == nil || b.stack == nil {
+		return
+	}
+
+	logger := slog.New(handler)
+	stack := b.stack
+
+	// Prompt (skill) usage persists globally off the stack-global metrics
+	// toggle, independent of per-server opt-in: the skills registry is not a
+	// stack.MCPServers entry, so it has no per-server PersistMetrics switch.
+	// Run this before the early-return below so a stack that flips metrics off
+	// still tears the writer down on hot-reload.
+	if flusher := b.telemetry.metricsFlusher; flusher != nil {
+		if stack.Telemetry != nil && stack.Telemetry.Persist.Metrics {
+			if err := state.EnsureTelemetryServerDir(stack.Name, telemetry.PromptUsageNamespace); err != nil {
+				logger.Warn("telemetry: cannot ensure prompt-usage dir", "error", err)
+			} else {
+				path, perr := state.TelemetryServerPath(stack.Name, telemetry.PromptUsageNamespace, "metrics")
+				if perr != nil {
+					logger.Warn("telemetry: cannot resolve prompt-usage path", "error", perr)
+				} else if err := flusher.SetPromptUsageWriter(path, telemetryRotationOpts(stack)); err != nil {
+					logger.Warn("telemetry: prompt-usage writer install failed", "path", path, "error", err)
+				}
+			}
+		} else {
+			flusher.RemovePromptUsageWriter()
+		}
+	}
+
+	// Compute desired set per signal.
+	wantLogs := map[string]bool{}
+	wantMetrics := map[string]bool{}
+	wantTraces := map[string]bool{}
+	for i := range stack.MCPServers {
+		srv := &stack.MCPServers[i]
+		if srv.Name == "" {
+			continue
+		}
+		if srv.PersistLogs(stack) {
+			wantLogs[srv.Name] = true
+		}
+		if srv.PersistMetrics(stack) {
+			wantMetrics[srv.Name] = true
+		}
+		if srv.PersistTraces(stack) {
+			wantTraces[srv.Name] = true
+		}
+	}
+
+	if len(wantLogs)+len(wantMetrics)+len(wantTraces) == 0 {
+		// Nothing to persist; ensure any previously-registered writers
+		// are torn down (handles hot-reload "off").
+		if b.telemetry.logRouter != nil {
+			for _, n := range b.telemetry.logRouter.ConfiguredServers() {
+				b.telemetry.logRouter.RemoveServer(n)
+			}
+		}
+		if b.telemetry.metricsFlusher != nil {
+			for _, n := range b.telemetry.metricsFlusher.ConfiguredServers() {
+				b.telemetry.metricsFlusher.RemoveServer(n)
+			}
+		}
+		if b.telemetry.tracesClient != nil {
+			for _, n := range b.telemetry.tracesClient.ConfiguredServers() {
+				b.telemetry.tracesClient.RemoveServer(n)
+			}
+		}
+		return
+	}
+
+	opts := telemetryRotationOpts(stack)
+
+	// Logs.
+	if router := b.telemetry.logRouter; router != nil {
+		current := stringSet(router.ConfiguredServers())
+		for name := range wantLogs {
+			if err := state.EnsureTelemetryServerDir(stack.Name, name); err != nil {
+				logger.Warn("telemetry: cannot ensure dir", "server", name, "error", err)
+				continue
+			}
+			path, perr := state.TelemetryServerPath(stack.Name, name, "logs")
+			if perr != nil {
+				logger.Warn("telemetry: cannot resolve path", "server", name, "error", perr)
+				continue
+			}
+			if err := router.AddServer(name, path, opts); err != nil {
+				logger.Warn("telemetry: log writer install failed", "server", name, "path", path, "error", err)
+			}
+		}
+		for name := range current {
+			if !wantLogs[name] {
+				router.RemoveServer(name)
+			}
+		}
+	}
+
+	// Metrics.
+	if flusher := b.telemetry.metricsFlusher; flusher != nil {
+		current := stringSet(flusher.ConfiguredServers())
+		for name := range wantMetrics {
+			if err := state.EnsureTelemetryServerDir(stack.Name, name); err != nil {
+				logger.Warn("telemetry: cannot ensure dir", "server", name, "error", err)
+				continue
+			}
+			path, perr := state.TelemetryServerPath(stack.Name, name, "metrics")
+			if perr != nil {
+				logger.Warn("telemetry: cannot resolve path", "server", name, "error", perr)
+				continue
+			}
+			if err := flusher.AddServer(name, path, opts); err != nil {
+				logger.Warn("telemetry: metrics writer install failed", "server", name, "path", path, "error", err)
+			}
+		}
+		for name := range current {
+			if !wantMetrics[name] {
+				flusher.RemoveServer(name)
+			}
+		}
+	}
+
+	// Traces.
+	if tc := b.telemetry.tracesClient; tc != nil {
+		current := stringSet(tc.ConfiguredServers())
+		for name := range wantTraces {
+			if err := state.EnsureTelemetryServerDir(stack.Name, name); err != nil {
+				logger.Warn("telemetry: cannot ensure dir", "server", name, "error", err)
+				continue
+			}
+			path, perr := state.TelemetryServerPath(stack.Name, name, "traces")
+			if perr != nil {
+				logger.Warn("telemetry: cannot resolve path", "server", name, "error", perr)
+				continue
+			}
+			if err := tc.AddServer(name, path, opts); err != nil {
+				logger.Warn("telemetry: traces writer install failed", "server", name, "path", path, "error", err)
+			}
+		}
+		for name := range current {
+			if !wantTraces[name] {
+				tc.RemoveServer(name)
+			}
+		}
+	}
+}
+
+// telemetryRotationOpts pulls retention from stack config or falls back to
+// the lumberjack defaults. Phase 1's SetDefaults already fills retention
+// when telemetry is set, so the zero-value fallbacks are belt-and-braces.
+func telemetryRotationOpts(stack *config.Stack) telemetry.LogOpts {
+	if stack == nil || stack.Telemetry == nil || stack.Telemetry.Retention == nil {
+		return telemetry.LogOpts{}
+	}
+	r := stack.Telemetry.Retention
+	return telemetry.LogOpts{
+		MaxSizeMB:  r.MaxSizeMB,
+		MaxBackups: r.MaxBackups,
+		MaxAgeDays: r.MaxAgeDays,
+	}
+}
+
+func stringSet(in []string) map[string]bool {
+	out := make(map[string]bool, len(in))
+	for _, s := range in {
+		out[s] = true
+	}
+	return out
+}
+
+// tokenizerName returns the configured tokenizer mode, defaulting to "embedded".
+func (b *GatewayBuilder) tokenizerName() string {
+	if b.stack.Gateway != nil && b.stack.Gateway.Tokenizer != "" {
+		return b.stack.Gateway.Tokenizer
+	}
+	return "embedded"
+}
+
+// buildTokenCounter creates the token counter based on the stack gateway config.
+// "embedded" (default): cl100k_base BPE vocabulary, pure Go, no network.
+// "api": Anthropic count_tokens endpoint — Anthropic-specific, requires a key.
+func (b *GatewayBuilder) buildTokenCounter() (token.Counter, error) {
+	switch b.tokenizerName() {
+	case "api":
+		apiKey := ""
+		if b.stack.Gateway != nil {
+			apiKey = b.stack.Gateway.TokenizerAPIKey
+		}
+		if apiKey == "" {
+			apiKey = os.Getenv("ANTHROPIC_API_KEY")
+		}
+		if apiKey == "" {
+			return nil, fmt.Errorf("gateway.tokenizer is \"api\" but no API key is configured: set ANTHROPIC_API_KEY or add tokenizer_api_key to stack.yaml")
+		}
+		return token.NewAPICounter(apiKey)
+	case "embedded", "":
+		c, err := token.NewTiktokenCounter()
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize embedded tokenizer: %w", err)
+		}
+		return c, nil
+	default:
+		// Unknown values fall back to embedded rather than failing.
+		c, err := token.NewTiktokenCounter()
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize embedded tokenizer: %w", err)
+		}
+		return c, nil
+	}
+}
+
+// wireExperimentalFlags resolves the stack's experimental flag map and
+// exposes the enabled set to /api/status as the features payload. The getter
+// closure reads through an atomic pointer so hot reloads of `experimental:`
+// (via refreshExperimentalFlags in the onConfigApplied hook) are reflected
+// without re-wiring.
+func (b *GatewayBuilder) wireExperimentalFlags(apiServer *api.Server, handler slog.Handler) {
+	logger := slog.Default()
+	if handler != nil {
+		logger = slog.New(handler)
+	}
+	b.refreshExperimentalFlags(flags.Default(), b.stack, logger)
+	apiServer.SetFeatures(func() []api.FeatureStatus {
+		state := b.experimentalFlags.Load()
+		if state == nil {
+			return nil
+		}
+		return state.features
+	})
+}
+
+// refreshExperimentalFlags re-resolves the experimental flag set from the
+// given stack (YAML map plus env overrides). Called at build time and from
+// the hot-reload hook so `experimental:` edits take effect without restart.
+// Resolution warnings (unknown names, concluded flags, malformed env
+// overrides) are logged; they never block anything.
+func (b *GatewayBuilder) refreshExperimentalFlags(reg *flags.Registry, cfg *config.Stack, logger *slog.Logger) {
+	res := flags.Resolve(reg, cfg.Experimental)
+	for _, w := range res.Warnings {
+		logger.Warn("experimental flag issue", "flag", w.Name, "detail", w.Message)
+	}
+	names := make([]string, 0, len(res.Enabled))
+	for name := range res.Enabled {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	features := make([]api.FeatureStatus, 0, len(names))
+	for _, name := range names {
+		f, ok := reg.Lookup(name)
+		if !ok {
+			continue
+		}
+		features = append(features, api.FeatureStatus{
+			Name:        f.Name,
+			Stage:       string(f.Stage),
+			Description: f.Description,
+		})
+	}
+	b.experimentalFlags.Store(&experimentalState{features: features})
+}
+
+// buildTracingConfig extracts tracing config from gateway config with defaults.
+func buildTracingConfig(gw *config.GatewayConfig) *tracing.Config {
+	cfg := tracing.DefaultConfig()
+	if gw == nil || gw.Tracing == nil {
+		return cfg
+	}
+	t := gw.Tracing
+	if t.Enabled != nil {
+		cfg.Enabled = *t.Enabled
+	}
+	if t.Sampling > 0 {
+		cfg.Sampling = t.Sampling
+	}
+	if t.Retention != "" {
+		cfg.Retention = t.Retention
+	}
+	cfg.Export = t.Export
+	cfg.Endpoint = t.Endpoint
+	if t.MaxTraces > 0 {
+		cfg.MaxTraces = t.MaxTraces
+	}
+	cfg.IncludeInfra = t.IncludeInfra
+	return cfg
+}
+
+// setupHotReload configures file watching and reload for the stack.
+func (b *GatewayBuilder) setupHotReload(ctx context.Context, inst *GatewayInstance, registrar *ServerRegistrar, handler slog.Handler, verbose bool) {
+	var vaultLookup config.VaultLookup
+	var vaultSetLookup config.VaultSetLookup
+	if b.vaultStore != nil {
+		vaultLookup = b.vaultStore
+		vaultSetLookup = newVaultSetAdapter(b.vaultStore)
+	}
+	// Seed the compiled model preference policies from the stack the
+	// daemon started with; the config-applied callback below keeps them
+	// current across hot reloads. The API reads them live so REST
+	// responses carry resolved values exactly when a stack is loaded.
+	inst.SetModelPolicies(b.stack.ModelPolicies())
+	inst.APIServer.SetModelPolicyProvider(inst.CurrentModelPolicies)
+
+	// Resolve the projection home once, at the composition boundary, so
+	// every refresh path below (including the config-applied callback)
+	// reconciles against an explicit home instead of resolving the real
+	// one deep inside library code (which is how tests once deleted real
+	// skill projections). Empty on resolution failure; reconcile then
+	// skips with a warning.
+	projectionHome := b.homeDir
+	if projectionHome == "" {
+		if h, err := state.Home(); err == nil {
+			projectionHome = h
+		} else {
+			slog.New(handler).Warn("home directory unavailable; skill projection reconcile disabled", "error", err)
+		}
+	}
+
+	reloadHandler := reload.NewHandler(b.stackPath, b.stack, inst.Gateway, b.rt, b.config.Port, b.config.BasePort, vaultLookup, vaultSetLookup)
+	reloadHandler.SetLogger(slog.New(handler))
+	reloadHandler.SetNoExpand(b.config.NoExpand)
+	// stackPath is threaded through the callback by the reload handler rather
+	// than captured from b.stackPath: in stackless mode b.stackPath starts
+	// empty and is only populated once POST /api/stack/initialize runs, which
+	// updates reloadHandler.stackPath. The handler already holds its mutex
+	// when invoking this callback, so reading h.stackPath there is safe and
+	// avoids a reentrant-lock deadlock a getter-based approach would cause.
+	reloadHandler.SetRegisterServerFunc(func(ctx context.Context, server config.MCPServer, replicas []reload.ReplicaRuntime, stackPath string) error {
+		runtimes := make([]ReplicaRuntime, 0, len(replicas))
+		for _, rep := range replicas {
+			runtimes = append(runtimes, ReplicaRuntime{HostPort: rep.HostPort, ContainerID: rep.ContainerID})
+		}
+		return registrar.RegisterOne(ctx, server, runtimes, stackPath)
+	})
+	// After a successful reload, refresh per-server telemetry writers so a
+	// YAML-toggled persist setting takes effect without restart. The
+	// callback fires under reload.Handler.mu — keep it allocation-light.
+	reloadHandler.SetOnConfigApplied(func(newCfg *config.Stack) {
+		b.stack = newCfg
+		// Re-resolve the per-client access policy from the reloaded config so a
+		// `clients:` change takes effect on the next tools/list and tools/call.
+		inst.Gateway.SetClientAccessPolicy(mcp.NewClientAccessPolicy(clientAccessSpec(newCfg)))
+		// Re-resolve experimental flags so `experimental:` edits reach
+		// /api/status (and everything gated on a flag) without restart.
+		b.refreshExperimentalFlags(flags.Default(), newCfg, slog.New(handler))
+		// Rebuild the limits policy so `limits:` edits enforce on the next
+		// call. Live rate buckets carry over for unchanged entries.
+		b.applyLimitsPolicy(inst.Gateway, newCfg, slog.New(handler))
+		// Rebuild the group policy so `groups:` edits change endpoint
+		// surfaces on the next request. Stateless recompile, no carry-over.
+		// Re-lint skills afterward: a reload can introduce renames whose
+		// originals live skills still reference.
+		inst.Gateway.SetGroupPolicy(mcp.NewGroupPolicy(groupsSpec(newCfg)))
+		if inst.RegistryServer != nil {
+			lintGroupRenamesAgainstSkills(inst.Gateway.CurrentGroupPolicy(), inst.RegistryServer.Store(), slog.New(handler))
+		}
+		// Rebuild the skill exposure policy so `skills:` edits filter the
+		// prompt/resource surface (and projection reconcile) on the next
+		// request. Stateless recompile, no carry-over.
+		inst.Gateway.SetSkillPolicy(mcp.NewSkillPolicy(skillsPolicySpec(newCfg)))
+		// Swap the compiled model preference policies. Stateless
+		// recompile, no carry-over.
+		inst.SetModelPolicies(newCfg.ModelPolicies())
+		b.applyTelemetryConfig(inst.APIServer, handler)
+		// Re-stamp projections so a `model_preferences:` edit reaches
+		// disk on EVERY successful reload path, not only under --watch:
+		// manual `gridctl reload` and POST /api/reload end here without
+		// ever passing through refreshRegistry. The --watch path also
+		// refreshes the registry right after this callback; the engine's
+		// cross-process lock serializes the two passes and the second is
+		// an idempotent no-op. Reload already does container work, so a
+		// projection reconcile adds negligible time under the handler's
+		// lock, and its failures are logged, never propagated.
+		if inst.RegistryServer != nil {
+			reconcileSkillProjections(ctx, inst, projectionHome, slog.New(handler))
+		}
+	})
+	inst.APIServer.SetReloadHandler(reloadHandler)
+
+	// startWatcher starts a file watcher for the given stack path.
+	// It is called immediately when --watch is active, and exposed via SetStartWatcher
+	// so POST /api/stack/initialize can activate watching after cold-loading.
+	startWatcher := func(stackPath string) {
+		watchCtx, _ := context.WithCancel(ctx) //nolint:govet,gosec // cancel called on process exit via ctx
+
+		watcher := reload.NewWatcher(stackPath, func() error {
+			result, err := reloadHandler.Reload(watchCtx)
+			if err != nil {
+				return err
+			}
+			if !result.Success {
+				return fmt.Errorf("%s", result.Message)
+			}
+			refreshRegistry(watchCtx, inst, projectionHome, slog.New(handler))
+			return nil
+		})
+		watcher.SetLogger(slog.New(handler))
+
+		go func() {
+			if err := watcher.Watch(watchCtx); err != nil && err != context.Canceled {
+				slog.New(handler).Error("file watcher error", "error", err)
+			}
+		}()
+	}
+
+	// Expose the watcher starter so initialize can activate it on demand.
+	inst.APIServer.SetStartWatcher(startWatcher)
+
+	// Watch the registry skills directory so skills added to disk out-of-band
+	// (hand-authored, or written by `gridctl skill add/update/remove` while the
+	// daemon runs) are reflected in the running gateway — activation, the UI
+	// listing, and the MCP prompt set — without a restart. This is independent
+	// of --watch, which only governs the stack.yaml watcher.
+	if inst.RegistryServer != nil {
+		regLogger := slog.New(handler)
+		skillsDir := filepath.Join(inst.RegistryServer.Store().Dir(), "skills")
+		// Create the directory synchronously so the watcher arms on the tight
+		// skills subtree rather than a busier ancestor like ~/.gridctl. The
+		// watcher itself is write-free and tolerates a missing directory, so a
+		// failure here is non-fatal.
+		if err := os.MkdirAll(skillsDir, 0o755); err != nil {
+			regLogger.Warn("could not create registry skills directory for watching", "path", skillsDir, "error", err)
+		}
+		regWatcher := reload.NewDirWatcher(skillsDir, func() error {
+			refreshRegistry(ctx, inst, projectionHome, regLogger)
+			return nil
+		})
+		regWatcher.SetLogger(regLogger)
+		go func() {
+			if err := regWatcher.Watch(ctx); err != nil && err != context.Canceled {
+				regLogger.Error("registry watcher error", "error", err)
+			}
+		}()
+	}
+
+	if b.config.Watch {
+		startWatcher(b.stackPath)
+
+		if verbose {
+			fmt.Printf("\nFile watcher enabled for: %s\n", b.stackPath)
+		}
+	}
+}
+
+// refreshRegistry reloads the registry store from disk and re-syncs the
+// gateway router with the result. It is shared by the stack-reload callback
+// and the registry directory watcher so the two paths cannot drift: the
+// store is reloaded, the registry client is added or removed from the router
+// depending on whether any skills remain, and the router's tool set is
+// refreshed. A failed reload is logged and tolerated rather than fatal.
+func refreshRegistry(ctx context.Context, inst *GatewayInstance, home string, logger *slog.Logger) {
+	if inst.RegistryServer == nil {
+		return
+	}
+	if err := inst.RegistryServer.RefreshTools(ctx); err != nil {
+		logger.Warn("registry refresh failed", "error", err)
+	}
+	if inst.RegistryServer.HasContent() {
+		inst.Gateway.Router().AddClient(inst.RegistryServer)
+	} else {
+		inst.Gateway.Router().RemoveClient("registry")
+	}
+	inst.Gateway.Router().RefreshTools()
+	syncSkillPins(inst, logger)
+	reconcileSkillProjections(ctx, inst, home, logger)
+}
+
+// syncSkillPins runs the skill-pin TOFU/verify pass after a registry
+// (re)load. The pin store writes only under ~/.gridctl/pins/, never into
+// the watched registry tree, so this can never feed back into the disk
+// watcher. Failures are logged and tolerated: pinning is an observation
+// layer and must not break the refresh path.
+func syncSkillPins(inst *GatewayInstance, logger *slog.Logger) {
+	if inst.SkillPinStore == nil || inst.RegistryServer == nil {
+		return
+	}
+	res, err := inst.SkillPinStore.Sync(inst.RegistryServer.Store())
+	if err != nil {
+		logger.Warn("skill pin sync failed", "error", err)
+		return
+	}
+	if len(res.Drifted) > 0 {
+		logger.Warn("skill pin drift detected", "skills", res.Drifted,
+			"hint", "review with 'gridctl skill pins diff' or the Pins workspace")
+	}
+}
+
+// reconcileSkillProjections keeps native-client skill projections in
+// step with the registry after a refresh: deactivated or deleted skills
+// leave client directories, repaired links and refreshed copies follow
+// edits. Failures are logged and never propagate — a projection problem
+// must not break the registry/prompt refresh path. Writes go only to
+// client skill directories, never into the watched registry tree, so
+// the disk watcher cannot feed back on itself. The home is resolved by
+// the caller (setupHotReload) so tests always reconcile against an
+// injected sandbox, never the real home.
+func reconcileSkillProjections(ctx context.Context, inst *GatewayInstance, home string, logger *slog.Logger) {
+	if home == "" {
+		logger.Warn("skill projection reconcile skipped: home directory unavailable")
+		return
+	}
+	// A skill reconcile failure deliberately does not abort the agent
+	// pass below: the two kinds are independent tenants of the engine.
+	// The wiring kind (pkg/wiring) is deliberately NOT reconciled here:
+	// client config endpoints change only on explicit user action, and a
+	// daemon silently rewriting them would be the exact failure mode
+	// wiring ownership exists to prevent. Keep it out of this loop.
+	skillModelPolicy, agentModelPolicy := inst.CurrentModelPolicies()
+	mgr := skillsync.NewManagerWithHome(home, inst.RegistryServer.Store())
+	// The reconcile enforces the stack's skill exposure policy: denied
+	// recorded projections are skipped (visible, never silently removed).
+	mgr.SetPolicy(func(name string) (bool, string) {
+		return inst.Gateway.CurrentSkillPolicy().Evaluate(name)
+	})
+	// And the stack's model preference policy: the daemon is the
+	// authoritative policy-aware sync path, so rewrite, reconcile-back,
+	// and channel restoration all happen here.
+	mgr.SetModelPolicy(skillModelPolicy)
+	results, err := mgr.Reconcile(ctx)
+	if err != nil {
+		logger.Warn("skill projection reconcile failed", "error", err)
+	}
+	for _, r := range results {
+		logReconcileAction(logger, "skill", r.Skill, r.Client, r.Action, r.Target, r.Error)
+	}
+
+	// Agent projections reconcile with the same posture: recorded set
+	// only, drift never forced, failures logged and tolerated.
+	agentMgr := agentsync.NewManagerWithHome(home, inst.RegistryServer.Store().Dir())
+	agentMgr.SetModelPolicy(agentModelPolicy)
+	agentResults, err := agentMgr.Reconcile(ctx)
+	if err != nil {
+		logger.Warn("agent projection reconcile failed", "error", err)
+	}
+	for _, r := range agentResults {
+		logReconcileAction(logger, "agent", r.Agent, r.Client, r.Action, r.Target, r.Error)
+	}
+}
+
+// logReconcileAction logs one projection reconcile result at the level
+// its action deserves. The action vocabulary is shared across the skill
+// and agent kinds, so one mapping serves both.
+func logReconcileAction(logger *slog.Logger, kind, name, client, action, target, errMsg string) {
+	switch action {
+	case skillsync.ActionUnchanged:
+	case skillsync.ActionError:
+		logger.Warn(kind+" projection reconcile error", kind, name, "client", client, "error", errMsg)
+	case skillsync.ActionSkippedDrift, skillsync.ActionSkippedUnmanaged:
+		// Unresolved drift the operator must decide on; reconcile never
+		// forces.
+		logger.Warn(kind+" projection needs attention", kind, name, "client", client, "action", action, "target", target)
+	case skillsync.ActionSkippedPolicy:
+		// Policy denial stays visible on every pass; removal is an explicit
+		// unsync decision, never the daemon's.
+		logger.Warn(kind+" projection denied by skills policy", kind, name, "client", client, "detail", errMsg)
+	case skillsync.ActionSkippedEmptyStore:
+		// The guard against mass-removal: an empty store with recorded
+		// projections is refused, not reconciled.
+		logger.Warn(kind+" projection reconcile refused", "reason", errMsg)
+	default:
+		logger.Info(kind+" projection reconciled", kind, name, "client", client, "action", action, "target", target)
+	}
+}
+
+// printEndpoints prints the gateway endpoint information.
+func (b *GatewayBuilder) printEndpoints(inst *GatewayInstance) {
+	addr := fmt.Sprintf(":%d", b.config.Port)
+
+	fmt.Printf("\nMCP Gateway running:\n")
+	fmt.Printf("  POST /mcp         - JSON-RPC endpoint\n")
+	fmt.Printf("  GET  /sse         - SSE endpoint (for Claude Desktop)\n")
+	fmt.Printf("  POST /message     - SSE message endpoint\n")
+	fmt.Printf("\nWeb UI available at http://localhost%s/\n", addr)
+	fmt.Printf("API endpoints:\n")
+	fmt.Printf("  GET  /api/status      - Gateway status (includes unified agents)\n")
+	fmt.Printf("  GET  /api/mcp-servers - List MCP servers\n")
+	fmt.Printf("  GET  /api/tools       - List tools\n")
+	fmt.Printf("  POST /api/reload      - Trigger configuration reload\n")
+	fmt.Printf("  GET  /health          - Liveness check (daemon is alive)\n")
+	fmt.Printf("  GET  /ready           - Readiness check (all MCP servers initialized)\n")
+	fmt.Println("\nPress Ctrl+C to stop...")
+}
+
+// waitForShutdown blocks until ctx is canceled (signal-driven) or the server
+// errors, then cleans up. Listening on ctx.Done() rather than a local signal
+// channel ensures all ctx-bound goroutines in the gateway see the same
+// cancellation and exit cleanly.
+func (b *GatewayBuilder) waitForShutdown(ctx context.Context, inst *GatewayInstance, handler slog.Handler, serverErr <-chan error, verbose bool) error {
+	select {
+	case <-ctx.Done():
+		logger := slog.New(handler)
+		logger.Info("received shutdown signal")
+
+		if verbose {
+			fmt.Println("\nShutting down...")
+		}
+
+		// Close API server resources: broadcasts SSE close event while
+		// HTTP connections are still alive, then closes gateway clients.
+		inst.APIServer.Close()
+
+		// Graceful HTTP shutdown with timeout. Parent is Background, not
+		// ctx — ctx is already canceled at this point, so a child of it
+		// would expire immediately.
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer shutdownCancel()
+
+		if err := inst.HTTPServer.Shutdown(shutdownCtx); err != nil {
+			logger.Error("HTTP server shutdown error", "error", err)
+		}
+
+		if b.telemetry != nil && b.telemetry.metricsFlusher != nil {
+			b.telemetry.metricsFlusher.Stop()
+		}
+
+		if b.tracingProvider != nil {
+			if err := b.tracingProvider.Shutdown(shutdownCtx); err != nil {
+				logger.Error("tracing shutdown error", "error", err)
+			}
+		}
+
+		if b.telemetry != nil && b.telemetry.logRouter != nil {
+			b.telemetry.logRouter.Close()
+		}
+	case err := <-serverErr:
+		return fmt.Errorf("server error: %w", err)
+	}
+
+	return nil
+}

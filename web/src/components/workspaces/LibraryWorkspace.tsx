@@ -1,0 +1,1752 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate, useParams, useSearchParams } from 'react-router';
+import {
+  AlignJustify,
+  BookOpen,
+  CloudDownload,
+  Download,
+  Globe,
+  LayoutGrid,
+  List,
+  Plus,
+  Power,
+  PowerOff,
+  RefreshCw,
+  Search,
+  SquareCheck,
+  Trash2,
+  X,
+  type LucideIcon,
+} from 'lucide-react';
+import { cn } from '../../lib/cn';
+import { IconButton } from '../ui/IconButton';
+import { PopoutButton } from '../ui/PopoutButton';
+import { SkillEditor } from '../registry/SkillEditor';
+import { SkillCardSkeleton } from '../registry/SkillCardSkeleton';
+import { LibraryGrid, type GroupMode } from '../registry/LibraryGrid';
+import { LibraryTable } from '../registry/LibraryTable';
+import { SkillDetailPanel } from '../registry/SkillDetailPanel';
+import { DriftSyncDialog } from '../registry/DriftSyncDialog';
+import { GlobalContextDialog } from '../context/GlobalContextDialog';
+import { ConfirmDialog } from '../ui/ConfirmDialog';
+import { Modal } from '../ui/Modal';
+import { showToast } from '../ui/Toast';
+import { summarizeSkillResults, syncCountsMessage, addCounts, type SyncCounts } from '../../lib/skillSync';
+import { useFuzzySearch } from '../../hooks/useFuzzySearch';
+import { useSkillUsage } from '../../hooks/useSkillUsage';
+import { useWindowManager } from '../../hooks/useWindowManager';
+import { useRegistryStore } from '../../stores/useRegistryStore';
+import { skillPinsUrl } from '../../lib/skillGovernance';
+import { stateDotClasses } from '../../lib/stateColors';
+import { useUIStore } from '../../stores/useUIStore';
+import { useWizardStore } from '../../stores/useWizardStore';
+import { useLibraryCommands, type LibraryFilter } from '../library/useLibraryCommands';
+import { LibraryKindSwitch } from '../registry/LibraryKindSwitch';
+import { isRegistryKind, type RegistryKind } from '../../lib/registryKind';
+import { fetchPacks } from '../../lib/api';
+import { AgentsWorkspace } from '../registry/agents/AgentsWorkspace';
+import { PacksWorkspace } from '../registry/packs/PacksWorkspace';
+import { hasAnyCategory, skillCategory } from '../../lib/skillMeta';
+import {
+  coldWindowCaveat,
+  isStaleUsage,
+  isUsageWindowCold,
+  staleUnknownReason,
+} from '../../lib/skillUsage';
+import {
+  AUDIT_WINDOWS,
+  DEFAULT_AUDIT_WINDOW,
+  auditWindowMs,
+  type AuditWindow,
+} from '../../lib/toolAudit';
+import {
+  activateRegistrySkill,
+  deleteRegistrySkill,
+  disableRegistrySkill,
+  fetchRegistrySkills,
+  fetchRegistryStatus,
+  fetchSkillSources,
+  setRegistrySkillsBatch,
+  syncAllSources,
+} from '../../lib/api';
+import { extractRepoInfo } from '../../lib/repo';
+import { WorkspaceShell } from '../layout/WorkspaceShell';
+import type { AgentSkill, ItemState, SkillSourceStatus, SkillUsageStat, SourceSyncResult } from '../../types';
+
+type FilterTab = 'all' | ItemState;
+type SortMode = 'name' | 'state' | 'files' | 'usage';
+
+// The usage axis. `unused` is "no recorded calls ever"; `stale` is "called at
+// some point, but not inside the selected window". They are separate questions,
+// so the facet is single-select rather than two combinable toggles.
+type UsageFilter = 'unused' | 'stale';
+
+function isUsageFilter(value: string | null): value is UsageFilter {
+  return value === 'unused' || value === 'stale';
+}
+
+function isAuditWindow(value: string | null): value is AuditWindow {
+  return AUDIT_WINDOWS.some((w) => w.id === value);
+}
+
+function isGroupMode(value: string | null): value is GroupMode {
+  return value === 'source' || value === 'category' || value === 'none';
+}
+
+function isFilterTab(value: string | null): value is FilterTab {
+  return value === 'active' || value === 'draft' || value === 'disabled' || value === 'all';
+}
+
+function isSortMode(value: string | null): value is SortMode {
+  return value === 'name' || value === 'state' || value === 'files' || value === 'usage';
+}
+
+/**
+ * LibraryWorkspace is the catalog view of the skill registry, hosted inside
+ * the unified AppShell. Search and filter state mirror the URL so reload,
+ * back/forward, and deep-links all preserve the user's view. The
+ * `/library/:skillName` path mounts the editor for that skill if it exists,
+ * else surfaces a toast and falls back to `/library`.
+ */
+export function LibraryWorkspace() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const { skillName } = useParams<{ skillName?: string }>();
+  const navigate = useNavigate();
+
+  // Registry is fetched by the global usePolling cycle in AppShell — read from
+  // the store instead of starting a second polling loop here.
+  const skills = useRegistryStore((s) => s.skills);
+  const sources = useRegistryStore((s) => s.sources);
+  // Load the packs list once for the reverse-ownership chips (source
+  // group headers and agent detail); packs are off the global poll.
+  useEffect(() => {
+    if (useRegistryStore.getState().packs !== null) return;
+    fetchPacks()
+      .then((packs) => useRegistryStore.getState().setPacks(packs))
+      .catch(() => {
+        // Chips are progressive enhancement; a failed load renders none.
+      });
+  }, []);
+
+  // Per-skill usage, fetched separately and joined by name (mirroring the
+  // provenance source join) so the registry list payload stays untouched. When
+  // the endpoint is unavailable (no metrics accumulator wired) usage stays null
+  // and every usage surface (column, KPI, inspector line) is omitted.
+  const { usage, fetchedAt } = useSkillUsage();
+  const usageAvailable = usage !== null;
+  const observedSince = usage?.observedSince ?? null;
+  // A tracking window younger than a day cannot support "never used": every
+  // skill would qualify simply because nothing has been observed yet. While
+  // cold, the KPI withholds its count, the ?usage facet is inert, and the bulk
+  // bar carries the caveat. See lib/skillUsage.ts for the full rationale.
+  //
+  // The clock is the snapshot's own fetch time, not Date.now() at render:
+  // reading a clock during render is impure, and "how old was the window when
+  // this data was taken" is the question actually being asked. `fetchedAt` is
+  // non-null whenever `usage` is, so the fallback only ever sees a null usage.
+  const usageCold = useMemo(() => isUsageWindowCold(usage, fetchedAt ?? 0), [usage, fetchedAt]);
+  const coldCaveat = useMemo(() => coldWindowCaveat(usage, fetchedAt ?? 0), [usage, fetchedAt]);
+
+  // Stale lookback window, sharing Tools Audit's vocabulary so "7 days" means
+  // the same thing in both workspaces. URL-synced with the default omitted.
+  const windowParam = searchParams.get('window');
+  const auditWindow: AuditWindow = isAuditWindow(windowParam) ? windowParam : DEFAULT_AUDIT_WINDOW;
+  const windowMs = auditWindowMs(auditWindow);
+  const windowLabel = AUDIT_WINDOWS.find((w) => w.id === auditWindow)?.label ?? '7 days';
+  const setAuditWindow = useCallback((w: AuditWindow) => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (w === DEFAULT_AUDIT_WINDOW) next.delete('window');
+        else next.set('window', w);
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
+
+  // Why a stale count cannot be given, or null when it can. Covers both the
+  // cold window and the window-longer-than-tracking case; see lib/skillUsage.ts.
+  // Non-null means "cannot answer", so the KPI and the facet both key off it
+  // directly. An unavailable endpoint also lands here, though the card is not
+  // rendered at all in that case.
+  const staleUnknown = useMemo(
+    () => staleUnknownReason(usage, windowMs, windowLabel, fetchedAt ?? 0),
+    [usage, windowMs, windowLabel, fetchedAt],
+  );
+  const usageMap = useMemo(() => {
+    if (!usage) return null;
+    const map = new Map<string, SkillUsageStat>();
+    for (const [name, stat] of Object.entries(usage.skills)) map.set(name, stat);
+    return map;
+  }, [usage]);
+
+  // A skill is "unused" when usage data exists and it has zero recorded calls
+  // (no entry, or an entry with calls === 0).
+  const isUnused = useCallback(
+    (name: string) => {
+      const u = usageMap?.get(name);
+      return !u || u.calls === 0;
+    },
+    [usageMap],
+  );
+
+  // A skill is stale when it has been called before but not inside the window.
+  // Never-used skills are excluded: that is the other facet.
+  const isStale = useCallback(
+    (name: string) => isStaleUsage(usageMap?.get(name), windowMs, fetchedAt ?? 0),
+    [usageMap, windowMs, fetchedAt],
+  );
+
+  // null means "not loaded yet"; the deep-link error toast must wait for a
+  // resolved fetch so a transient mid-fetch render doesn't false-positive.
+  const isLoading = skills === null;
+  const hasSkills = (skills ?? []).length > 0;
+
+  const { openDetachedWindow } = useWindowManager();
+  const compact = useUIStore((s) => s.compactMode.library);
+  const toggleCompact = useUIStore((s) => s.toggleCompactMode);
+  // Select mode pins the multi-select checkboxes visible. Any live selection
+  // implies it, so the toggle is a discoverability aid rather than a gate.
+  const selectMode = useUIStore((s) => s.libraryPrefs.selectMode);
+  const setLibraryPrefs = useUIStore((s) => s.setLibraryPrefs);
+  const openWizard = useWizardStore((s) => s.open);
+  const handleImportSkill = useCallback(() => openWizard('skill'), [openWizard]);
+
+  // Catalog kind: ?kind=agent switches the whole workspace to the Agents
+  // segment. The default ('skill') is omitted from the URL so existing deep
+  // links stay clean. Switching clears every kind-inapplicable param — the
+  // two segments share the URL but not their facet vocabulary.
+  const kindParam = searchParams.get('kind');
+  const kind: RegistryKind = isRegistryKind(kindParam) ? kindParam : 'skill';
+  const setKind = useCallback((next: RegistryKind) => {
+    setSearchParams(
+      (prev) => {
+        const current = isRegistryKind(prev.get('kind')) ? prev.get('kind') : 'skill';
+        if (current === next) return prev;
+        const cleared = new URLSearchParams();
+        if (next !== 'skill') cleared.set('kind', next);
+        return cleared;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
+
+  // URL → local state for the search input. We round-trip through state so the
+  // input keeps caret behavior; the URL is the source of truth on reload.
+  const searchQuery = searchParams.get('q') ?? '';
+  const filterParam = searchParams.get('filter');
+  const activeTab: FilterTab = isFilterTab(filterParam) ? filterParam : 'all';
+
+  const setSearchQuery = useCallback((value: string) => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (value.trim()) next.set('q', value);
+        else next.delete('q');
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
+
+  const setActiveTab = useCallback((tab: FilterTab) => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (tab === 'all') next.delete('filter');
+        else next.set('filter', tab);
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
+
+  // Provenance grouping state. The default grouping is Source when any source
+  // exists, else Category (today's behavior) — so the default value is omitted
+  // from the URL and a no-source registry is untouched.
+  const hasSources = (sources ?? []).length > 0;
+  // Category grouping is only offered when some skill actually has a category;
+  // a flat registry would otherwise get one section per skill.
+  const hasCategories = useMemo(() => hasAnyCategory(skills ?? []), [skills]);
+  const defaultGroup: GroupMode = hasSources ? 'source' : 'category';
+  const groupParam = searchParams.get('group');
+  const groupMode: GroupMode = isGroupMode(groupParam) ? groupParam : defaultGroup;
+  const sourceParam = searchParams.get('source');
+  const activeSource = groupMode === 'source' ? sourceParam : null;
+
+  // Join skills to sources by skill name. Verified against internal/api/skills.go:
+  // source entries are built from the same registry store, so SkillSourceEntry.name
+  // === AgentSkill.name. Caveat (deferred): a skill kept after its source is removed,
+  // or a name shared across sources, maps to the first owning source or "My Skills".
+  const sourceMap = useMemo(() => {
+    const map = new Map<string, SkillSourceStatus>();
+    for (const src of sources ?? []) {
+      for (const entry of src.skills ?? []) {
+        if (!map.has(entry.name)) map.set(entry.name, src);
+      }
+    }
+    return map;
+  }, [sources]);
+
+  const setGroupMode = useCallback((mode: GroupMode) => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (mode === defaultGroup) next.delete('group');
+        else next.set('group', mode);
+        if (mode !== 'source') next.delete('source'); // isolate only applies in source mode
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams, defaultGroup]);
+
+  const setActiveSource = useCallback((key: string | null) => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (!key) next.delete('source');
+        else next.set('source', key);
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
+
+  // Inspector selection — the skill shown in the right-rail SkillDetailPanel.
+  // URL-synced as ?selected=<name> (replace history) so reload and deep-links
+  // restore it; kept distinct from /library/:skillName, which opens the editor.
+  const selectedName = searchParams.get('selected');
+  const setSelectedName = useCallback((name: string | null) => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (name) next.set('selected', name);
+        else next.delete('selected');
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
+
+  // Sort axis — URL-synced as ?sort, with the default ('name') omitted.
+  const sortParam = searchParams.get('sort');
+  const sortMode: SortMode = isSortMode(sortParam) ? sortParam : 'name';
+  const setSortMode = useCallback((mode: SortMode) => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (mode === 'name') next.delete('sort');
+        else next.set('sort', mode);
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
+
+  // View mode, URL-synced as ?view (cards default omitted), consistent with
+  // the workspace's URL-first state model. Row density stays in useUIStore.
+  const viewMode: 'cards' | 'table' = searchParams.get('view') === 'table' ? 'table' : 'cards';
+  const setViewMode = useCallback((mode: 'cards' | 'table') => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (mode === 'cards') next.delete('view');
+        else next.set('view', mode);
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
+
+  // Usage facet: a new axis beyond the state filter, URL-synced as
+  // ?usage=unused (the only value today) and omitted otherwise. Threaded like
+  // the source isolate. Effective only when usage data is available.
+  const usageParam = searchParams.get('usage');
+  const usageFilter: UsageFilter | null = isUsageFilter(usageParam) ? usageParam : null;
+  // Inert when usage is unavailable *or* the window is too young to support the
+  // claim, so a stale or hand-typed ?usage=unused cannot select the whole
+  // active catalog on a freshly started gateway.
+  const usageFilterActive = usageFilter === 'unused' && usageAvailable && !usageCold;
+  // The stale facet carries a second condition: the tracking window must also
+  // be at least as long as the lookback the user picked.
+  const staleAnswerable = usageAvailable && staleUnknown === null;
+  const staleFilterActive = usageFilter === 'stale' && staleAnswerable;
+  const setUsageFilter = useCallback((filter: UsageFilter | null) => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (filter) next.set('usage', filter);
+        else next.delete('usage');
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
+  // Enabling "Never used" also clears any state tab: the facet is active-only,
+  // so a draft/disabled tab would contradict it and yield an empty list while
+  // the (search-aware, tab-independent) KPI count still reads non-zero.
+  const toggleUsageFacet = useCallback((facet: UsageFilter) => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (usageFilter === facet) {
+          next.delete('usage');
+        } else {
+          next.set('usage', facet);
+          next.delete('filter');
+        }
+        return next;
+      },
+      { replace: true },
+    );
+  }, [usageFilter, setSearchParams]);
+  const toggleNeverUsed = useCallback(() => toggleUsageFacet('unused'), [toggleUsageFacet]);
+  const toggleStale = useCallback(() => toggleUsageFacet('stale'), [toggleUsageFacet]);
+
+  // Clear every removable facet in one update. Grouping (?group) is a view axis,
+  // not a facet, so it is intentionally left untouched.
+  const clearAllFacets = useCallback(() => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete('q');
+        next.delete('filter');
+        next.delete('source');
+        next.delete('sort');
+        next.delete('usage');
+        next.delete('window');
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
+
+  // Editor + delete confirm state
+  const [showEditor, setShowEditor] = useState(false);
+  // Global Context management surface (canonical AGENTS.md sync).
+  const [showGlobalContext, setShowGlobalContext] = useState(false);
+  const [editingSkill, setEditingSkill] = useState<AgentSkill | undefined>();
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
+  // Bulk disable is reversible but wide: from the "Never used" facet a single
+  // Select all can take out the whole active catalog, so it confirms like
+  // delete does rather than firing on one click.
+  const [confirmBulkDisable, setConfirmBulkDisable] = useState(false);
+
+  // Sync sources state. `syncing` disables the workspace-level button; the
+  // failure list is captured for the Details overlay opened from the toast.
+  const [syncing, setSyncing] = useState(false);
+  const [syncFailures, setSyncFailures] = useState<SourceSyncResult[] | null>(null);
+  const [confirmSyncDrift, setConfirmSyncDrift] = useState(false);
+
+  // Multi-select state. Names only (not skill objects) so the selection
+  // survives filter, sort, group, and refresh; stale names are pruned at the
+  // point of use against the live skill set.
+  const [selectedNames, setSelectedNames] = useState<Set<string>>(() => new Set());
+  const toggleSelect = useCallback((skill: AgentSkill) => {
+    setSelectedNames((prev) => {
+      const next = new Set(prev);
+      if (next.has(skill.name)) next.delete(skill.name);
+      else next.add(skill.name);
+      return next;
+    });
+  }, []);
+  const clearSelection = useCallback(() => setSelectedNames(new Set()), []);
+
+  // Track the last skillName we resolved so we don't refire the toast on every
+  // re-render. Reset whenever the param actually changes.
+  const lastResolvedSkillRef = useRef<string | null>(null);
+
+  // Deep-link resolution: /library/:skillName mounts the editor for that
+  // skill once the registry has loaded. Unknown name → toast + replace URL.
+  useEffect(() => {
+    if (!skillName) {
+      lastResolvedSkillRef.current = null;
+      return;
+    }
+    if (lastResolvedSkillRef.current === skillName) return;
+    if (isLoading) return;
+
+    const found = (skills ?? []).find((s) => s.name === skillName);
+    lastResolvedSkillRef.current = skillName;
+    if (found) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- deep-link resolution must wait for the async registry load; guarded by lastResolvedSkillRef so it runs once per param change
+      setEditingSkill(found);
+      setShowEditor(true);
+    } else {
+      showToast('error', `Skill "${skillName}" not found`);
+      navigate('/library', { replace: true });
+    }
+  }, [skillName, isLoading, skills, navigate]);
+
+  // When the editor closes, drop the :skillName segment so the URL reflects
+  // the catalog view again. Search/filter query params survive.
+  const handleEditorClose = useCallback(() => {
+    setShowEditor(false);
+    setEditingSkill(undefined);
+    if (skillName) {
+      navigate({ pathname: '/library', search: searchParams.toString() }, { replace: true });
+    }
+  }, [navigate, searchParams, skillName]);
+
+  // Esc clears an active multi-selection first, then (on a second press) closes
+  // the inspector. Ignored while a modal is open or focus is in a text input
+  // (the search box keeps its own clear affordance). Inert on the Agents
+  // segment: AgentsWorkspace owns Esc there — this handler would otherwise
+  // clear the shared ?selected param behind the agents dialogs, or silently
+  // eat a press on an invisible skills multi-selection.
+  useEffect(() => {
+    if (kind === 'agent' || kind === 'pack') return;
+    if (!selectedName && selectedNames.size === 0) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || showEditor) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if (selectedNames.size > 0) {
+        setSelectedNames(new Set());
+        return;
+      }
+      setSelectedName(null);
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [kind, selectedName, selectedNames.size, showEditor, setSelectedName]);
+
+  const refreshRegistry = useCallback(async () => {
+    try {
+      const [regStatus, regSkills] = await Promise.all([
+        fetchRegistryStatus(),
+        fetchRegistrySkills(),
+      ]);
+      useRegistryStore.getState().setStatus(regStatus);
+      useRegistryStore.getState().setSkills(regSkills);
+    } catch (err) {
+      showToast('error', err instanceof Error ? err.message : 'Refresh failed');
+    }
+  }, []);
+
+  // Refresh registry + sources together — used after an inline source update so
+  // the "update available" badge clears and any new/removed skills appear.
+  const refreshAll = useCallback(async () => {
+    await refreshRegistry();
+    try {
+      const srcs = await fetchSkillSources();
+      useRegistryStore.getState().setSources(srcs);
+    } catch {
+      // Sources unavailable — progressive disclosure.
+    }
+  }, [refreshRegistry]);
+
+  // Aggregate the locally-edited skills across every source, for the bulk-sync
+  // drift warning and to decide whether a sync needs confirmation.
+  const driftedAcrossSources = useMemo(
+    () => (sources ?? []).flatMap((s) => s.driftedSkills ?? []),
+    [sources],
+  );
+
+  // Bulk sync every imported source via the aggregate backend endpoint.
+  // Surfaces an aggregated toast; failures expose a Details action that
+  // opens an overlay listing the per-source error messages.
+  const runSyncAll = useCallback(
+    async (force: boolean) => {
+      if (syncing) return;
+      setSyncing(true);
+      setConfirmSyncDrift(false);
+      try {
+        const summary = await syncAllSources(force ? { force } : undefined);
+        await refreshAll();
+        const counts = (summary.sources ?? []).reduce<SyncCounts>(
+          (acc, s) => addCounts(acc, summarizeSkillResults(s.skills)),
+          { updated: 0, skipped: 0, overwritten: 0, failed: 0 },
+        );
+        const failures = summary.sources.filter((s) => s.error || s.skills?.some((k) => k.error));
+        if (failures.length === 0) {
+          const detail = syncCountsMessage(counts);
+          showToast('success', detail ? `Sync complete: ${detail}` : 'All sources up to date');
+        } else {
+          const okCount = summary.syncedSources;
+          const failCount = failures.length;
+          showToast(
+            'warning',
+            `Synced ${okCount} of ${okCount + failCount} sources. ${failCount} failed`,
+            { action: { label: 'Details', onClick: () => setSyncFailures(failures) }, duration: 6000 },
+          );
+        }
+      } catch (err) {
+        showToast('error', err instanceof Error ? err.message : 'Sync failed');
+      } finally {
+        setSyncing(false);
+      }
+    },
+    [syncing, refreshAll],
+  );
+
+  // Sync clean sources silently; when any source has local edits, warn first so
+  // the user chooses to keep or overwrite them.
+  const handleSyncAll = useCallback(() => {
+    if (syncing) return;
+    if (driftedAcrossSources.length > 0) {
+      setConfirmSyncDrift(true);
+      return;
+    }
+    void runSyncAll(false);
+  }, [syncing, driftedAcrossSources, runSyncAll]);
+
+  const handleEnable = useCallback(async (skill: AgentSkill) => {
+    try {
+      await activateRegistrySkill(skill.name);
+      showToast('success', `Skill "${skill.name}" activated`);
+      refreshRegistry();
+    } catch (err) {
+      showToast('error', err instanceof Error ? err.message : 'State change failed');
+    }
+  }, [refreshRegistry]);
+
+  const handleDisable = useCallback(async (skill: AgentSkill) => {
+    try {
+      await disableRegistrySkill(skill.name);
+      showToast('success', `Skill "${skill.name}" disabled`);
+      refreshRegistry();
+    } catch (err) {
+      showToast('error', err instanceof Error ? err.message : 'State change failed');
+    }
+  }, [refreshRegistry]);
+
+  const handleDeleteConfirm = useCallback(async () => {
+    if (!confirmDelete) return;
+    try {
+      await deleteRegistrySkill(confirmDelete);
+      showToast('success', 'Skill deleted');
+      refreshRegistry();
+      // Drop the inspector selection if it pointed at the deleted skill, so the
+      // URL doesn't carry a dead ?selected= param.
+      if (confirmDelete === selectedName) setSelectedName(null);
+    } catch (err) {
+      showToast('error', err instanceof Error ? err.message : 'Delete failed');
+    } finally {
+      setConfirmDelete(null);
+    }
+  }, [confirmDelete, refreshRegistry, selectedName, setSelectedName]);
+
+  const handleNewSkill = useCallback(() => {
+    setEditingSkill(undefined);
+    setShowEditor(true);
+  }, []);
+
+  const handlePopout = useCallback(() => {
+    openDetachedWindow('registry');
+  }, [openDetachedWindow]);
+
+  const handleShowAll = useCallback(() => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete('q');
+        next.delete('filter');
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
+
+  const handleFilter = useCallback((value: LibraryFilter) => {
+    if (value === 'all') {
+      setActiveTab('all');
+    } else {
+      setActiveTab(value);
+    }
+  }, [setActiveTab]);
+
+  useLibraryCommands({
+    onNewSkill: handleNewSkill,
+    onRefresh: refreshRegistry,
+    onShowAll: handleShowAll,
+    onFilter: handleFilter,
+    onOpenInNewWindow: handlePopout,
+    onSetGroup: setGroupMode,
+    kind,
+    onSwitchKind: setKind,
+  });
+
+  const searchResults = useFuzzySearch(skills ?? [], searchQuery);
+
+  const tabCounts = useMemo(() => ({
+    all: searchResults.length,
+    active: searchResults.filter((s) => s.state === 'active').length,
+    draft: searchResults.filter((s) => s.state === 'draft').length,
+    disabled: searchResults.filter((s) => s.state === 'disabled').length,
+  }), [searchResults]);
+
+  const displayedSkills = useMemo(() => {
+    if (activeTab === 'all') return searchResults;
+    return searchResults.filter((s) => s.state === activeTab);
+  }, [searchResults, activeTab]);
+
+  // Apply the provenance isolate and the usage facet on top of search + tab
+  // filtering, so empty states and the grid see a coherent set. The usage
+  // facet keeps only active skills with zero recorded calls, and applies only
+  // when usage data is available (a stale ?usage on an unavailable endpoint is
+  // inert rather than hiding everything).
+  const visibleSkills = useMemo(() => {
+    let result = displayedSkills;
+    if (groupMode === 'source' && activeSource) {
+      result = result.filter((s) => {
+        const src = sourceMap.get(s.name);
+        return activeSource === 'local' ? !src : src?.name === activeSource;
+      });
+    }
+    if (usageFilterActive) {
+      result = result.filter((s) => s.state === 'active' && isUnused(s.name));
+    }
+    if (staleFilterActive) {
+      result = result.filter((s) => s.state === 'active' && isStale(s.name));
+    }
+    return result;
+  }, [displayedSkills, groupMode, activeSource, sourceMap, usageFilterActive, isUnused, staleFilterActive, isStale]);
+
+  // Sort a copy of the visible set (never mutate the source). LibraryGrid
+  // buckets in array order, so sorting here also orders within each group;
+  // group order itself is decided by the grid and unaffected.
+  const sortedSkills = useMemo(() => {
+    const byName = (a: AgentSkill, b: AgentSkill) => a.name.localeCompare(b.name);
+    const copy = [...visibleSkills];
+    if (sortMode === 'state') {
+      const order: Record<ItemState, number> = { active: 0, draft: 1, disabled: 2 };
+      return copy.sort((a, b) => order[a.state] - order[b.state] || byName(a, b));
+    }
+    if (sortMode === 'files') {
+      return copy.sort((a, b) => b.fileCount - a.fileCount || byName(a, b));
+    }
+    if (sortMode === 'usage') {
+      // Most recently used first, then by call count, then by name. A missing
+      // timestamp or count sorts as zero, so never-used skills sink to the end.
+      const lastMs = (name: string) => {
+        const t = usageMap?.get(name)?.lastCalledAt;
+        const ms = t ? Date.parse(t) : 0;
+        return Number.isNaN(ms) ? 0 : ms;
+      };
+      const calls = (name: string) => usageMap?.get(name)?.calls ?? 0;
+      return copy.sort(
+        (a, b) => lastMs(b.name) - lastMs(a.name) || calls(b.name) - calls(a.name) || byName(a, b),
+      );
+    }
+    return copy.sort(byName);
+  }, [visibleSkills, sortMode, usageMap]);
+
+  // "Never used" KPI count: active skills with zero recorded calls, computed
+  // within the search results (search-aware, like the state KPIs). null means
+  // "not knowable" — either usage is unavailable (the KPI is omitted entirely)
+  // or the window is cold (the KPI renders disabled, without a number, rather
+  // than asserting a count it cannot stand behind).
+  const neverUsedCount = useMemo(() => {
+    if (!usageAvailable || usageCold) return null;
+    return searchResults.filter((s) => s.state === 'active' && isUnused(s.name)).length;
+  }, [usageAvailable, usageCold, searchResults, isUnused]);
+
+  // "Stale" count, under the same nullable contract. null whenever the window
+  // is cold or longer than the tracking period, both captured by staleUnknown.
+  const staleCount = useMemo(() => {
+    if (!usageAvailable || staleUnknown !== null) return null;
+    return searchResults.filter((s) => s.state === 'active' && isStale(s.name)).length;
+  }, [usageAvailable, staleUnknown, searchResults, isStale]);
+
+  // Reconcile the selection against the live skill set so a skill deleted out
+  // from under the selection never lands in a bulk request (which would reject
+  // the whole batch).
+  const existingNames = useMemo(() => new Set((skills ?? []).map((s) => s.name)), [skills]);
+  const liveSelected = useMemo(
+    () => Array.from(selectedNames).filter((n) => existingNames.has(n)),
+    [selectedNames, existingNames],
+  );
+  const allSelected = sortedSkills.length > 0 && sortedSkills.every((s) => selectedNames.has(s.name));
+  const someSelected = sortedSkills.some((s) => selectedNames.has(s.name)) && !allSelected;
+  const selectAllVisible = useCallback(
+    () => setSelectedNames(new Set(sortedSkills.map((s) => s.name))),
+    [sortedSkills],
+  );
+
+  const handleBulkState = useCallback(async (state: 'active' | 'disabled') => {
+    if (state === 'disabled') setConfirmBulkDisable(false);
+    if (liveSelected.length === 0) return;
+    try {
+      await setRegistrySkillsBatch(liveSelected.map((name) => ({ name, state })));
+      const n = liveSelected.length;
+      showToast('success', `${n} skill${n === 1 ? '' : 's'} ${state === 'active' ? 'enabled' : 'disabled'}`);
+      clearSelection();
+      refreshRegistry();
+    } catch (err) {
+      showToast('error', err instanceof Error ? err.message : 'Bulk update failed');
+    }
+  }, [liveSelected, clearSelection, refreshRegistry]);
+
+  const handleBulkDelete = useCallback(async () => {
+    setConfirmBulkDelete(false);
+    if (liveSelected.length === 0) return;
+    const results = await Promise.allSettled(liveSelected.map((name) => deleteRegistrySkill(name)));
+    const ok = results.filter((r) => r.status === 'fulfilled').length;
+    showToast(ok === liveSelected.length ? 'success' : 'error', `Deleted ${ok} of ${liveSelected.length} skills`);
+    clearSelection();
+    refreshRegistry();
+  }, [liveSelected, clearSelection, refreshRegistry]);
+
+  // Human-readable label for the active source isolate, shown in its facet chip.
+  const activeSourceLabel = useMemo(() => {
+    if (!activeSource) return null;
+    if (activeSource === 'local') return 'My Skills';
+    const src = (sources ?? []).find((s) => s.name === activeSource);
+    const info = src ? extractRepoInfo(src.repo) : null;
+    return info ? `${info.owner}/${info.repo}` : activeSource;
+  }, [activeSource, sources]);
+
+  // Inspector state, derived from the in-store skills (no per-skill fetch). An
+  // unknown ?selected= simply yields null → the panel's empty state.
+  const selectedSkillObj = useMemo(
+    () => (selectedName ? (skills ?? []).find((s) => s.name === selectedName) ?? null : null),
+    [selectedName, skills],
+  );
+
+  // Other skills sharing the selected skill's category, for the inspector's
+  // "Related skills" list. A skill with no category has no siblings to show.
+  const relatedSkills = useMemo(() => {
+    if (!selectedSkillObj) return [];
+    const key = skillCategory(selectedSkillObj.dir, selectedSkillObj.metadata);
+    if (!key) return [];
+    return (skills ?? []).filter(
+      (s) => s.name !== selectedSkillObj.name && skillCategory(s.dir, s.metadata) === key,
+    );
+  }, [selectedSkillObj, skills]);
+
+  // The Agents segment is its own self-contained tree (data, header, KPI
+  // strip, inspector). Returned after every hook above has run, so the
+  // hook order stays identical across kind switches.
+  if (kind === 'agent') {
+    return <AgentsWorkspace onKindChange={setKind} />;
+  }
+  if (kind === 'pack') {
+    return <PacksWorkspace onKindChange={setKind} />;
+  }
+
+  const inspector = (
+    <SkillDetailPanel
+      skill={selectedSkillObj}
+      source={selectedSkillObj ? sourceMap.get(selectedSkillObj.name) : undefined}
+      relatedSkills={relatedSkills}
+      usageTracked={usageAvailable}
+      usage={selectedSkillObj ? usageMap?.get(selectedSkillObj.name) : undefined}
+      observedSince={observedSince}
+      onClose={() => setSelectedName(null)}
+      onEdit={(s) => { setEditingSkill(s); setShowEditor(true); }}
+      onToggle={(s) => (s.state === 'active' ? handleDisable(s) : handleEnable(s))}
+      onDelete={(s) => setConfirmDelete(s.name)}
+      onSelectRelated={(name) => setSelectedName(name)}
+      onRefresh={refreshAll}
+      onOpenPinDrift={(name) => navigate(skillPinsUrl(name, 'drift'))}
+    />
+  );
+
+  return (
+    <div className="absolute inset-0 flex flex-col bg-background text-text-primary overflow-hidden">
+      <WorkspaceShell
+        workspace="library"
+        defaultRightPct={30}
+        minRightPx={300}
+        right={inspector}
+      >
+        <main className="flex flex-col h-full overflow-hidden">
+          <LibraryHeader
+            kindSwitch={<LibraryKindSwitch kind="skill" onChange={setKind} />}
+            onNewSkill={handleNewSkill}
+            onImportSkill={handleImportSkill}
+            onGlobalContext={() => setShowGlobalContext(true)}
+            onRefresh={refreshRegistry}
+            onSync={handleSyncAll}
+            sources={sources ?? []}
+            syncing={syncing}
+            onPopout={handlePopout}
+            counts={tabCounts}
+            activeTab={activeTab}
+            onSelectFilter={setActiveTab}
+            usageTracked={usageAvailable}
+            neverUsedCount={neverUsedCount}
+            coldCaveat={coldCaveat}
+            usageFilterActive={usageFilterActive}
+            onToggleNeverUsed={toggleNeverUsed}
+            staleCount={staleCount}
+            staleUnknownReason={staleUnknown}
+            staleFilterActive={staleFilterActive}
+            onToggleStale={toggleStale}
+            compact={compact}
+          />
+
+          {/* Search + Filter bar */}
+          <div className="px-4 pt-3 pb-2.5 bg-surface/60 backdrop-blur-sm border-b border-border/40 flex flex-col gap-2 flex-shrink-0">
+            <div className="relative">
+              <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted/50 pointer-events-none" />
+              <input
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Search skills…"
+                aria-label="Filter skills"
+                className="w-full bg-background/60 border border-border/40 rounded-lg pl-9 pr-8 py-2 text-sm text-text-primary placeholder:text-text-muted/40 focus:outline-none focus:border-primary/50 transition-colors"
+              />
+              {searchQuery && (
+                <button
+                  onClick={() => setSearchQuery('')}
+                  aria-label="Clear search"
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-surface-highlight transition-colors"
+                >
+                  <X size={13} className="text-text-muted" />
+                </button>
+              )}
+            </div>
+
+            {/* Controls row: sort axis (always), then view controls, plus the
+                grouping axis in cards view when sources exist. */}
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <div className="flex items-center gap-3 flex-wrap">
+                <SortControl mode={sortMode} onChange={setSortMode} usageAvailable={usageAvailable} />
+                {/* Only meaningful while a stale question is on screen. */}
+                {usageAvailable && <WindowControl window={auditWindow} onChange={setAuditWindow} />}
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                {hasSources && viewMode === 'cards' && (
+                  <GroupByControl mode={groupMode} onChange={setGroupMode} hasCategories={hasCategories} />
+                )}
+                <ViewToggle mode={viewMode} onChange={setViewMode} />
+                <IconButton
+                  icon={SquareCheck}
+                  onClick={() => setLibraryPrefs({ selectMode: !selectMode })}
+                  tooltip={selectMode ? 'Hide selection checkboxes' : 'Show selection checkboxes'}
+                  pressed={selectMode}
+                  size="sm"
+                  variant={selectMode ? 'default' : 'ghost'}
+                />
+                <IconButton
+                  icon={AlignJustify}
+                  onClick={() => toggleCompact('library')}
+                  tooltip={compact ? 'Comfortable rows' : 'Compact rows'}
+                  size="sm"
+                  variant={compact ? 'default' : 'ghost'}
+                />
+              </div>
+            </div>
+
+            <FacetChips
+              searchQuery={searchQuery}
+              activeTab={activeTab}
+              sortMode={sortMode}
+              sourceLabel={groupMode === 'source' ? activeSourceLabel : null}
+              usageUnused={usageFilterActive}
+              usageStale={staleFilterActive ? windowLabel : null}
+              onClearSearch={() => setSearchQuery('')}
+              onClearState={() => setActiveTab('all')}
+              onClearSource={() => setActiveSource(null)}
+              onClearSort={() => setSortMode('name')}
+              onClearUsage={() => setUsageFilter(null)}
+              onClearAll={clearAllFacets}
+            />
+          </div>
+
+          {liveSelected.length > 0 && (
+            <BulkActionBar
+              count={liveSelected.length}
+              allSelected={allSelected}
+              onSelectAll={selectAllVisible}
+              onEnable={() => handleBulkState('active')}
+              onDisable={() => setConfirmBulkDisable(true)}
+              onDelete={() => setConfirmBulkDelete(true)}
+              onClear={clearSelection}
+              caveat={coldCaveat}
+            />
+          )}
+
+          <div className="flex-1 overflow-y-auto scrollbar-dark">
+            {isLoading && (
+              <div
+                className="p-4"
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))',
+                  gap: '12px',
+                }}
+              >
+                {Array.from({ length: 8 }).map((_, i) => (
+                  <SkillCardSkeleton key={i} />
+                ))}
+              </div>
+            )}
+
+            {!isLoading && !hasSkills && (
+              <div className="h-full flex flex-col items-center justify-center text-text-muted gap-3 animate-fade-in-scale">
+                <div className="p-4 rounded-xl bg-surface-elevated/50 border border-border/30">
+                  <BookOpen size={32} className="text-text-muted/50" />
+                </div>
+                <span className="text-sm">No skills registered</span>
+                <span className="text-[10px] text-text-muted">Create a SKILL.md to get started</span>
+              </div>
+            )}
+
+            {!isLoading && hasSkills && visibleSkills.length === 0 && (
+              <div className="h-full flex flex-col items-center justify-center text-text-muted gap-3 animate-fade-in-scale p-8">
+                <div className="p-4 rounded-xl bg-surface-elevated/50 border border-border/30">
+                  <Search size={28} className="text-text-muted/50" />
+                </div>
+                <span className="text-sm text-text-secondary">
+                  No skills match{searchQuery ? ` "${searchQuery}"` : ' this filter'}
+                </span>
+                {searchQuery && (
+                  <button
+                    onClick={() => setSearchQuery('')}
+                    className="text-xs text-primary hover:text-primary/80 transition-colors underline underline-offset-2"
+                  >
+                    Clear search
+                  </button>
+                )}
+              </div>
+            )}
+
+            {!isLoading && visibleSkills.length > 0 && viewMode === 'cards' && (
+              <LibraryGrid
+                skills={sortedSkills}
+                hasSearch={searchQuery.length > 0}
+                groupMode={groupMode}
+                sourceMap={sourceMap}
+                activeSource={activeSource}
+                onIsolateSource={setActiveSource}
+                onRefresh={refreshAll}
+                onEnable={handleEnable}
+                onDisable={handleDisable}
+                onEdit={(s) => { setEditingSkill(s); setShowEditor(true); }}
+                onDelete={(s) => setConfirmDelete(s.name)}
+                onSelect={(s) => setSelectedName(s.name)}
+                activeSkillName={selectedName}
+                selectedNames={selectedNames}
+                onToggleSelect={toggleSelect}
+                selectMode={selectMode}
+              />
+            )}
+
+            {!isLoading && visibleSkills.length > 0 && viewMode === 'table' && (
+              <LibraryTable
+                skills={sortedSkills}
+                sortMode={sortMode}
+                onSort={setSortMode}
+                selectedNames={selectedNames}
+                onToggleSelect={toggleSelect}
+                onSelectAll={selectAllVisible}
+                onClearSelection={clearSelection}
+                allSelected={allSelected}
+                someSelected={someSelected}
+                onSelect={(s) => setSelectedName(s.name)}
+                activeSkillName={selectedName}
+                sourceMap={sourceMap}
+                usageMap={usageMap ?? undefined}
+                onEnable={handleEnable}
+                onDisable={handleDisable}
+                onEdit={(s) => { setEditingSkill(s); setShowEditor(true); }}
+                onDelete={(s) => setConfirmDelete(s.name)}
+                compact={compact}
+              />
+            )}
+          </div>
+        </main>
+      </WorkspaceShell>
+
+      <ConfirmDialog
+        isOpen={confirmDelete !== null}
+        onClose={() => setConfirmDelete(null)}
+        onConfirm={handleDeleteConfirm}
+        title="Delete skill"
+        message={
+          <>
+            <p>
+              Delete <span className="font-mono text-primary">{confirmDelete}</span>?
+            </p>
+            <p>This action cannot be undone.</p>
+          </>
+        }
+        confirmLabel={
+          <span>
+            Delete <span className="font-mono">"{confirmDelete}"</span>
+          </span>
+        }
+        variant="danger"
+      />
+
+      <ConfirmDialog
+        isOpen={confirmBulkDisable}
+        onClose={() => setConfirmBulkDisable(false)}
+        onConfirm={() => void handleBulkState('disabled')}
+        title="Disable skills"
+        message={
+          <>
+            <p>
+              Disable <span className="font-mono text-primary">{liveSelected.length}</span> selected{' '}
+              {liveSelected.length === 1 ? 'skill' : 'skills'}? Disabled skills stop being served to
+              clients until you enable them again.
+            </p>
+            {coldCaveat && <p className="text-status-pending">{coldCaveat}</p>}
+          </>
+        }
+        confirmLabel={
+          <span>
+            Disable {liveSelected.length} {liveSelected.length === 1 ? 'skill' : 'skills'}
+          </span>
+        }
+      />
+
+      <ConfirmDialog
+        isOpen={confirmBulkDelete}
+        onClose={() => setConfirmBulkDelete(false)}
+        onConfirm={handleBulkDelete}
+        title="Delete skills"
+        message={
+          <>
+            <p>
+              Delete <span className="font-mono text-primary">{liveSelected.length}</span> selected{' '}
+              {liveSelected.length === 1 ? 'skill' : 'skills'}?
+            </p>
+            <p>This action cannot be undone.</p>
+          </>
+        }
+        confirmLabel={
+          <span>
+            Delete {liveSelected.length} {liveSelected.length === 1 ? 'skill' : 'skills'}
+          </span>
+        }
+        variant="danger"
+      />
+
+      <SkillEditor
+        isOpen={showEditor}
+        onClose={handleEditorClose}
+        onSaved={refreshAll}
+        skill={editingSkill}
+        source={editingSkill ? sourceMap.get(editingSkill.name) : undefined}
+      />
+
+      <GlobalContextDialog
+        isOpen={showGlobalContext}
+        onClose={() => setShowGlobalContext(false)}
+      />
+
+      <DriftSyncDialog
+        isOpen={confirmSyncDrift}
+        title="Sync all sources"
+        driftedSkills={driftedAcrossSources}
+        busy={syncing}
+        onCancel={() => setConfirmSyncDrift(false)}
+        onSkip={() => void runSyncAll(false)}
+        onOverwrite={() => void runSyncAll(true)}
+      />
+
+      {syncFailures && (
+        <SyncFailuresDialog
+          failures={syncFailures}
+          onClose={() => setSyncFailures(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+const GROUP_OPTIONS: { key: GroupMode; label: string }[] = [
+  { key: 'source', label: 'Source' },
+  { key: 'category', label: 'Category' },
+  { key: 'none', label: 'None' },
+];
+
+/**
+ * Segmented control to switch the Library's grouping axis. Category is offered
+ * only when at least one skill has one; on a flat registry it would group every
+ * skill into its own section, which reads as broken rather than as "no data".
+ */
+function GroupByControl({
+  mode,
+  onChange,
+  hasCategories,
+}: {
+  mode: GroupMode;
+  onChange: (m: GroupMode) => void;
+  hasCategories: boolean;
+}) {
+  const options = hasCategories ? GROUP_OPTIONS : GROUP_OPTIONS.filter((o) => o.key !== 'category');
+  return (
+    <div className="flex items-center gap-1" role="group" aria-label="Group skills by">
+      <span className="text-[10px] uppercase tracking-wider text-text-muted/60 mr-0.5">Group</span>
+      {options.map((opt) => (
+        <button
+          key={opt.key}
+          onClick={() => onChange(opt.key)}
+          aria-pressed={mode === opt.key}
+          className={cn(
+            'px-2 py-1 rounded-md text-[11px] font-medium transition-colors',
+            mode === opt.key
+              ? 'bg-primary/10 text-primary border border-primary/25'
+              : 'text-text-muted hover:text-text-secondary hover:bg-surface-highlight border border-transparent',
+          )}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+const SORT_OPTIONS: { key: SortMode; label: string }[] = [
+  { key: 'name', label: 'Name' },
+  { key: 'state', label: 'State' },
+  { key: 'files', label: 'Files' },
+];
+
+// "Last used" sorts by usage; only offered when usage data is available.
+const USAGE_SORT_OPTION: { key: SortMode; label: string } = { key: 'usage', label: 'Last used' };
+
+const SORT_LABEL: Record<SortMode, string> = { name: 'Name', state: 'State', files: 'Files', usage: 'Last used' };
+
+/** Segmented control to switch the Library's sort axis. */
+function SortControl({ mode, onChange, usageAvailable }: { mode: SortMode; onChange: (m: SortMode) => void; usageAvailable: boolean }) {
+  const options = usageAvailable ? [...SORT_OPTIONS, USAGE_SORT_OPTION] : SORT_OPTIONS;
+  return (
+    <div className="flex items-center gap-1" role="group" aria-label="Sort skills by">
+      <span className="text-[10px] uppercase tracking-wider text-text-muted/60 mr-0.5">Sort</span>
+      {options.map((opt) => (
+        <button
+          key={opt.key}
+          onClick={() => onChange(opt.key)}
+          aria-pressed={mode === opt.key}
+          className={cn(
+            'px-2 py-1 rounded-md text-[11px] font-medium transition-colors',
+            mode === opt.key
+              ? 'bg-primary/10 text-primary border border-primary/25'
+              : 'text-text-muted hover:text-text-secondary hover:bg-surface-highlight border border-transparent',
+          )}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Lookback window for the Stale facet. Uses Tools Audit's window vocabulary
+ * verbatim so "7 days" means the same thing in both workspaces, rather than
+ * defining a second, silently-divergent set of windows.
+ */
+function WindowControl({ window, onChange }: { window: AuditWindow; onChange: (w: AuditWindow) => void }) {
+  return (
+    <div className="flex items-center gap-1" role="group" aria-label="Stale lookback window">
+      <span className="text-[10px] uppercase tracking-wider text-text-muted/60 mr-0.5">Window</span>
+      {AUDIT_WINDOWS.map((opt) => (
+        <button
+          key={opt.id}
+          onClick={() => onChange(opt.id)}
+          aria-pressed={window === opt.id}
+          className={cn(
+            'px-2 py-1 rounded-md text-[11px] font-medium transition-colors',
+            window === opt.id
+              ? 'bg-primary/10 text-primary border border-primary/25'
+              : 'text-text-muted hover:text-text-secondary hover:bg-surface-highlight border border-transparent',
+          )}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+interface FacetChipsProps {
+  searchQuery: string;
+  activeTab: FilterTab;
+  sortMode: SortMode;
+  sourceLabel: string | null;
+  usageUnused: boolean;
+  /** Window label when the stale facet is active, else null. */
+  usageStale: string | null;
+  onClearSearch: () => void;
+  onClearState: () => void;
+  onClearSource: () => void;
+  onClearSort: () => void;
+  onClearUsage: () => void;
+  onClearAll: () => void;
+}
+
+/**
+ * One strip of removable chips, a chip per active non-default facet. Each chip
+ * reads from and clears the shared URL state, so it stays in sync with the KPI
+ * cards, search box, and grouping control. Renders nothing when no facet is
+ * active. This subsumes the former standalone source-isolate chip.
+ */
+function FacetChips({
+  searchQuery,
+  activeTab,
+  sortMode,
+  sourceLabel,
+  usageUnused,
+  usageStale,
+  onClearSearch,
+  onClearState,
+  onClearSource,
+  onClearSort,
+  onClearUsage,
+  onClearAll,
+}: FacetChipsProps) {
+  const chips: { key: string; label: string; value: string; onClear: () => void }[] = [];
+  if (searchQuery.trim()) chips.push({ key: 'search', label: 'Search', value: searchQuery.trim(), onClear: onClearSearch });
+  if (activeTab !== 'all') chips.push({ key: 'state', label: 'State', value: activeTab, onClear: onClearState });
+  if (sourceLabel) chips.push({ key: 'source', label: 'Source', value: sourceLabel, onClear: onClearSource });
+  if (usageUnused) chips.push({ key: 'usage', label: 'Usage', value: 'Never used', onClear: onClearUsage });
+  if (usageStale) chips.push({ key: 'usage', label: 'Usage', value: `Stale over ${usageStale}`, onClear: onClearUsage });
+  if (sortMode !== 'name') chips.push({ key: 'sort', label: 'Sort', value: SORT_LABEL[sortMode], onClear: onClearSort });
+
+  if (chips.length === 0) return null;
+
+  return (
+    <div className="flex items-center gap-1.5 flex-wrap" role="group" aria-label="Active filters">
+      {chips.map((chip) => (
+        <button
+          key={chip.key}
+          onClick={chip.onClear}
+          aria-label={`Clear ${chip.label} filter: ${chip.value}`}
+          className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full border border-primary/25 bg-primary/10 text-primary hover:bg-primary/15 transition-colors"
+        >
+          <span className="text-text-muted">{chip.label}</span>
+          <span className="font-medium">{chip.value}</span>
+          <X size={11} />
+        </button>
+      ))}
+      {chips.length >= 2 && (
+        <button
+          onClick={onClearAll}
+          aria-label="Clear all filters"
+          className="text-[10px] px-2 py-0.5 rounded-full text-text-muted hover:text-text-secondary hover:bg-surface-highlight transition-colors"
+        >
+          Clear all
+        </button>
+      )}
+    </div>
+  );
+}
+
+const VIEW_OPTIONS: { key: 'cards' | 'table'; label: string; icon: LucideIcon }[] = [
+  { key: 'cards', label: 'Cards', icon: LayoutGrid },
+  { key: 'table', label: 'Table', icon: List },
+];
+
+/** Segmented toggle between the card grid and the table view. */
+function ViewToggle({ mode, onChange }: { mode: 'cards' | 'table'; onChange: (m: 'cards' | 'table') => void }) {
+  return (
+    <div className="flex items-center gap-1" role="group" aria-label="View mode">
+      {VIEW_OPTIONS.map(({ key, label, icon: Icon }) => (
+        <button
+          key={key}
+          onClick={() => onChange(key)}
+          aria-pressed={mode === key}
+          aria-label={`${label} view`}
+          className={cn(
+            'p-1.5 rounded-md border transition-colors',
+            mode === key
+              ? 'bg-primary/10 text-primary border-primary/25'
+              : 'text-text-muted hover:text-text-secondary hover:bg-surface-highlight border-transparent',
+          )}
+        >
+          <Icon size={13} />
+        </button>
+      ))}
+    </div>
+  );
+}
+
+interface BulkActionBarProps {
+  count: number;
+  allSelected: boolean;
+  onSelectAll: () => void;
+  onEnable: () => void;
+  onDisable: () => void;
+  onDelete: () => void;
+  onClear: () => void;
+  /** Tracking-window caveat shown before the state actions, or null when warm. */
+  caveat?: string | null;
+}
+
+/**
+ * Contextual bar shown while a multi-selection is active. The count is an
+ * aria-live region so bulk results are announced. Disable and delete are both
+ * confirmed upstream via ConfirmDialog. While the usage window is cold the bar
+ * carries the caveat inline, so a selection made from "Never used" says why the
+ * set may be wrong before the user acts on it (mirrors FleetActions).
+ */
+function BulkActionBar({ count, allSelected, onSelectAll, onEnable, onDisable, onDelete, onClear, caveat }: BulkActionBarProps) {
+  return (
+    <div
+      role="region"
+      aria-label="Bulk actions"
+      className="flex items-center gap-2 flex-wrap px-4 py-2 bg-primary/[0.06] border-b border-primary/20 flex-shrink-0"
+    >
+      <span aria-live="polite" className="text-xs font-medium text-text-secondary">
+        {count} selected
+      </span>
+      {!allSelected && (
+        <button onClick={onSelectAll} className="text-[11px] text-text-muted hover:text-text-secondary transition-colors">
+          Select all
+        </button>
+      )}
+      {/* Full-width row so a long sentence never squeezes the actions, and
+          placed ahead of them in DOM order so it is read before the buttons. */}
+      {caveat && (
+        <span role="status" className="basis-full text-[11px] text-status-pending">
+          {caveat}
+        </span>
+      )}
+      <div className="ml-auto flex items-center gap-1.5">
+        <button
+          onClick={onEnable}
+          className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium text-emerald-400 border border-emerald-400/25 hover:bg-emerald-400/10 transition-colors"
+        >
+          <Power size={11} /> Enable
+        </button>
+        <button
+          onClick={onDisable}
+          className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium text-text-muted border border-border/40 hover:bg-surface-highlight transition-colors"
+        >
+          <PowerOff size={11} /> Disable
+        </button>
+        <button
+          onClick={onDelete}
+          className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium text-red-400 border border-red-400/25 hover:bg-red-400/10 transition-colors"
+        >
+          <Trash2 size={11} /> Delete
+        </button>
+        <button
+          onClick={onClear}
+          aria-label="Clear selection"
+          className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-text-muted border border-transparent hover:bg-surface-highlight transition-colors"
+        >
+          <X size={11} /> Clear
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
+// KPI cards double as the state filter: clicking one applies that ?filter, and
+// "Total" clears it. Counts are search-aware (they come from tabCounts),
+// matching the tab strip these cards replaced. The "Never used" KPI is a
+// separate usage axis (?usage) appended after this row in LibraryHeader, and
+// only when usage data exists.
+const KPI_METRICS: { key: FilterTab; label: string; dot: ItemState | null }[] = [
+  { key: 'all', label: 'Total', dot: null },
+  { key: 'active', label: 'Active', dot: 'active' },
+  { key: 'draft', label: 'Draft', dot: 'draft' },
+  { key: 'disabled', label: 'Disabled', dot: 'disabled' },
+];
+
+interface LibraryHeaderProps {
+  /** The Skills | Agents segment control, standing in the eyebrow slot. */
+  kindSwitch: React.ReactNode;
+  onNewSkill: () => void;
+  onImportSkill: () => void;
+  onGlobalContext: () => void;
+  onRefresh: () => void;
+  onSync: () => void;
+  sources: SkillSourceStatus[];
+  syncing: boolean;
+  onPopout: () => void;
+  counts: Record<FilterTab, number>;
+  activeTab: FilterTab;
+  onSelectFilter: (tab: FilterTab) => void;
+  // "Never used" is a usage-data KPI on a separate axis from the state filter.
+  // It renders only when the usage endpoint is available (`usageTracked`), so
+  // the row carries no zero-state noise on a gateway without an accumulator.
+  usageTracked: boolean;
+  // null while the tracking window is too young to support the claim; the card
+  // then shows a dash and goes inert rather than counting the whole catalog.
+  neverUsedCount: number | null;
+  // Why the count is withheld, shown on hover of the inert card.
+  coldCaveat: string | null;
+  usageFilterActive: boolean;
+  onToggleNeverUsed: () => void;
+  // "Stale" is the second usage axis: used once, but not inside the selected
+  // window. null under the same nullable-count contract as never-used.
+  staleCount: number | null;
+  staleUnknownReason: string | null;
+  staleFilterActive: boolean;
+  onToggleStale: () => void;
+  compact: boolean;
+}
+
+function LibraryHeader({ kindSwitch, onNewSkill, onImportSkill, onGlobalContext, onRefresh, onSync, sources, syncing, onPopout, counts, activeTab, onSelectFilter, usageTracked, neverUsedCount, coldCaveat, usageFilterActive, onToggleNeverUsed, staleCount, staleUnknownReason, staleFilterActive, onToggleStale, compact }: LibraryHeaderProps) {
+  const registryDetached = useUIStore((s) => s.registryDetached);
+  const hasSources = sources.length > 0;
+  const updateCount = sources.filter((s) => s.updateAvailable).length;
+  return (
+    <header className={cn(
+      'flex-shrink-0 bg-surface/30 backdrop-blur-sm border-b border-border-subtle px-6 flex flex-col gap-2',
+      compact ? 'py-2' : 'py-3',
+    )}>
+      <div className="flex items-center justify-between gap-3">
+        {/* The kind segment stands where the static "library" eyebrow label
+            used to: the header is already five actions wide, and this is the
+            sole discovery mechanism for the Agents catalog. */}
+        {kindSwitch}
+        <div className="flex items-center gap-2">
+          {/* One shared treatment for the three header actions (the
+              secondary outline Import always had): uniform color, padding,
+              and nowrap so no label ever two-lines and heights stay equal.
+              The stateful Sync pill keeps its distinct alert styling. */}
+          <button
+            onClick={onNewSkill}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium whitespace-nowrap text-secondary hover:text-secondary/80 border border-secondary/25 hover:bg-secondary/10 rounded-lg transition-colors"
+          >
+            <Plus size={12} /> New Skill
+          </button>
+          {/* Adding a git source belongs where sources are managed. Opens the
+              same import wizard the registry sidebar does, skipping the
+              generic resource-type step. */}
+          <button
+            onClick={onImportSkill}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium whitespace-nowrap text-secondary hover:text-secondary/80 border border-secondary/25 hover:bg-secondary/10 rounded-lg transition-colors"
+            title="Import skills from a git repository"
+          >
+            <Download size={12} /> Import
+          </button>
+          <button
+            onClick={onGlobalContext}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium whitespace-nowrap text-secondary hover:text-secondary/80 border border-secondary/25 hover:bg-secondary/10 rounded-lg transition-colors"
+            title="Manage the global context (single file or rule fragments) synced to linked clients"
+          >
+            <Globe size={12} /> Global Context
+          </button>
+          <SyncSourcesButton
+            hasSources={hasSources}
+            updateCount={updateCount}
+            syncing={syncing}
+            onClick={onSync}
+          />
+          <IconButton icon={RefreshCw} onClick={onRefresh} tooltip="Refresh" size="sm" variant="ghost" />
+          <PopoutButton onClick={onPopout} disabled={registryDetached} tooltip="Open in new window" />
+        </div>
+      </div>
+
+      {/* KPI summary cards — the first-class dashboard signal, and the primary
+          state filter. They replace the old tab strip, so the URL contract
+          (?filter) and selected-state live in exactly one place. */}
+      <div className="flex items-center gap-1.5 flex-wrap" role="group" aria-label="Filter skills by state and usage">
+        {KPI_METRICS.map((metric) => (
+          <KpiCard
+            key={metric.key}
+            label={metric.label}
+            count={counts[metric.key]}
+            dot={metric.dot}
+            active={activeTab === metric.key}
+            compact={compact}
+            onClick={() => onSelectFilter(metric.key)}
+          />
+        ))}
+        {/* "Never used" is a reserved slot that renders only when usage data
+            exists. It toggles the ?usage=unused facet rather than ?filter.
+            A null count keeps the slot but withholds the number. */}
+        {usageTracked && (
+          <>
+            <KpiCard
+              label="Never used"
+              count={neverUsedCount}
+              dot={null}
+              active={usageFilterActive}
+              compact={compact}
+              onClick={onToggleNeverUsed}
+              unknownReason={coldCaveat}
+            />
+            <KpiCard
+              label="Stale"
+              count={staleCount}
+              dot={null}
+              active={staleFilterActive}
+              compact={compact}
+              onClick={onToggleStale}
+              unknownReason={staleUnknownReason}
+            />
+          </>
+        )}
+      </div>
+    </header>
+  );
+}
+
+interface KpiCardProps {
+  label: string;
+  /** null means "not knowable yet"; the card shows a dash and goes inert. */
+  count: number | null;
+  dot: ItemState | null;
+  active: boolean;
+  compact: boolean;
+  onClick: () => void;
+  /** Explanation for a null count, surfaced on hover and to assistive tech. */
+  unknownReason?: string | null;
+}
+
+function KpiCard({ label, count, dot, active, compact, onClick, unknownReason }: KpiCardProps) {
+  // A null count is a claim the card cannot make, so it renders no number and
+  // stops being a filter. The label alone carries the accessible name; folding
+  // a placeholder into it would announce "Never used (dash)".
+  const unknown = count === null;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={unknown}
+      aria-pressed={unknown ? undefined : active}
+      aria-label={unknown ? label : `${label} (${count})`}
+      title={unknown ? unknownReason ?? undefined : undefined}
+      className={cn(
+        'flex flex-col items-start rounded-lg border transition-colors text-left min-w-[60px]',
+        compact ? 'px-2.5 py-1' : 'px-3 py-1.5',
+        unknown
+          ? 'bg-background/20 border-border/30 opacity-60 cursor-not-allowed'
+          : active
+            ? 'bg-primary/10 border-primary/30'
+            : 'bg-background/40 border-border/40 hover:border-border hover:bg-surface-highlight',
+      )}
+    >
+      <span className="flex items-center gap-1.5">
+        {/* Secondary, aria-hidden cue: every KPI is conveyed by its text label
+            and count, so the row never relies on color alone. */}
+        {dot && (
+          <span aria-hidden="true" className={cn('inline-block w-1.5 h-1.5 rounded-full flex-shrink-0', stateDotClasses[dot])} />
+        )}
+        <span className={cn(
+          'text-[10px] uppercase tracking-wider font-medium',
+          active && !unknown ? 'text-primary' : 'text-text-muted',
+        )}>
+          {label}
+        </span>
+      </span>
+      <span
+        aria-hidden={unknown ? 'true' : undefined}
+        className={cn(
+          'font-mono leading-none mt-0.5',
+          compact ? 'text-xs' : 'text-sm',
+          active && !unknown ? 'text-primary' : 'text-text-secondary',
+        )}
+      >
+        {unknown ? '–' : count}
+      </span>
+    </button>
+  );
+}
+
+interface SyncSourcesButtonProps {
+  hasSources: boolean;
+  updateCount: number;
+  syncing: boolean;
+  onClick: () => void;
+}
+
+/**
+ * Workspace-level "Sync sources" affordance. Three states:
+ * - hidden when no imported sources exist (feature is dormant)
+ * - brand pill "Sync sources (N updates)" when any source has updateAvailable
+ * - low-emphasis IconButton otherwise (lets users force a sync anyway)
+ *
+ * During sync the button disables and the label morphs inside an aria-live
+ * region so screen readers announce the in-flight state. `CloudDownload`
+ * differentiates the sync action from the local Refresh button (which uses
+ * `RefreshCw`, matching the global Header convention).
+ */
+function SyncSourcesButton({ hasSources, updateCount, syncing, onClick }: SyncSourcesButtonProps) {
+  if (!hasSources) return null;
+
+  const hasUpdates = updateCount > 0;
+  const ariaLabel = syncing
+    ? 'Syncing skill sources'
+    : hasUpdates
+      ? `Sync sources, ${updateCount} ${updateCount === 1 ? 'update' : 'updates'} available`
+      : 'Sync sources from git';
+
+  if (hasUpdates) {
+    // Pill mirrors the per-source pill in SourceGroupHeader so the two
+    // affordances read as the same family. Brand tokens rather than the warning
+    // family: an available update is informational and optional, matching the
+    // "N updates" pill in RegistrySidebar.
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={syncing}
+        aria-label={ariaLabel}
+        aria-busy={syncing}
+        title={ariaLabel}
+        className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 whitespace-nowrap rounded-lg border border-primary/30 bg-primary/10 text-primary hover:bg-primary/20 transition-colors disabled:opacity-60"
+      >
+        <CloudDownload size={12} aria-hidden="true" className={syncing ? 'animate-pulse' : undefined} />
+        <span aria-live="polite">
+          {syncing ? 'Syncing…' : `Sync sources (${updateCount} update${updateCount === 1 ? '' : 's'})`}
+        </span>
+      </button>
+    );
+  }
+
+  // No pending updates: a quiet IconButton lets users force a sync without
+  // the chrome implying anything is wrong. The aria-label morph carries the
+  // in-flight announcement; no separate live region is needed.
+  return (
+    <IconButton
+      icon={CloudDownload}
+      onClick={onClick}
+      disabled={syncing}
+      tooltip={ariaLabel}
+      size="sm"
+      variant="ghost"
+      className={syncing ? 'animate-pulse' : undefined}
+    />
+  );
+}
+
+interface SyncFailuresDialogProps {
+  failures: SourceSyncResult[];
+  onClose: () => void;
+}
+
+/**
+ * Listing of per-source failures from a bulk sync, opened from the toast's
+ * "Details" action. Wraps the shared Modal so focus trap, Escape, and panel
+ * chrome stay consistent with every other dialog in the app. The backend's
+ * error message is rendered verbatim so users can act on auth failures,
+ * missing repos, etc.
+ */
+function SyncFailuresDialog({ failures, onClose }: SyncFailuresDialogProps) {
+  return (
+    <Modal isOpen onClose={onClose} title="Sync failures">
+      <ul className="space-y-3">
+        {failures.map((src) => {
+          const skillErrors = (src.skills ?? []).filter((k) => k.error);
+          return (
+            <li key={src.name} className="border border-border/30 rounded-md p-3">
+              <div className="text-xs font-mono text-text-secondary mb-1.5">{src.name}</div>
+              {src.error && (
+                <div className="text-xs text-status-error whitespace-pre-wrap">{src.error}</div>
+              )}
+              {skillErrors.length > 0 && (
+                <ul className="space-y-1 mt-1">
+                  {skillErrors.map((sk) => (
+                    <li key={sk.skill} className="text-xs">
+                      <span className="text-text-muted">{sk.skill}:</span>{' '}
+                      <span className="text-status-error whitespace-pre-wrap">{sk.error}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </Modal>
+  );
+}
+
+export default LibraryWorkspace;

@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "needs_attention": true,
+  "projections": [
+  {
+  "kind": "skill",
+  "skill": "alpha",
+  "client": "antigravity",
+  "channel": "copy",
+  "target": "$HOME/.gemini/config/skills/alpha",
+  "render": "identity",
+  "state": "drifted",
+  "unofficial": true,
+  "synced_at": "<TS>"
+  },
+  {
+  "kind": "skill",
+  "skill": "alpha",
+  "client": "claude-code",
+  "channel": "symlink",
+  "target": "$HOME/.claude/skills/alpha",
+  "render": "identity",
+  "state": "in-sync",
+  "synced_at": "<TS>"
+  },
+  {
+  "kind": "skill",
+  "skill": "beta",
+  "client": "antigravity",
+  "channel": "copy",
+  "target": "$HOME/.gemini/config/skills/beta",
+  "render": "identity",
+  "state": "stale",
+  "unofficial": true,
+  "synced_at": "<TS>"
+  }
+  ]
+}

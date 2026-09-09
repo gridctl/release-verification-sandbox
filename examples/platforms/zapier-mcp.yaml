@@ -1,0 +1,34 @@
+# Zapier MCP Server Example
+#
+# This stack provides access to Zapier's MCP server, enabling AI agents to
+# interact with 8,000+ apps through Zapier's automation platform.
+#
+# Prerequisites:
+#   - A Zapier account (free plan or higher)
+#   - A Zapier MCP server configured at https://mcp.zapier.com
+#
+# Setup:
+#   1. Visit https://mcp.zapier.com and create a new MCP server
+#   2. Add the tools/actions you want (e.g., Gmail, Slack, Google Calendar)
+#   3. Authorize once with 'gridctl auth login zapier' after apply
+#
+# Usage:
+#   gridctl apply examples/platforms/zapier-mcp.yaml
+#   gridctl auth login zapier
+#
+# Note:
+#   gridctl brokers the OAuth flow natively: the server deploys in a
+#   "needs auth" state, one browser authorization activates it, and tokens
+#   are stored encrypted and refreshed automatically.
+#
+# Reference:
+#   https://zapier.com/mcp
+
+version: "1"
+name: zapier-mcp
+
+mcp-servers:
+  - name: zapier
+    url: https://mcp.zapier.com/api/v1/connect
+    auth:
+      type: oauth

@@ -1,0 +1,352 @@
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import {
+  Library,
+  BookOpen,
+  Plus,
+  RefreshCw,
+  Search,
+  X,
+} from 'lucide-react';
+import { cn } from '../lib/cn';
+import { IconButton } from '../components/ui/IconButton';
+import { ZoomControls } from '../components/ui/ZoomControls';
+import { SkillEditor } from '../components/registry/SkillEditor';
+import { SkillCardSkeleton } from '../components/registry/SkillCardSkeleton';
+import { LibraryGrid } from '../components/registry/LibraryGrid';
+import { ConfirmDialog } from '../components/ui/ConfirmDialog';
+import { ToastContainer, showToast } from '../components/ui/Toast';
+import { useDetachedWindowSync } from '../hooks/useBroadcastChannel';
+import { useLogFontSize } from '../hooks/useLogFontSize';
+import { useFuzzySearch } from '../hooks/useFuzzySearch';
+import {
+  fetchRegistryStatus,
+  fetchRegistrySkills,
+  deleteRegistrySkill,
+  activateRegistrySkill,
+  disableRegistrySkill,
+} from '../lib/api';
+import { POLLING } from '../lib/constants';
+import type { AgentSkill, RegistryStatus, ItemState } from '../types';
+import { ErrorBoundary } from '../components/ui/ErrorBoundary';
+
+type FilterTab = 'all' | ItemState;
+
+const TABS: { key: FilterTab; label: string }[] = [
+  { key: 'all', label: 'All' },
+  { key: 'active', label: 'Active' },
+  { key: 'draft', label: 'Draft' },
+  { key: 'disabled', label: 'Disabled' },
+];
+
+function DetachedRegistryContent() {
+  const [skills, setSkills] = useState<AgentSkill[] | null>(null);
+  const [status, setStatus] = useState<RegistryStatus | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [activeTab, setActiveTab] = useState<FilterTab>('all');
+
+  // Editor state
+  const [showEditor, setShowEditor] = useState(false);
+  const [editingSkill, setEditingSkill] = useState<AgentSkill | undefined>();
+
+  // Delete confirmation
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+
+  // Text zoom
+  const contentRef = useRef<HTMLElement>(null);
+  const { fontSize, zoomIn, zoomOut, resetZoom, isMin, isMax, isDefault } =
+    useLogFontSize(contentRef);
+
+  // Register with main window
+  useDetachedWindowSync('registry');
+
+  const fetchData = useCallback(async () => {
+    try {
+      const [regStatus, regSkills] = await Promise.all([
+        fetchRegistryStatus(),
+        fetchRegistrySkills(),
+      ]);
+      setStatus(regStatus);
+      setSkills(regSkills);
+      setIsLoading(false);
+    } catch {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const initFetch = async () => {
+      await fetchData();
+    };
+    initFetch();
+    const interval = window.setInterval(fetchData, POLLING.STATUS);
+    return () => clearInterval(interval);
+  }, [fetchData]);
+
+  // Fuzzy search runs on all skills; tab filter narrows the result
+  const searchResults = useFuzzySearch(skills ?? [], searchQuery);
+
+  // Tab counts from the searched set so they stay in sync with the search query
+  const tabCounts = useMemo(() => ({
+    all: searchResults.length,
+    active: searchResults.filter((s) => s.state === 'active').length,
+    draft: searchResults.filter((s) => s.state === 'draft').length,
+    disabled: searchResults.filter((s) => s.state === 'disabled').length,
+  }), [searchResults]);
+
+  // Apply active tab filter on top of search results
+  const displayedSkills = useMemo(() => {
+    if (activeTab === 'all') return searchResults;
+    return searchResults.filter((s) => s.state === activeTab);
+  }, [searchResults, activeTab]);
+
+  const handleEnable = useCallback(async (skill: AgentSkill) => {
+    try {
+      await activateRegistrySkill(skill.name);
+      showToast('success', `Skill "${skill.name}" activated`);
+      fetchData();
+    } catch (err) {
+      showToast('error', err instanceof Error ? err.message : 'State change failed');
+    }
+  }, [fetchData]);
+
+  const handleDisable = useCallback(async (skill: AgentSkill) => {
+    try {
+      await disableRegistrySkill(skill.name);
+      showToast('success', `Skill "${skill.name}" disabled`);
+      fetchData();
+    } catch (err) {
+      showToast('error', err instanceof Error ? err.message : 'State change failed');
+    }
+  }, [fetchData]);
+
+  const handleDeleteConfirm = useCallback(async () => {
+    if (!confirmDelete) return;
+    try {
+      await deleteRegistrySkill(confirmDelete);
+      showToast('success', 'Skill deleted');
+      fetchData();
+    } catch (err) {
+      showToast('error', err instanceof Error ? err.message : 'Delete failed');
+    } finally {
+      setConfirmDelete(null);
+    }
+  }, [confirmDelete, fetchData]);
+
+  const hasSkills = (skills ?? []).length > 0;
+
+  return (
+    <div className="h-screen w-screen bg-background flex flex-col overflow-hidden relative">
+      {/* Background grain */}
+      <div
+        className="fixed inset-0 pointer-events-none z-0 opacity-[0.015]"
+        style={{
+          backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E")`,
+        }}
+      />
+
+      {/* Header */}
+      <header className="h-12 flex-shrink-0 bg-surface/90 backdrop-blur-xl border-b border-border/50 flex items-center justify-between px-4 z-10 relative">
+        <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-primary/30 to-transparent" />
+
+        <div className="flex items-center gap-3">
+          <div className="p-1.5 rounded-lg bg-primary/10 border border-primary/20">
+            <Library size={14} className="text-primary" />
+          </div>
+          <div>
+            <span className="text-sm font-semibold text-text-primary tracking-tight">Library</span>
+            <span className="text-[10px] text-text-muted uppercase tracking-wider ml-2">Agent Skills</span>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <ZoomControls
+            fontSize={fontSize}
+            onZoomIn={zoomIn}
+            onZoomOut={zoomOut}
+            onReset={resetZoom}
+            isMin={isMin}
+            isMax={isMax}
+            isDefault={isDefault}
+          />
+          <button
+            onClick={() => { setEditingSkill(undefined); setShowEditor(true); }}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-primary hover:text-primary/80 bg-primary/10 hover:bg-primary/15 border border-primary/20 rounded-lg transition-colors"
+          >
+            <Plus size={12} /> New Skill
+          </button>
+          <IconButton icon={RefreshCw} onClick={fetchData} tooltip="Refresh" size="sm" variant="ghost" />
+        </div>
+      </header>
+
+      {/* Search + Filter bar */}
+      <div className="px-4 pt-3 pb-2.5 bg-surface/60 backdrop-blur-sm border-b border-border/40 flex flex-col gap-2 z-10 flex-shrink-0">
+        {/* Search input */}
+        <div className="relative">
+          <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted/50 pointer-events-none" />
+          <input
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Search skills…"
+            aria-label="Filter skills"
+            className="w-full bg-background/60 border border-border/40 rounded-lg pl-9 pr-8 py-2 text-sm text-text-primary placeholder:text-text-muted/40 focus:outline-none focus:border-primary/50 transition-colors"
+          />
+          {searchQuery && (
+            <button
+              onClick={() => setSearchQuery('')}
+              className="absolute right-2.5 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-surface-highlight transition-colors"
+            >
+              <X size={13} className="text-text-muted" />
+            </button>
+          )}
+        </div>
+
+        {/* Filter tabs */}
+        <div className="flex gap-1 flex-wrap">
+          {TABS.map((tab) => (
+            <button
+              key={tab.key}
+              onClick={() => setActiveTab(tab.key)}
+              className={cn(
+                'flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium transition-colors',
+                activeTab === tab.key
+                  ? 'bg-primary/10 text-primary border border-primary/25'
+                  : 'text-text-muted hover:text-text-secondary hover:bg-surface-highlight border border-transparent',
+              )}
+            >
+              {tab.label}
+              <span
+                className={cn(
+                  'text-[10px] px-1.5 py-0 rounded-full font-mono min-w-[18px] text-center transition-colors',
+                  activeTab === tab.key
+                    ? 'bg-primary/15 text-primary'
+                    : 'bg-surface-highlight text-text-muted',
+                )}
+              >
+                {tabCounts[tab.key]}
+              </span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Content */}
+      <main
+        ref={contentRef}
+        className="flex-1 overflow-y-auto scrollbar-dark relative z-10"
+        style={{ '--log-font-size': `${fontSize}px` } as React.CSSProperties}
+      >
+        {isLoading && (
+          <div
+            className="p-4"
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))',
+              gap: '12px',
+            }}
+          >
+            {Array.from({ length: 8 }).map((_, i) => (
+              <SkillCardSkeleton key={i} />
+            ))}
+          </div>
+        )}
+
+        {/* No skills at all */}
+        {!isLoading && !hasSkills && (
+          <div className="h-full flex flex-col items-center justify-center text-text-muted gap-3 animate-fade-in-scale">
+            <div className="p-4 rounded-xl bg-surface-elevated/50 border border-border/30">
+              <BookOpen size={32} className="text-text-muted/50" />
+            </div>
+            <span className="text-sm">No skills registered</span>
+            <span className="text-[10px] text-text-muted">Create a SKILL.md to get started</span>
+          </div>
+        )}
+
+        {/* Has skills but nothing matches current filter + search */}
+        {!isLoading && hasSkills && displayedSkills.length === 0 && (
+          <div className="h-full flex flex-col items-center justify-center text-text-muted gap-3 animate-fade-in-scale p-8">
+            <div className="p-4 rounded-xl bg-surface-elevated/50 border border-border/30">
+              <Search size={28} className="text-text-muted/50" />
+            </div>
+            <span className="text-sm text-text-secondary">
+              No skills match{searchQuery ? ` "${searchQuery}"` : ' this filter'}
+            </span>
+            {searchQuery && (
+              <button
+                onClick={() => setSearchQuery('')}
+                className="text-xs text-primary hover:text-primary/80 transition-colors underline underline-offset-2"
+              >
+                Clear search
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Card grid */}
+        {!isLoading && displayedSkills.length > 0 && (
+          <LibraryGrid
+            skills={displayedSkills}
+            hasSearch={searchQuery.length > 0}
+            onEnable={handleEnable}
+            onDisable={handleDisable}
+            onEdit={(s) => { setEditingSkill(s); setShowEditor(true); }}
+            onDelete={(s) => setConfirmDelete(s.name)}
+          />
+        )}
+      </main>
+
+      {/* Status footer */}
+      <footer className="h-6 flex-shrink-0 bg-surface/90 backdrop-blur-xl border-t border-border/50 flex items-center justify-between px-4 text-[10px] text-text-muted z-10">
+        <span>
+          {status ? `${status.totalSkills} total` : ''}
+          {status ? ` · ` : ''}
+          <span className="text-status-running">{status?.activeSkills ?? 0} active</span>
+        </span>
+        <span className="flex items-center gap-1">
+          <span className="w-1.5 h-1.5 rounded-full bg-text-muted animate-pulse" />
+          Detached Window
+        </span>
+      </footer>
+
+      {/* Delete confirmation */}
+      <ConfirmDialog
+        isOpen={confirmDelete !== null}
+        onClose={() => setConfirmDelete(null)}
+        onConfirm={handleDeleteConfirm}
+        title="Delete skill"
+        message={
+          <>
+            <p>
+              Delete <span className="font-mono text-primary">{confirmDelete}</span>?
+            </p>
+            <p>This action cannot be undone.</p>
+          </>
+        }
+        confirmLabel={
+          <span>
+            Delete <span className="font-mono">"{confirmDelete}"</span>
+          </span>
+        }
+        variant="danger"
+      />
+
+      {/* Editor modal */}
+      <SkillEditor
+        isOpen={showEditor}
+        onClose={() => { setShowEditor(false); setEditingSkill(undefined); }}
+        onSaved={fetchData}
+        skill={editingSkill}
+      />
+
+      <ToastContainer />
+    </div>
+  );
+}
+
+export function DetachedRegistryPage() {
+  return (
+    <ErrorBoundary variant="window">
+      <DetachedRegistryContent />
+    </ErrorBoundary>
+  );
+}

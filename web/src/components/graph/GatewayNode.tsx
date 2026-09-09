@@ -1,0 +1,193 @@
+import { memo } from 'react';
+import { Handle, Position } from '@xyflow/react';
+import { Server, Database, Wrench, Radio, Monitor, Code, Library, ExternalLink } from 'lucide-react';
+// Named import only — @lobehub/icons sets `sideEffects: false`, so Vite
+// tree-shakes this down to the MCP icon module (see lib/clientIcons.tsx).
+import { MCP } from '@lobehub/icons';
+import { cn } from '../../lib/cn';
+import { StatusDot } from '../ui/StatusDot';
+import { useWindowManager } from '../../hooks/useWindowManager';
+import type { GatewayNodeData } from '../../types';
+
+interface GatewayNodeProps {
+  data: GatewayNodeData;
+  selected?: boolean;
+}
+
+const GatewayNode = memo(({ data, selected }: GatewayNodeProps) => {
+  const { openDetachedWindow } = useWindowManager();
+
+  return (
+    <div
+      className={cn(
+        'w-60 rounded-2xl frost-surface',
+        'bg-gradient-to-b from-surface/95 via-surface/90 to-primary/[0.03]',
+        'backdrop-blur-xl border border-border',
+        'shadow-lg-bevel transition-all duration-300 ease-out',
+        selected && 'border-primary shadow-glow-primary ring-2 ring-primary/20',
+        !selected && 'hover:shadow-node-hover hover:border-primary/60'
+      )}
+    >
+      {/* Top accent gradient */}
+      <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-primary/50 to-transparent" />
+
+      {/* Header */}
+      <div className="px-4 py-3.5 flex items-center gap-3 border-b border-primary/10 bg-primary/[0.02] relative">
+        {/* Glowing logo. Liveness is signaled by the "Gateway Active" pill's
+            StatusDot ring below, so the mark itself stays static. */}
+        <div className="p-2.5 bg-gradient-to-br from-primary/20 to-primary/5 rounded-xl border border-primary/30 shadow-glow-primary">
+          <MCP size={20} className="text-primary" />
+        </div>
+        <div>
+          <h3 className="font-bold text-sm text-text-primary tracking-tight">{data.name}</h3>
+          <p className="text-[10px] text-text-muted font-mono tracking-wider">{data.version}</p>
+        </div>
+      </div>
+
+      {/* Stats Grid */}
+      <div className="p-4 space-y-3">
+        {/* MCP Servers */}
+        <div className="flex items-center justify-between group">
+          <div className="flex items-center gap-2.5">
+            <div className="p-1.5 rounded-lg bg-white/[0.04] border border-[var(--color-border-subtle)] group-hover:bg-primary/15 group-hover:border-primary/20 transition-colors">
+              <Server size={12} className="text-text-secondary group-hover:text-primary/70 transition-colors" />
+            </div>
+            <span className="text-xs text-text-secondary font-medium">MCP Servers</span>
+          </div>
+          <span className="text-sm font-bold text-text-primary tabular-nums">
+            {data.serverCount}
+          </span>
+        </div>
+
+        {/* Resources */}
+        {data.resourceCount > 0 && (
+          <div className="flex items-center justify-between group">
+            <div className="flex items-center gap-2.5">
+              <div className="p-1.5 rounded-lg bg-white/[0.04] border border-[var(--color-border-subtle)] group-hover:bg-primary/15 group-hover:border-primary/20 transition-colors">
+                <Database size={12} className="text-text-secondary group-hover:text-primary/70 transition-colors" />
+              </div>
+              <span className="text-xs text-text-secondary font-medium">Resources</span>
+            </div>
+            <span className="text-sm font-bold text-text-primary tabular-nums">
+              {data.resourceCount}
+            </span>
+          </div>
+        )}
+
+        {/* Sessions */}
+        {(data.sessions ?? 0) > 0 && (
+          <div className="flex items-center justify-between group">
+            <div className="flex items-center gap-2.5">
+              <div className="p-1.5 rounded-lg bg-white/[0.04] border border-[var(--color-border-subtle)] group-hover:bg-primary/15 group-hover:border-primary/20 transition-colors">
+                <Radio size={12} className="text-text-secondary group-hover:text-primary/70 transition-colors" />
+              </div>
+              <span className="text-xs text-text-secondary font-medium">Sessions</span>
+            </div>
+            <span className="text-sm font-bold text-text-primary tabular-nums">
+              {data.sessions}
+            </span>
+          </div>
+        )}
+
+        {/* Linked Clients */}
+        {(data.clientCount ?? 0) > 0 && (
+          <div className="flex items-center justify-between group">
+            <div className="flex items-center gap-2.5">
+              <div className="p-1.5 rounded-lg bg-white/[0.04] border border-[var(--color-border-subtle)] group-hover:bg-primary/15 group-hover:border-primary/20 transition-colors">
+                <Monitor size={12} className="text-text-secondary group-hover:text-primary/70 transition-colors" />
+              </div>
+              <span className="text-xs text-text-secondary font-medium">Clients</span>
+            </div>
+            <span className="text-sm font-bold text-text-primary tabular-nums">
+              {data.clientCount}
+            </span>
+          </div>
+        )}
+
+        {/* Tools */}
+        <div className="flex items-center justify-between group">
+          <div className="flex items-center gap-2.5">
+            <div className="p-1.5 rounded-lg bg-white/[0.04] border border-[var(--color-border-subtle)] group-hover:bg-primary/15 group-hover:border-primary/20 transition-colors">
+              <Wrench size={12} className="text-text-secondary group-hover:text-primary/70 transition-colors" />
+            </div>
+            <span className="text-xs text-text-secondary font-medium">Total Tools</span>
+          </div>
+          <span className="text-sm font-bold text-text-primary tabular-nums">
+            {data.totalToolCount}
+          </span>
+        </div>
+
+        {/* Skills (Registry) */}
+        {(data.totalSkills ?? 0) > 0 && (
+          <div
+            className="flex items-center justify-between group cursor-pointer hover:bg-primary/5 rounded-md transition-colors px-1 -mx-1"
+            onClick={(e) => { e.stopPropagation(); openDetachedWindow('registry'); }}
+            title="Open skills dashboard"
+          >
+            <div className="flex items-center gap-2.5">
+              <div className="p-1.5 rounded-lg bg-white/[0.04] border border-[var(--color-border-subtle)] group-hover:bg-primary/15 group-hover:border-primary/20 transition-colors">
+                <Library size={12} className="text-text-secondary group-hover:text-primary/70 transition-colors" />
+              </div>
+              <span className="text-xs text-text-secondary font-medium">Skills</span>
+            </div>
+            <div className="flex items-center gap-1">
+              <span className="text-sm font-bold text-text-primary tabular-nums">
+                {data.activeSkills ?? 0}<span className="text-text-muted font-normal">/{data.totalSkills}</span>
+              </span>
+              <ExternalLink size={9} className="text-text-muted opacity-0 group-hover:opacity-100 transition-opacity" />
+            </div>
+          </div>
+        )}
+
+        {/* Read-only status footer. These pills reflect gateway state and are
+            not interactive: Code Mode is configured in stack.yaml and cannot be
+            toggled at runtime, so it must not carry action chrome (hover,
+            cursor, focus ring). Grouping it beside "Gateway Active" reads them
+            both as liveness indicators rather than buttons. */}
+        <div className="flex items-center gap-2 pt-2 mt-1 border-t border-border/50">
+          <span
+            role="status"
+            className="inline-flex items-center gap-1.5 text-[10px] px-1.5 py-0.5 rounded font-medium border bg-status-running/10 border-status-running/25 text-status-running"
+          >
+            <StatusDot status="running" />
+            Gateway Active
+          </span>
+          {data.codeMode && data.codeMode !== 'off' && (
+            <span
+              role="status"
+              title="Code mode is enabled (configured in stack.yaml)"
+              className="inline-flex items-center gap-1.5 text-[10px] px-1.5 py-0.5 rounded font-medium border bg-primary/10 border-primary/20 text-primary"
+            >
+              <Code size={11} />
+              Code Mode
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Connection Handle - Left side: single input (mirrors right-side output) */}
+      <Handle
+        type="target"
+        position={Position.Left}
+        className={cn(
+          '!w-3.5 !h-3.5 !bg-primary !border-2 !border-background !rounded-full',
+          'transition-all duration-200 hover:!scale-125 hover:!shadow-glow-primary'
+        )}
+        id="input"
+      />
+      <Handle
+        type="source"
+        position={Position.Right}
+        className={cn(
+          '!w-3.5 !h-3.5 !bg-primary !border-2 !border-background !rounded-full',
+          'transition-all duration-200 hover:!scale-125 hover:!shadow-glow-primary'
+        )}
+        id="output"
+      />
+    </div>
+  );
+});
+
+GatewayNode.displayName = 'GatewayNode';
+
+export default GatewayNode;
