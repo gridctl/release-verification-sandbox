@@ -13,7 +13,7 @@ jobs:
     outputs:
       tag: ${{ steps.release.outputs.tag }}
     steps:
-    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         persist-credentials: false
     - name: Run the actual tag-bound release workflow
@@ -32,7 +32,7 @@ jobs:
       RELEASE_REF: refs/tags/${{ needs.release-acceptance.outputs.tag }}
       RELEASE_PUBLIC: 'true'
     steps:
-    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - uses: ./.github/actions/release-tools
     - run: python3 scripts/release.py download
     - run: python3 scripts/release.py verify
@@ -47,7 +47,7 @@ jobs:
       RELEASE_REF: refs/tags/${{ needs.release-acceptance.outputs.tag }}
       RELEASE_PUBLIC: 'true'
     steps:
-    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - uses: ./.github/actions/release-tools
     - run: python3 scripts/release.py download
     - run: python3 scripts/release.py verify
@@ -57,7 +57,7 @@ jobs:
     permissions:
       contents: read
     steps:
-    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - uses: ./.github/actions/release-tools
     - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_*.py'
         -v
@@ -71,7 +71,7 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       RELEASE_REF: refs/tags/${{ needs.release-acceptance.outputs.tag }}
     steps:
-    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - run: python3 scripts/release-acceptance.py order
   inventory:
     name: inventory
@@ -84,7 +84,7 @@ jobs:
       RELEASE_REF: refs/tags/${{ needs.release-acceptance.outputs.tag }}
       RELEASE_PUBLIC: 'true'
     steps:
-    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - uses: ./.github/actions/release-tools
     - run: python3 scripts/release.py download
     - run: python3 scripts/release.py verify
@@ -95,7 +95,7 @@ jobs:
     permissions:
       contents: read
     steps:
-    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - uses: ./.github/actions/release-tools
     - name: Assert missing, malformed, disabled, and enabled prerequisites
       run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_release.py
