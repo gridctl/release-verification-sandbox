@@ -120,6 +120,13 @@ def expected_assets(tag):
         "checksums.txt", "provenance.sigstore.json"]
 
 
+def check_rejection(result, markers):
+    diagnostic = (result.stdout + result.stderr).lower()
+    if result.returncode != 1 or not any(marker.lower() in diagnostic for marker in markers):
+        raise ValueError(f"expected an identity/cryptographic rejection; exit={result.returncode}; "
+                         f"{result.stdout}{result.stderr}")
+
+
 def verify(directory, tag, sha, repository, workflow, negative=False):
     check_source(f"refs/tags/{tag}", sha, sha)
     with tempfile.TemporaryDirectory(prefix="gridctl-verifier-") as clean:
@@ -139,27 +146,29 @@ def verify(directory, tag, sha, repository, workflow, negative=False):
                             "--bundle", str(bundle), *policy], env=env, check=True, timeout=180)
         if negative:
             archive = directory / archive_names(tag)[0]
-            for flag, wrong in (("--repo", "wrong/repository"),
-                                ("--cert-identity", identity.replace(workflow, ".github/workflows/wrong.yaml")),
-                                ("--source-ref", "refs/tags/v0.0.0-wrong"),
-                                ("--source-digest", "0" * 40),
-                                ("--cert-oidc-issuer", "https://wrong.example"),
-                                ("--predicate-type", "https://wrong.example/predicate")):
+            for flag, wrong, markers in (
+                ("--repo", "wrong/repository", ("expected SourceRepositoryOwnerURI", "expected SourceRepositoryURI")),
+                ("--cert-identity", identity.replace(workflow, ".github/workflows/wrong.yaml"),
+                 ("no matching certificate identity", "expected SAN")),
+                ("--source-ref", "refs/tags/v0.0.0-wrong", ("expected SourceRepositoryRef",)),
+                ("--source-digest", "0" * 40, ("expected SourceRepositoryDigest",)),
+                ("--cert-oidc-issuer", "https://wrong.example", ("expected Issuer",)),
+                ("--predicate-type", "https://wrong.example/predicate", ("no attestations found with predicate type",)),
+            ):
                 bad = list(policy)
                 bad[bad.index(flag) + 1] = wrong
                 result = subprocess.run(["gh", "attestation", "verify", str(archive),
                                          "--bundle", str(bundle), *bad], env=env,
                                         capture_output=True, text=True, timeout=180)
-                if result.returncode == 0 or "verification failed" not in (result.stdout + result.stderr).lower():
-                    raise ValueError(f"negative verification did not reject the policy mismatch: {flag}; "
-                                     f"exit={result.returncode}; {result.stdout}{result.stderr}")
+                check_rejection(result, markers)
+                print(f"Rejected mismatch {flag}: {result.stderr.strip()}")
             tampered = Path(clean) / archive.name
             tampered.write_bytes(archive.read_bytes() + b"tampered")
             result = subprocess.run(["gh", "attestation", "verify", str(tampered),
                                      "--bundle", str(bundle), *policy], env=env,
                                     capture_output=True, text=True, timeout=180)
-            if result.returncode == 0:
-                raise ValueError("tampered archive was accepted")
+            check_rejection(result, ("artifact verification failed", "no matching subject", "unable to verify artifact"))
+            print(f"Rejected tampered archive: {result.stderr.strip()}")
 
 
 def api(repository, path, method="GET", body=None, token=None):

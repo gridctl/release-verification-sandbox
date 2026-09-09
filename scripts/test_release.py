@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -18,6 +19,15 @@ SPEC.loader.exec_module(release)
 
 
 class ReleasePolicyTests(unittest.TestCase):
+    def test_rejection_diagnostic_distinguishes_infrastructure(self):
+        diagnostic = "Error: expected SourceRepositoryOwnerURI to be https://github.com/wrong, got https://github.com/gridctl"
+        markers = ("expected SourceRepositoryOwnerURI",)
+        release.check_rejection(subprocess.CompletedProcess([], 1, "", diagnostic), markers)
+        for code, error in ((0, diagnostic), (1, "network timeout"), (4, "authentication required"), (1, "")):
+            with self.subTest(code=code, error=error):
+                with self.assertRaises(ValueError):
+                    release.check_rejection(subprocess.CompletedProcess([], code, "", error), markers)
+
     def test_workflow_gate_set(self):
         import yaml
 
