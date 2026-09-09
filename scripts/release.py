@@ -132,7 +132,8 @@ def verify(directory, tag, sha, repository, workflow, negative=False):
     with tempfile.TemporaryDirectory(prefix="gridctl-verifier-") as clean:
         env = {key: value for key, value in os.environ.items()
                if key not in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")}
-        env.update(HOME=clean, GH_CONFIG_DIR=clean, XDG_CACHE_HOME=clean, GH_HOST="github.com")
+        env.update(HOME=clean, GH_CONFIG_DIR=clean, XDG_CACHE_HOME=clean, GH_HOST="github.com",
+                   GH_FORCE_TTY="120", NO_COLOR="1")
         identity = f"https://github.com/{repository}/{workflow}@refs/tags/{tag}"
         policy = ["--repo", repository, "--cert-identity", identity,
                   "--source-ref", f"refs/tags/{tag}", "--source-digest", sha,
@@ -149,7 +150,7 @@ def verify(directory, tag, sha, repository, workflow, negative=False):
             for flag, wrong, markers in (
                 ("--repo", "wrong/repository", ("expected SourceRepositoryOwnerURI", "expected SourceRepositoryURI")),
                 ("--cert-identity", identity.replace(workflow, ".github/workflows/wrong.yaml"),
-                 ("no matching certificate identity", "expected SAN")),
+                 ("no matching certificate identity", "expected SAN", "Sigstore verification failed")),
                 ("--source-ref", "refs/tags/v0.0.0-wrong", ("expected SourceRepositoryRef",)),
                 ("--source-digest", "0" * 40, ("expected SourceRepositoryDigest",)),
                 ("--cert-oidc-issuer", "https://wrong.example", ("expected Issuer",)),
@@ -167,7 +168,8 @@ def verify(directory, tag, sha, repository, workflow, negative=False):
             result = subprocess.run(["gh", "attestation", "verify", str(tampered),
                                      "--bundle", str(bundle), *policy], env=env,
                                     capture_output=True, text=True, timeout=180)
-            check_rejection(result, ("artifact verification failed", "no matching subject", "unable to verify artifact"))
+            check_rejection(result, ("artifact verification failed", "no matching subject",
+                                     "unable to verify artifact", "Sigstore verification failed"))
             print(f"Rejected tampered archive: {result.stderr.strip()}")
 
 

@@ -100,4 +100,8 @@ jobs:
     - name: Assert missing, malformed, disabled, and enabled prerequisites
       run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_release.py
         -v
-run-name: sandbox-verification-20260909T015306Z-1e7c52957887422ca4b8f1e872787f7e
+    - name: Check live immutable-mode prerequisites
+      run: python3 scripts/release-acceptance.py immutable
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+run-name: sandbox-verification-20260909T021523Z-cc9e1d46ce8341d7b85b3aa30cbff6db

@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import time
 import urllib.request
+import urllib.error
 import zipfile
 
 import release
@@ -108,7 +109,29 @@ def order():
     print(f"Draft asset assembly preceded publication at {record['published_at']}; tap commit {commit['sha']} followed")
 
 
+def immutable():
+    try:
+        settings = release.api(SANDBOX, "immutable-releases")
+    except urllib.error.HTTPError as error:
+        if error.code not in (403, 404):
+            raise
+        settings = None
+        print(f"Settings preflight returned HTTP {error.code}; Administration read is unavailable")
+    if settings is not None and settings.get("enabled") is True:
+        release.check_immutable("immutable", settings)
+        print("Live immutable settings prerequisite is enabled; this does not test immutable publication")
+    else:
+        try:
+            release.check_immutable("immutable", settings)
+        except ValueError as error:
+            if "immutable release prerequisite absent" not in str(error):
+                raise
+            print(f"Live missing-configuration rejection passed: {error}")
+        else:
+            raise ValueError("immutable mode accepted absent live prerequisites")
+
+
 if __name__ == "__main__":
     if os.environ["GITHUB_REPOSITORY"] != SANDBOX:
         raise SystemExit("acceptance is sandbox-only")
-    {"dispatch": dispatch, "inventory": inventory, "order": order}[sys.argv[1]]()
+    {"dispatch": dispatch, "inventory": inventory, "order": order, "immutable": immutable}[sys.argv[1]]()
