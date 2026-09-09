@@ -82,7 +82,6 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       RELEASE_REF: refs/tags/${{ needs.release-acceptance.outputs.tag }}
       RELEASE_PUBLIC: 'true'
-      SPDX_SCHEMA: ${{ runner.temp }}/release-tools/spdx-schema.json
     steps:
     - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
     - uses: ./.github/actions/release-tools
@@ -99,4 +98,4 @@ jobs:
     - name: Assert missing, malformed, disabled, and enabled prerequisites
       run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_release.py
         -v
-run-name: sandbox-verification-20260909T002419Z-bfe0f32181b1496a95427bf888931e45
+run-name: sandbox-verification-20260909T002543Z-4d2e9ecc54294df1a008c69ade0540e9

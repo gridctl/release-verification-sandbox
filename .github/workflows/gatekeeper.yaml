@@ -67,11 +67,11 @@ jobs:
         \ \u2014 neither is a stack.\nmapfile -t files < <(find examples -name \"\
         *.yaml\" -not -name \"skills.yaml\" -not -name \"gridctl-pack.yaml\" -not\
         \ -name \"gateway-remote.yaml\" -not -path \"examples/model-policy/*\" | sort)\n\
-        if [ ${#files[@]} -eq 0 ]; then\n  echo \"No example stacks found, skipping\
+        if [ \"${#files[@]}\" -eq 0 ]; then\n  echo \"No example stacks found, skipping\
         \ validation\"\n  exit 0\nfi\nfailed=0\nfor f in \"${files[@]}\"; do\n  echo\
         \ \"Validating $f...\"\n  ./gridctl validate \"$f\" && rc=0 || rc=$?\n  if\
-        \ [ $rc -eq 1 ]; then\n    echo \"  FAILED: $f\"\n    failed=1\n  fi\ndone\n\
-        exit $failed\n"
+        \ [ \"$rc\" -eq 1 ]; then\n    echo \"  FAILED: $f\"\n    failed=1\n  fi\n\
+        done\nexit \"$failed\"\n"
   integration:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -231,6 +231,10 @@ jobs:
         podman network ls
 
         echo "--- aardvark-dns state ---"
+
+        # Human-readable diagnostics, not a parsed file list.
+
+        # shellcheck disable=SC2012
 
         ls -la "${XDG_RUNTIME_DIR}/containers/networks/aardvark-dns/" 2>&1 | head
         -20
