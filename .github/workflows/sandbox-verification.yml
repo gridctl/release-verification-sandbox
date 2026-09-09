@@ -100,4 +100,4 @@ jobs:
     - name: Assert missing, malformed, disabled, and enabled prerequisites
       run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_release.py
         -v
-run-name: sandbox-verification-20260909T010850Z-e71add4b1ed94ce7a9a51e3a0028b206
+run-name: sandbox-verification-20260909T013056Z-3d1fb1e975cb40aa91d7ef3b0399aa40

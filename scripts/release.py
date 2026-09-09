@@ -151,7 +151,8 @@ def verify(directory, tag, sha, repository, workflow, negative=False):
                                          "--bundle", str(bundle), *bad], env=env,
                                         capture_output=True, text=True, timeout=180)
                 if result.returncode == 0 or "verification failed" not in (result.stdout + result.stderr).lower():
-                    raise ValueError(f"negative verification did not reject the policy mismatch: {flag}")
+                    raise ValueError(f"negative verification did not reject the policy mismatch: {flag}; "
+                                     f"exit={result.returncode}; {result.stdout}{result.stderr}")
             tampered = Path(clean) / archive.name
             tampered.write_bytes(archive.read_bytes() + b"tampered")
             result = subprocess.run(["gh", "attestation", "verify", str(tampered),
