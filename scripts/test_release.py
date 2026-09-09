@@ -2,7 +2,10 @@
 
 import copy
 import importlib.util
+import json
+import os
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -15,6 +18,57 @@ SPEC.loader.exec_module(release)
 
 
 class ReleasePolicyTests(unittest.TestCase):
+    def test_workflow_gate_set(self):
+        import yaml
+
+        gates = yaml.safe_load(Path(".github/workflows/gatekeeper.yaml").read_text())["jobs"]
+        self.assertEqual(set(release.GATES), set(gates["required"]["needs"]))
+        self.assertIn("always()", gates["required"]["if"])
+        publisher = yaml.safe_load(Path(".github/workflows/release.yaml").read_text())["jobs"]
+        self.assertEqual("./.github/workflows/gatekeeper.yaml", publisher["validation"]["uses"])
+        self.assertEqual("validation", publisher["assemble"]["needs"])
+        self.assertEqual({"validation", "assemble", "verify-linux", "verify-macos"},
+                         set(publisher["publish"]["needs"]))
+        self.assertEqual("publish", publisher["homebrew"]["needs"])
+
+    def test_prepare_requires_complete_inventories(self):
+        import jsonschema
+
+        tag, sha = "v1.2.3", "a" * 40
+        schema = {"type": "object", "required": ["spdxVersion", "packages"],
+                  "properties": {"packages": {"type": "array"}}}
+        with tempfile.TemporaryDirectory(dir=".", prefix=".release-test-") as temporary:
+            directory = Path(temporary)
+            schema_path = directory / "schema.json"
+            schema_path.write_text(json.dumps(schema))
+            for name in release.archive_names(tag):
+                (directory / name).write_bytes(b"archive fixture")
+                (directory / (name + ".spdx.json")).write_text(json.dumps({
+                    "spdxVersion": "SPDX-2.3", "packages": [{"name": "github.com/spf13/cobra"}]}))
+            inventory = directory / "frontend-build.spdx.json"
+            good = json.dumps({"spdxVersion": "SPDX-2.3", "packages": [{"name": "react"}, {"name": "vite"}]})
+            inventory.write_text(good)
+            cask = directory / "homebrew/Casks/gridctl.rb"
+            cask.parent.mkdir(parents=True)
+            cask.write_text("cask fixture")
+            with patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo"}):
+                names = release.prepare(directory, tag, sha, schema_path)
+                self.assertEqual(set(release.expected_assets(tag)) - {"provenance.sigstore.json"}, set(names))
+                checksums = (directory / "checksums.txt").read_text()
+                subjects = (directory / "attestation-subjects.txt").read_text()
+                self.assertNotIn("provenance.sigstore.json", checksums)
+                self.assertNotIn("checksums.txt", checksums)
+                self.assertIn("checksums.txt", subjects)
+                for value in ("", "not json", "{}", '{"spdxVersion":"SPDX-2.3","packages":[]}'):
+                    with self.subTest(value=value):
+                        inventory.write_text(value)
+                        with self.assertRaises((ValueError, jsonschema.ValidationError)):
+                            release.prepare(directory, tag, sha, schema_path)
+                inventory.write_text(good)
+                (directory / release.archive_names(tag)[0]).unlink()
+                with self.assertRaises(ValueError):
+                    release.prepare(directory, tag, sha, schema_path)
+
     def test_draft_lookup_uses_authenticated_listing(self):
         missing = urllib.error.HTTPError("https://api.github.com", 404, "Not Found", {}, None)
         draft = {"tag_name": "v1.2.3", "draft": True, "id": 42}

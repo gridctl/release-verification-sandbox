@@ -68,20 +68,31 @@ jobs:
         python3 scripts/release.py upload
 
         '
+    - name: Read back the complete draft for independent verification
+      run: python3 scripts/release.py download
+      env:
+        RELEASE_DIST: verified-draft
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: verified-draft
+        path: verified-draft/
+        if-no-files-found: error
+        retention-days: 7
   verify-linux:
     needs: assemble
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
     - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
       with:
         persist-credentials: false
     - uses: ./.github/actions/release-tools
-    - run: python3 scripts/release.py download
+    - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+      with:
+        name: verified-draft
+        path: dist
     - name: Account-free verification and identity rejection tests
       run: python3 scripts/release.py verify
   verify-macos:
@@ -90,14 +101,15 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
     - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
       with:
         persist-credentials: false
     - uses: ./.github/actions/release-tools
-    - run: python3 scripts/release.py download
+    - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+      with:
+        name: verified-draft
+        path: dist
     - name: Account-free verification and identity rejection tests
       run: python3 scripts/release.py verify
   publish:

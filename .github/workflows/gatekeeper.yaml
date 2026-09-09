@@ -45,8 +45,14 @@ jobs:
 
         '
     - name: Release policy regressions
-      run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_*.py'
-        -v
+      run: 'python3 -m venv "$RUNNER_TEMP/policy-tests"
+
+        "$RUNNER_TEMP/policy-tests/bin/pip" install jsonschema==4.23.0 PyYAML==6.0.3
+
+        PYTHONDONTWRITEBYTECODE=1 "$RUNNER_TEMP/policy-tests/bin/python" -m unittest
+        discover -s scripts -p ''test_*.py'' -v
+
+        '
     - name: Set up Task
       uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e
       with:

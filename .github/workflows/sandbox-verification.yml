@@ -58,6 +58,7 @@ jobs:
       contents: read
     steps:
     - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - uses: ./.github/actions/release-tools
     - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_*.py'
         -v
   publication-order:
@@ -95,7 +96,8 @@ jobs:
       contents: read
     steps:
     - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    - uses: ./.github/actions/release-tools
     - name: Assert missing, malformed, disabled, and enabled prerequisites
       run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_release.py
         -v
-run-name: sandbox-verification-20260909T004740Z-4a23e28c87444036943cb682f48939c5
+run-name: sandbox-verification-20260909T010850Z-e71add4b1ed94ce7a9a51e3a0028b206
