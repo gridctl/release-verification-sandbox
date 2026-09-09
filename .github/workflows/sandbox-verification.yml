@@ -104,4 +104,4 @@ jobs:
       run: python3 scripts/release-acceptance.py immutable
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-run-name: sandbox-verification-20260909T025029Z-949f7fb8db3e4f8ca9c465500c665b54
+run-name: sandbox-verification-20260909T033515Z-898e5ab7f8f94dabb250a463ae22ac00
