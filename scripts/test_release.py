@@ -4,6 +4,9 @@ import copy
 import importlib.util
 from pathlib import Path
 import unittest
+from unittest.mock import patch
+import urllib.error
+import urllib.request
 
 
 SPEC = importlib.util.spec_from_file_location("release", Path(__file__).with_name("release.py"))
@@ -12,6 +15,22 @@ SPEC.loader.exec_module(release)
 
 
 class ReleasePolicyTests(unittest.TestCase):
+    def test_draft_lookup_uses_authenticated_listing(self):
+        missing = urllib.error.HTTPError("https://api.github.com", 404, "Not Found", {}, None)
+        draft = {"tag_name": "v1.2.3", "draft": True, "id": 42}
+        with patch.object(release, "api", side_effect=[missing, [draft]]) as api:
+            self.assertEqual(draft, release.release_record("owner/repo", "v1.2.3"))
+            self.assertEqual("releases?per_page=100&page=1", api.call_args.args[1])
+        with patch.object(release, "api", side_effect=[missing, []]):
+            with self.assertRaises(urllib.error.HTTPError):
+                release.release_record("owner/repo", "v1.2.3")
+
+    def test_download_redirect_drops_credentials(self):
+        request = urllib.request.Request("https://api.github.com/asset", headers={"Authorization": "test-only"})
+        redirected = release.DownloadRedirect().redirect_request(
+            request, None, 302, "Found", {}, "https://release-assets.githubusercontent.com/asset")
+        self.assertIsNone(redirected.get_header("Authorization"))
+
     def test_archive_contract(self):
         self.assertEqual([
             "gridctl_1.2.3_darwin_amd64.tar.gz", "gridctl_1.2.3_darwin_arm64.tar.gz",

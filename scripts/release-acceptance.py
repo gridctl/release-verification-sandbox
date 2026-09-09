@@ -48,7 +48,7 @@ def dispatch():
     if run["conclusion"] != "success" or any(job["conclusion"] != "success" for job in jobs):
         request = urllib.request.Request(f"https://api.github.com/repos/{repository}/actions/runs/{run['id']}/logs",
                                          headers={"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}"})
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with urllib.request.build_opener(release.DownloadRedirect()).open(request, timeout=120) as response:
             logs = response.read()
         with zipfile.ZipFile(io.BytesIO(logs)) as archive:
             for name in archive.namelist():

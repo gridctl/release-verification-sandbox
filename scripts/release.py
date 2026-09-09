@@ -20,6 +20,14 @@ GATES = ("test", "integration", "litellm-contract", "conformance",
 PREDICATE = "https://slsa.dev/provenance/v1"
 
 
+class DownloadRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, newurl):
+        redirected = super().redirect_request(request, fp, code, message, headers, newurl)
+        if urllib.parse.urlsplit(request.full_url).netloc != urllib.parse.urlsplit(newurl).netloc:
+            redirected.remove_header("Authorization")
+        return redirected
+
+
 def check_gates(gates):
     if not isinstance(gates, dict):
         raise ValueError("required gate results are missing or malformed")
@@ -176,7 +184,22 @@ def source(repository, ref, sha):
 
 
 def release_record(repository, tag):
-    return api(repository, f"releases/tags/{urllib.parse.quote(tag, safe='')}")
+    try:
+        return api(repository, f"releases/tags/{urllib.parse.quote(tag, safe='')}")
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise
+        # The tag endpoint returns published releases. Drafts require a listing.
+        for page in range(1, 101):
+            records = api(repository, f"releases?per_page=100&page={page}")
+            matches = [record for record in records if record.get("tag_name") == tag]
+            if len(matches) > 1:
+                raise ValueError("ambiguous draft releases for tag") from error
+            if matches:
+                return matches[0]
+            if len(records) < 100:
+                raise error
+        raise ValueError("release lookup exceeded pagination limit") from error
 
 
 def preflight(repository, ref, sha, mode):
@@ -222,7 +245,7 @@ def download_assets(directory, repository, tag, public=False):
             headers = {"Accept": "application/octet-stream",
                        "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}"}
         request = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(request, timeout=180) as response:
+        with urllib.request.build_opener(DownloadRedirect()).open(request, timeout=180) as response:
             (directory / asset["name"]).write_bytes(response.read())
     return record
 
